@@ -1,0 +1,8 @@
+Output_Song_files/
+Voices_Cloning/
+Ambient_Musics/
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.tmp
