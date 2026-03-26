@@ -1,0 +1,16 @@
+# XTTS-Voice-Studio - Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# Note: PyTorch must be installed via conda BEFORE running this:
+#   conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
+
+# Core TTS engine (Coqui XTTS v2 - community fork)
+coqui-tts
+
+# Audio processing
+pydub
+
+# Voice analyser
+librosa
+numpy
+scipy
