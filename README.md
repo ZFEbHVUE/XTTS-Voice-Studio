@@ -15,11 +15,44 @@ Generate professional narrations — meditations, audiobooks, podcasts, voice-ov
 - 🎵 **Ambient music** looping + **punctual sound** injection
 - ⏸️ **Smart pauses** — fixed or adjusted to speech duration
 - 🔬 **Voice analyser** — automatically finds optimal parameters for any voice
+- 🎙️ **Audio transcriber** — converts any MP3/WAV to a generator-ready `.txt` with auto-detected pauses (Whisper)
 - 🎲 **Reproducible generation** via seed control
 
 ---
 
-## 🖥️ System Requirements
+## 📁 Recommended Directory Structure
+
+All files should be organised under a single `~/XTTS/` root folder.  
+**Clone this repo into `~/XTTS/`** and create the additional directories below:
+
+```
+~/XTTS/                                ← root folder (this repo)
+│
+├── Python_Scripting/                  ← scripts (from this repo)
+│   ├── guided_meditation_generator_v20.py
+│   └── voice_analyser.py
+│
+├── Prompts/                           ← your .txt script files (from this repo)
+│
+├── Punctual_sounds/                   ← short WAV sounds triggered inline (from this repo)
+│
+├── Song_to_TXT_with_Pauses/          ← utility scripts (from this repo)
+│
+├── Voices_Cloning/                    ← ⚠️ create this manually — your WAV voice references
+│
+├── Ambient_Musics/                    ← ⚠️ create this manually — background music WAV files
+│                                           (filename must contain "ambiance" or "ambient")
+│
+└── Output_Song_files/                 ← ⚠️ create this manually — generated WAV output
+```
+
+Create the missing directories in one command:
+
+```bash
+mkdir -p ~/XTTS/Voices_Cloning ~/XTTS/Ambient_Musics ~/XTTS/Output_Song_files
+```
+
+---
 
 - Ubuntu 20.04 or later (tested on Ubuntu 24.04)
 - NVIDIA GPU with CUDA support (recommended — CPU mode works but is slow)
@@ -123,11 +156,12 @@ cd XTTS-Voice-Studio
 ```
 XTTS-Voice-Studio/
 ├── Python_Scripting/
-│   ├── guided_meditation_generator_v20.py   # Main generator
-│   └── voice_analyser.py                    # Voice parameter analyser
-├── Prompts/                                 # Example script files (.txt)
-├── Punctual_sounds/                         # Example punctual audio files
-├── Song_to_TXT_with_Pauses/                 # Utility scripts
+│   ├── guided_meditation_generator_v20.py      # Main generator
+│   ├── voice_analyser.py                       # Voice parameter analyser
+│   └── transcribeSong2txt_with_pause.py        # Audio → TXT transcriber (Whisper)
+├── Prompts/                                    # Example script files (.txt)
+├── Punctual_sounds/                            # Example punctual audio files
+├── Song_to_TXT_with_Pauses/                    # Output folder for transcribed .txt files
 └── README.md
 ```
 
@@ -226,19 +260,26 @@ The ambient file must contain `ambiance` or `ambiant` in its filename.
 ### Complete example
 
 ```
-volume_ambiance=-18
-musique_1=5s,-10
+# ── Global settings ──────────────────────────────────────────────────────
+volume_ambiance=-18        # ambient music at -18 dB throughout
+musique_1=5s,-10           # punctual sound #1: 5 seconds, -10 dB
 
+# ── Voice 1 (female narrator, English) ───────────────────────────────────
 {1, 42, 110, 255, 150, 300, 0.65, 50, 0.85}
-[1, FR, 0.85, +1, -5, +1, -1, 90, 9000, 0.3, 0.4, 0.2]
+[1, EN, 0.85, +1, -5, +1, -1, 90, 9000, 0.3, 0.4, 0.2]
 Welcome. [pause=4s,start]
-Close your eyes and breathe slowly. [pause=5s,start]
+Close your eyes, and take a slow, deep breath. [pause=5s,start]
+Feel the weight of your body becoming heavier with each exhale. [pause=5s,start]
 
+# ── Trigger punctual sound (e.g. a singing bowl) ─────────────────────────
 [musique=1]
 
+# ── Voice 2 (male narrator, English, different cloning reference) ─────────
 {2, 42, 60, 339, 150, 300, 0.60, 40, 0.80}
 [2, EN, 0.90, +3, -3, +2, -2, 80, 8000, 0.5, 0.4, 0.2]
-Now, let your thoughts drift away. [pause=4s,start]
+Now, let your thoughts drift away like clouds across the sky. [pause=4s,start]
+There is nothing to do, nowhere to be. [pause=5s,start]
+Just breathe. [pause=6s,start]
 ```
 
 ---
@@ -257,6 +298,48 @@ python Python_Scripting/voice_analyser.py voice1.wav voice2.wav voice3.wav
 ```
 
 The analyser measures F0, RMS level, SNR, crest factor, sibilance, and spectral balance to recommend optimal EQ, compression, noise reduction, XTTS temperature, and trim values for your specific voice.
+
+---
+
+## 🎙️ Audio Transcriber
+
+`transcribeSong2txt_with_pause.py` converts any audio file (MP3, WAV) into a `.txt` script ready for the generator, with **automatic pause detection** based on Whisper word-level timestamps.
+
+```bash
+# Basic usage (medium model, 0.7s minimum pause)
+python Python_Scripting/transcribeSong2txt_with_pause.py audio.mp3 Song_to_TXT_with_Pauses/output.txt
+
+# Specify model and minimum pause duration
+python Python_Scripting/transcribeSong2txt_with_pause.py audio.mp3 Song_to_TXT_with_Pauses/output.txt medium
+python Python_Scripting/transcribeSong2txt_with_pause.py audio.mp3 Song_to_TXT_with_Pauses/output.txt small 0.5
+python Python_Scripting/transcribeSong2txt_with_pause.py audio.mp3 Song_to_TXT_with_Pauses/output.txt large-v3 1.0
+```
+
+**Available Whisper models:**
+
+| Model | Speed | Quality | Recommended for |
+|-------|-------|---------|-----------------|
+| `tiny` | Very fast | Basic | Quick tests |
+| `base` | Fast | Decent | Short clips |
+| `small` | Medium | Good | GTX 1650 / 4GB GPU |
+| `medium` | Slow | Very good | Default |
+| `large` | Very slow | Excellent | High quality |
+| `large-v3` | Very slow | Best | Non-English audio |
+
+**Minimum pause parameter:**
+
+| Value | Effect |
+|-------|--------|
+| `0.5s` | Captures all small pauses |
+| `0.7s` | Significant pauses only (recommended) |
+| `1.0s` | Long pauses only |
+
+**Install Whisper** (if not already installed):
+```bash
+pip install openai-whisper
+```
+
+The output `.txt` is placed in `Song_to_TXT_with_Pauses/` and is directly usable with the generator — just add your `{...}` and `[...]` brackets at the top.
 
 ---
 
