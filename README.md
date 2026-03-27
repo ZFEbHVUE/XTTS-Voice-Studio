@@ -41,7 +41,7 @@ All files should be organised under a single `~/XTTS/` root folder.
 ├── Voices_Cloning/                    ← ⚠️ create this manually — your WAV voice references
 │
 ├── Ambient_Musics/                    ← ⚠️ create this manually — background music WAV files
-│                                           (filename must contain "ambiance" or "ambient")
+│                                           (filename must contain "ambient" — e.g. forest_ambient.wav)
 │
 └── Output_Song_files/                 ← ⚠️ create this manually — generated WAV output
 ```
@@ -251,26 +251,26 @@ python Python_Scripting/guided_meditation_generator_v20.py \
 
 ```
 # Declare at top of file
-musique_1=30s,-15    → file #1: 30s, -15 dB
-musique_2=-10        → file #2: full duration, -10 dB
+music_1=30s,-15    → file #1: 30s, -15 dB
+music_2=-10        → file #2: full duration, -10 dB
 
 # Trigger inline
-[musique=1]
+[music=1]
 ```
 
 ### Ambient music
 
 ```
-volume_ambiance=-12  → loops throughout at -12 dB
+ambient_volume=-12  → loops throughout at -12 dB
 ```
-The ambient file must contain `ambiance` or `ambiant` in its filename.
+The ambient file must contain `ambient` in its filename (e.g. `forest_ambient.wav`).
 
 ### Complete example
 
 ```
 # ── Global settings ──────────────────────────────────────────────────────
-volume_ambiance=-18        # ambient music at -18 dB throughout
-musique_1=5s,-10           # punctual sound #1: 5 seconds, -10 dB
+ambient_volume=-18        # ambient music at -18 dB throughout
+music_1=5s,-10           # punctual sound #1: 5 seconds, -10 dB
 
 # ── Voice 1 (female narrator, English) ───────────────────────────────────
 {1, 42, 110, 255, 150, 300, 0.65, 50, 0.85}
@@ -280,7 +280,7 @@ Close your eyes, and take a slow, deep breath. [pause=5s,start]
 Feel the weight of your body becoming heavier with each exhale. [pause=5s,start]
 
 # ── Trigger punctual sound (e.g. a singing bowl) ─────────────────────────
-[musique=1]
+[music=1]
 
 # ── Voice 2 (male narrator, English, different cloning reference) ─────────
 {2, 42, 60, 339, 150, 300, 0.60, 40, 0.80}
