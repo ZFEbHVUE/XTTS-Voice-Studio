@@ -13,7 +13,7 @@
 
   # ── Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
   
-  [1, FR, 0.9, 5, -5, 1, -2, 65, 7500, 0.3, 0.5, 0.5]
+  [1, EN, 0.9, 5, -5, 1, -2, 65, 7500, 0.3, 0.5, 0.5]
 
 
 
