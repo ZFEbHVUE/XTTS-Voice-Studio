@@ -178,13 +178,21 @@ mkdir -p Voices_Cloning Output_Song_files Ambient_Musics
 
 ```bash
 conda activate xtts
+
+# With language (recommended)
+python Python_Scripting/voice_analyser.py Voices_Cloning/my_voice.wav FR
+
+# Multiple voices at once
+python Python_Scripting/voice_analyser.py voice1.wav FR voice2.wav EN
+
+# Language defaults to FR if omitted
 python Python_Scripting/voice_analyser.py Voices_Cloning/my_voice.wav
 ```
 
 This outputs two ready-to-paste brackets for your script:
 ```
-{1, 0, 89, 314, 150, 300, 0.55, 30, 0.75}          ← XTTS params
-[1, FR, 0.85, +1, -5, +1, -3, 90, 8000, 0.3, 0.4, 0.2]   ← audio params
+{1, 0, 89, 314, 150, 300, 0.55, 30, 0.75}
+[1, FR, 0.85, +1, -5, +1, -3, 90, 8000, 0.3, 0.4, 0.2]
 ```
 
 ### Step 2 — Write your script
@@ -287,15 +295,20 @@ Just breathe. [pause=6s,start]
 ## 🔬 Voice Analyser
 
 ```bash
-# Fast mode (default, 3-10s)
+# Basic usage — language defaults to FR
 python Python_Scripting/voice_analyser.py Voices_Cloning/voice.wav
 
+# With language code (recommended)
+python Python_Scripting/voice_analyser.py Voices_Cloning/voice.wav EN
+
 # Precise mode (30-90s, pyin algorithm)
-python Python_Scripting/voice_analyser.py --precise Voices_Cloning/voice.wav
+python Python_Scripting/voice_analyser.py --precise Voices_Cloning/voice.wav FR
 
 # Multiple voices at once
-python Python_Scripting/voice_analyser.py voice1.wav voice2.wav voice3.wav
+python Python_Scripting/voice_analyser.py voice1.wav FR voice2.wav EN voice3.wav DE
 ```
+
+Supported languages: `FR EN ES DE IT PT PL TR RU NL CS AR ZH-CN HU KO JA HI`
 
 The analyser measures F0, RMS level, SNR, crest factor, sibilance, and spectral balance to recommend optimal EQ, compression, noise reduction, XTTS temperature, and trim values for your specific voice.
 
