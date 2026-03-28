@@ -17,7 +17,7 @@
 
 
 
-Orchestrated French-to-English UK translation taskOrchestrated French-to-English UK translation task Hello.
+  Hello.
   [pause=2s]
   We are going to practise breathing cycles using the Nadi Shodhana Pranayama method.
   [pause=2s]
