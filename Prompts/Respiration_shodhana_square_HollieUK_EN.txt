@@ -3,7 +3,7 @@
   ambient_volume=-10 
   music_1=16s,+5      
 
-  # Voix1 in EN (8dB)
+  # Voix1 in EN (3dB)
   # python ~/XTTS/Python_Scripting/voice_analyser.py --precise ~/XTTS/Voices_Cloning/HollieUK_EN.wav EN
   #
   # ── XTTS params  {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p}
