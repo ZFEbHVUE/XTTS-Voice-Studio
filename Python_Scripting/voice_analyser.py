@@ -19,7 +19,7 @@ Usage:
 Examples:
   python voice_analyser.py Monique.wav FR
   python voice_analyser.py Monique.wav FR John.wav EN
-  python voice_analyser.py --precise FannyArdant.wav FR
+  python voice_analyser.py --precise Fanny.wav FR
 
 Estimated duration (30s file, standard CPU):
   Default mode  : 3-10s  (yin algorithm)
