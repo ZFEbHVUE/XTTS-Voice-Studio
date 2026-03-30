@@ -17,8 +17,8 @@ Usage:
   Supported: FR EN ES DE IT PT PL TR RU NL CS AR ZH-CN HU KO JA HI
 
 Examples:
-  python voice_analyser.py Monique.wav FR
-  python voice_analyser.py Monique.wav FR John.wav EN
+  python voice_analyser.py Stéphane.wav FR
+  python voice_analyser.py Stéphane.wav FR John.wav EN
   python voice_analyser.py --precise Fanny.wav FR
 
 Estimated duration (30s file, standard CPU):
