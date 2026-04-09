@@ -200,7 +200,7 @@ def apply_eq(audio_segment, graves_db=0, mediums_db=0, aigus_db=0):
         )
         return AudioSegment.from_wav(temp_out.name)
     except subprocess.CalledProcessError as e:
-        print(f"  ⚠️  EQ error: {e}")
+        print(f"  [!]  EQ error: {e}")
         return audio_segment
     finally:
         for f in (temp_in.name, temp_out.name):
@@ -234,7 +234,7 @@ def apply_noise_reduction(audio_segment, force=0.8):
         )
         return AudioSegment.from_wav(temp_out.name)
     except subprocess.CalledProcessError as e:
-        print(f"  ⚠️  Noise reduction error: {e}")
+        print(f"  [!]  Noise reduction error: {e}")
         return audio_segment
     finally:
         for f in (temp_in.name, temp_out.name):
@@ -278,7 +278,7 @@ def apply_deesser(audio_segment, force=0.3):
         )
         return AudioSegment.from_wav(temp_out.name)
     except subprocess.CalledProcessError as e:
-        print(f"  ⚠️  De-esser error: {e}")
+        print(f"  [!]  De-esser error: {e}")
         return audio_segment
     finally:
         for f in (temp_in.name, temp_out.name):
@@ -290,7 +290,7 @@ def process_audio(audio_segment, config, xtts_params):
     Full audio processing pipeline (per sentence):
     Trim → Filters → EQ → Noise reduction → De-esser → Compression → Fades
     """
-    print(f"      🎚️  Audio: EQ({config['eq_low']:+.0f}/{config['eq_mid']:+.0f}/{config['eq_high']:+.0f}dB) "
+    print(f"      [*]  Audio: EQ({config['eq_low']:+.0f}/{config['eq_mid']:+.0f}/{config['eq_high']:+.0f}dB) "
           f"Filters({config['highpass']}-{config['lowpass']}Hz) "
           f"NR({config['noise_reduction']:.1f}) Comp({config['compression']:.1f}) DS({config['deesser']:.1f})")
 
@@ -299,21 +299,21 @@ def process_audio(audio_segment, config, xtts_params):
     trim_end   = int(xtts_params['trim_end'])
 
     if trim_start == 0 and trim_end == 0:
-        print(f"      ✂️  No trim (trim_start=0, trim_end=0)")
+        print(f"      [*]  No trim (trim_start=0, trim_end=0)")
     elif trim_start > 0 and trim_end > 0:
         if len(audio_segment) > (trim_start + trim_end + 50):
             audio_segment = audio_segment[trim_start:-trim_end]
-            print(f"      ✂️  Trimmed: {trim_start}ms start + {trim_end}ms end")
+            print(f"      [*]  Trimmed: {trim_start}ms start + {trim_end}ms end")
         else:
-            print(f"      ✂️  Segment too short to trim ({len(audio_segment)}ms), skipped")
+            print(f"      [*]  Segment too short to trim ({len(audio_segment)}ms), skipped")
     elif trim_start > 0:
         if len(audio_segment) > trim_start + 50:
             audio_segment = audio_segment[trim_start:]
-            print(f"      ✂️  Trimmed: {trim_start}ms start only")
+            print(f"      [*]  Trimmed: {trim_start}ms start only")
     elif trim_end > 0:
         if len(audio_segment) > trim_end:
             audio_segment = audio_segment[:-trim_end]
-            print(f"      ✂️  Trimmed: {trim_end}ms end only")
+            print(f"      [*]  Trimmed: {trim_end}ms end only")
 
     # 2. High-pass / low-pass filters
     audio_segment = apply_filters(audio_segment,
@@ -347,9 +347,9 @@ def process_audio(audio_segment, config, xtts_params):
         if fi_safe > 0: audio_segment = audio_segment.fade_in(fi_safe)
         if fo_safe > 0: audio_segment = audio_segment.fade_out(fo_safe)
         note = f"  (reduced, segment={dur_ms}ms)" if (fi_safe != fade_in or fo_safe != fade_out) else ""
-        print(f"      🎚️  Fades: in={fi_safe}ms  out={fo_safe}ms{note}")
+        print(f"      [*]  Fades: in={fi_safe}ms  out={fo_safe}ms{note}")
     else:
-        print(f"      🎚️  Fades: disabled (0/0)")
+        print(f"      [*]  Fades: disabled (0/0)")
 
     return audio_segment
 
@@ -370,7 +370,7 @@ def apply_speed_rubberband(audio_segment, speed,
             if os.path.exists(f): os.remove(f)
         return result
     except subprocess.CalledProcessError as e:
-        print(f"  ⚠️  Rubberband error: {e}")
+        print(f"  [!]  Rubberband error: {e}")
         return audio_segment
 
 
@@ -406,9 +406,9 @@ def parse_voice_config(config_str):
         lang = parts[1].lower().strip()
         if lang in VALID_LANGUAGES:
             config['language'] = lang
-            print(f"  🌐 Language: {lang.upper()}")
+            print(f"  [*] Language: {lang.upper()}")
         else:
-            print(f"  ⚠️  Unknown language '{parts[1]}', ignored (default: {config['language']})")
+            print(f"  [!]  Unknown language '{parts[1]}', ignored (default: {config['language']})")
         offset = 2
 
     param_names = ['speed', 'volume', 'eq_low', 'eq_mid', 'eq_high',
@@ -422,7 +422,7 @@ def parse_voice_config(config_str):
             except ValueError:
                 pass
 
-    print(f"  ✅ Voice {voice_num} [{config['language'].upper()}] "
+    print(f"  [OK] Voice {voice_num} [{config['language'].upper()}] "
           f"speed={config['speed']} vol={config['volume']:+.0f}dB")
     return voice_num, config
 
@@ -605,7 +605,7 @@ def extract_config(text):
 
                 if name == 'ambient_volume':
                     ambient_vol = float(val_str)
-                    print(f"   🎵 Ambient volume: {ambient_vol} dB")
+                    print(f"   [*] Ambient volume: {ambient_vol} dB")
 
                 elif name.startswith('music_'):
                     try:
@@ -616,13 +616,13 @@ def extract_config(text):
                             vol     = float(parts[1].strip())
                             dur_sec = float(dur_str[:-1]) if dur_str.endswith('s') else float(dur_str)
                             music_configs[idx] = (dur_sec, vol)
-                            print(f"   🎶 Music #{idx}: duration {dur_sec}s, volume {vol} dB")
+                            print(f"   [*] Music #{idx}: duration {dur_sec}s, volume {vol} dB")
                         else:
                             vol = float(val_str)
                             music_configs[idx] = (None, vol)
-                            print(f"   🎶 Music #{idx}: full duration, volume {vol} dB")
+                            print(f"   [*] Music #{idx}: full duration, volume {vol} dB")
                     except ValueError:
-                        print(f"   ⚠️  Invalid music config: {name}={val_str}")
+                        print(f"   [!]  Invalid music config: {name}={val_str}")
 
                 continue
 
@@ -656,22 +656,22 @@ def parse_audio_files(args):
 
     for fpath in args:
         if not os.path.exists(fpath):
-            print(f"⚠️  File not found: {fpath}")
+            print(f"[!]  File not found: {fpath}")
             continue
 
         path_lower = fpath.lower()
 
         if "voices_cloning" in path_lower:
             voice_files.append(fpath)
-            print(f"   🎤 Voice #{len(voice_files)}: {os.path.basename(fpath)}")
+            print(f"   [*] Voice #{len(voice_files)}: {os.path.basename(fpath)}")
 
         elif "ambient" in path_lower:
             ambient_file = fpath
-            print(f"   🎵 Ambient file: {os.path.basename(fpath)}")
+            print(f"   [*] Ambient file: {os.path.basename(fpath)}")
 
         else:
             music_files.append(fpath)
-            print(f"   🎶 Music #{len(music_files)}: {os.path.basename(fpath)}")
+            print(f"   [*] Music #{len(music_files)}: {os.path.basename(fpath)}")
 
     return voice_files, ambient_file, music_files
 
@@ -681,8 +681,8 @@ def parse_audio_files(args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_meditation(text, output_file, voice_files, ambient_file, music_files):
-    print("🧘 Guided Meditation Generator - VERSION 20 - PER-VOICE XTTS PARAMS")
-    print(f"   🎤 Available voices: {len(voice_files)}")
+    print("[*] Guided Meditation Generator - VERSION 20 - PER-VOICE XTTS PARAMS")
+    print(f"   [*] Available voices: {len(voice_files)}")
     for i, v in enumerate(voice_files, 1):
         print(f"      Voice {i}: {os.path.basename(v)}")
 
@@ -692,7 +692,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
     # Summary
     for num in sorted(k for k in xtts_params_by_voice if k > 0):
         p = xtts_params_by_voice[num]
-        print(f"   🎚️  Voice {num}: trim={p['trim_start']:.0f}/{p['trim_end']:.0f}ms "
+        print(f"   [*]  Voice {num}: trim={p['trim_start']:.0f}/{p['trim_end']:.0f}ms "
               f"fade={p['fade_in']:.0f}/{p['fade_out']:.0f}ms "
               f"temp={p['temperature']} top_k={p['top_k']:.0f} top_p={p['top_p']} "
               f"seed={p['seed']}")
@@ -708,7 +708,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
             torch.cuda.manual_seed_all(sval)
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
-        print(f"🎲 Initial seed = {sval} (voice 1)")
+        print(f"[*] Initial seed = {sval} (voice 1)")
 
     ambient_vol, music_configs, clean_content = extract_config(text)
 
@@ -716,7 +716,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
     tts_instances = {}
     for i, voice_path in enumerate(voice_files, 1):
         tts_instances[i] = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
-        print(f"   ✅ TTS initialised for voice {i}")
+        print(f"   [OK] TTS initialised for voice {i}")
 
     # Split text into segments
     raw_segments = re.split(
@@ -731,7 +731,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
     music_to_apply = []
     position_ms        = 0
 
-    print("\n🎤 Generating...\n")
+    print("\n[*] Generating...\n")
 
     sentence_count  = 0
     current_voice   = 1
@@ -744,6 +744,13 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
                            and not s.startswith('[')
                            and not s.startswith('[music=')
                            and not s.startswith('[music=')])
+
+    # Total work units = sentences + post-processing phases
+    # (mix music + ambient + save = 3 phases). Used for the GUI progress bar
+    # so that 100% only fires when the WAV is actually written to disk.
+    POST_PHASES = 3
+    total_steps = total_sentences + POST_PHASES
+    step_done   = 0
 
     times_per_sentence = []
     start_time         = time.time()
@@ -771,13 +778,13 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
                     if adjusted_pause > 0:
                         voice_audio += AudioSegment.silent(duration=int(adjusted_pause * 1000))
                         position_ms += int(adjusted_pause * 1000)
-                        print(f"  ⏸️  Adjusted pause: speech={elapsed:.2f}s + silence={adjusted_pause:.2f}s = TOTAL {duration:.2f}s ✅")
+                        print(f"  [*]  Adjusted pause: speech={elapsed:.2f}s + silence={adjusted_pause:.2f}s = TOTAL {duration:.2f}s [OK]")
                     else:
-                        print(f"  ⏸️  Adjusted pause: speech already ≥ {duration}s")
+                        print(f"  [*]  Adjusted pause: speech already >= {duration}s")
                 else:
                     voice_audio += AudioSegment.silent(duration=int(duration * 1000))
                     position_ms += int(duration * 1000)
-                    print(f"  ⏸️  Pause {duration}s")
+                    print(f"  [*]  Pause {duration}s")
 
         # ── XTTS params block  {N, seed, ...}  ───────────────────────────────
         elif segment.startswith('{') and segment.endswith('}'):
@@ -793,14 +800,14 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
                     if sv is not None:
                         random.seed(sv); np.random.seed(sv); torch.manual_seed(sv)
                         if torch.cuda.is_available(): torch.cuda.manual_seed_all(sv)
-                print(f"  🎛️  XTTS params voice {voice_num}: "
+                print(f"  [*]  XTTS params voice {voice_num}: "
                       f"seed={new_params['seed']} "
                       f"trim={new_params['trim_start']:.0f}/{new_params['trim_end']:.0f}ms "
                       f"fade={new_params['fade_in']:.0f}/{new_params['fade_out']:.0f}ms "
                       f"temp={new_params['temperature']} "
                       f"top_k={new_params['top_k']:.0f} top_p={new_params['top_p']}")
             elif voice_num:
-                print(f"  ⚠️  Voice #{voice_num} not available")
+                print(f"  [!]  Voice #{voice_num} not available")
 
         # ── Audio bracket  [N, ...]  ──────────────────────────────────────────
         elif segment.startswith('[') and ',' in segment or \
@@ -817,7 +824,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
                     if sv is not None:
                         random.seed(sv); np.random.seed(sv); torch.manual_seed(sv)
                         if torch.cuda.is_available(): torch.cuda.manual_seed_all(sv)
-                    print(f"  🎤 Voice {current_voice}: speed={config['speed']}x "
+                    print(f"  [*] Voice {current_voice}: speed={config['speed']}x "
                           f"vol={config['volume']:+.0f}dB "
                           f"lang={config['language'].upper()} | "
                           f"trim={current_xtts_params['trim_start']:.0f}/"
@@ -826,7 +833,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
                           f"{current_xtts_params['fade_out']:.0f}ms "
                           f"seed={sv}")
                 else:
-                    print(f"  ⚠️  Voice #{voice_num} not available")
+                    print(f"  [!]  Voice #{voice_num} not available")
 
         # ── Punctual music  [music=N]  ──────────────────────────────────────
         elif segment.startswith('[music='):
@@ -838,7 +845,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
                     dur_sec, vol_db = music_configs[idx]
                     music_to_apply.append((position_ms, fpath, dur_sec, vol_db))
                     dur_str = f"{dur_sec}s" if dur_sec else "full"
-                    print(f"  🎶 Music #{idx} at {position_ms/1000:.1f}s: "
+                    print(f"  [*] Music #{idx} at {position_ms/1000:.1f}s: "
                           f"{os.path.basename(fpath)} ({dur_str}, {vol_db} dB)")
 
         # ── Text sentence ─────────────────────────────────────────────────────
@@ -848,8 +855,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
             last_sentence_pos = position_ms
 
             clean = clean_text(segment)
-            print(f"  🎤 [{sentence_count}/{total_sentences}] "
-                  f"[Voice {current_voice}] "
+            print(f"  [*] [Voice {current_voice}] "
                   f"[{current_config['speed']}x, {current_config['volume']:+.0f}dB] "
                   f"{clean[:40]}{'...' if len(clean) > 40 else ''}")
 
@@ -884,13 +890,20 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
                     avg_time      = sum(times_per_sentence) / len(times_per_sentence)
                     remaining_est = avg_time * (total_sentences - sentence_count)
                     elapsed_total = time.time() - start_time
+                    pct = int(100 * sentence_count / total_sentences) if total_sentences else 0
 
-                    print(f"      ⏱️  {int(t_sentence)}s | "
+                    # Human-readable progress (sentence-based)
+                    print(f"      [*] [{pct:3d}%] [{sentence_count}/{total_sentences}] "
+                          f"{int(t_sentence)}s | "
                           f"Elapsed: {timedelta(seconds=int(elapsed_total))} | "
                           f"ETA: {timedelta(seconds=int(remaining_est))}")
-                    print(f"      📏 Duration: {len(audio)/1000:.2f}s")
+                    print(f"      [*] Duration: {len(audio)/1000:.2f}s")
+
+                    # GUI progress marker (covers ALL phases incl. post-processing)
+                    step_done += 1
+                    print(f"[PROGRESS={step_done}/{total_steps}]")
             except Exception as e:
-                print(f"  ⚠️  Error: {e}")
+                print(f"  [!]  Error: {e}")
 
         i += 1
 
@@ -898,7 +911,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
         os.remove(temp_file)
 
     # ── Mix music ────────────────────────────────────────────────────────────
-    print(f"\n🎼 Mixing music...")
+    print(f"\n[*] Mixing music...")
     final_audio = voice_audio
 
     if music_to_apply:
@@ -909,12 +922,14 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
                     music = music[:int(dur_sec * 1000)]
                 final_audio = final_audio.overlay(music, position=pos_ms)
                 dur_str = f"{dur_sec}s" if dur_sec else f"{len(music)/1000:.1f}s"
-                print(f"   ✅ {os.path.basename(fpath)} at {pos_ms/1000:.1f}s ({dur_str})")
+                print(f"   [OK] {os.path.basename(fpath)} at {pos_ms/1000:.1f}s ({dur_str})")
             except Exception as e:
-                print(f"   ⚠️  Error: {e}")
+                print(f"   [!]  Error: {e}")
+    step_done += 1
+    print(f"[PROGRESS={step_done}/{total_steps}]")
 
     if ambient_file and ambient_vol is not None:
-        print(f"   🎵 Ambient track: {os.path.basename(ambient_file)}...")
+        print(f"   [*] Ambient track: {os.path.basename(ambient_file)}...")
         try:
             ambient = AudioSegment.from_file(ambient_file) + ambient_vol
             total_dur = len(final_audio)
@@ -923,17 +938,23 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
                 looped += ambient
             looped      = looped[:total_dur]
             final_audio = looped.overlay(final_audio)
-            print(f"   ✅ Applied ({len(looped)/1000:.1f}s, {ambient_vol} dB)")
+            print(f"   [OK] Applied ({len(looped)/1000:.1f}s, {ambient_vol} dB)")
         except Exception as e:
-            print(f"   ⚠️  Error: {e}")
+            print(f"   [!]  Error: {e}")
+    step_done += 1
+    print(f"[PROGRESS={step_done}/{total_steps}]")
 
-    print(f"\n💾 Saving...")
+    print(f"\n[*] Saving...")
     final_audio.export(output_file, format="wav")
+    step_done += 1
+    print(f"[PROGRESS={step_done}/{total_steps}]")
 
     duration = len(final_audio) / 1000
-    print(f"\n✅ Done - VERSION 20 - PER-VOICE XTTS PARAMS")
-    print(f"📁 {output_file}")
-    print(f"⏱️  {int(duration // 60)}min {int(duration % 60)}s")
+    total_elapsed = time.time() - start_time
+    print(f"\n[OK] Done - VERSION 20 - PER-VOICE XTTS PARAMS")
+    print(f"[*] {output_file}")
+    print(f"[*] Audio length   : {int(duration // 60)}min {int(duration % 60)}s")
+    print(f"[*] Total elapsed  : {timedelta(seconds=int(total_elapsed))}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -963,14 +984,14 @@ def main():
     audio_files = sys.argv[3:]
 
     if not audio_files:
-        print("❌ At least one voice file is required!")
+        print("[!] At least one voice file is required!")
         sys.exit(1)
 
-    print("🎼 Parsing audio files...")
+    print("[*] Parsing audio files...")
     voice_files, ambient_file, music_files = parse_audio_files(audio_files)
 
     if not voice_files:
-        print("❌ No voice files detected!")
+        print("[!] No voice files detected!")
         sys.exit(1)
 
     # Read input text (try UTF-8, then fallback encodings)
@@ -981,16 +1002,23 @@ def main():
                 text = f.read()
             break
         except UnicodeDecodeError:
-            print(f"⚠️  {encoding} failed, trying next encoding...")
+            print(f"[!]  {encoding} failed, trying next encoding...")
         except FileNotFoundError:
-            print(f"❌ Input file not found: {input_file}")
+            print(f"[!] Input file not found: {input_file}")
             sys.exit(1)
 
     if text is None:
-        print("❌ Could not read input file (encoding issue).")
+        print("[!] Could not read input file (encoding issue).")
         sys.exit(1)
 
     generate_meditation(text, output_file, voice_files, ambient_file, music_files)
+
+    # Flush stdout and exit hard: os._exit(0) skips Python's normal teardown,
+    # which prevents XTTS/torch/CUDA shutdown logs from scrolling past the
+    # final "Total elapsed" line in the GUI console.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

@@ -12,14 +12,15 @@ parameters for both bracket types:
 Usage:
   python voice_analyser.py voice.wav LANG [voice2.wav LANG2 ...]
   python voice_analyser.py --precise voice.wav FR
+  python voice_analyser.py --start-num 3 voice.wav FR
 
   LANG is optional — defaults to FR if omitted.
   Supported: FR EN ES DE IT PT PL TR RU NL CS AR ZH-CN HU KO JA HI
 
 Examples:
-  python voice_analyser.py Stéphane.wav FR
-  python voice_analyser.py Stéphane.wav FR John.wav EN
-  python voice_analyser.py --precise Fanny.wav FR
+  python voice_analyser.py Monique.wav FR
+  python voice_analyser.py Monique.wav FR John.wav EN
+  python voice_analyser.py --precise FannyArdant.wav FR
 
 Estimated duration (30s file, standard CPU):
   Default mode  : 3-10s  (yin algorithm)
@@ -300,14 +301,14 @@ def analyse_voice(wav_file, fast=True):
 # Display results
 # ─────────────────────────────────────────────────────────────────────────────
 
-def display_results(params, stats, voice_num=1, wav_file=None, language='FR'):
+def display_results(params, stats, voice_num=1, wav_file=None, language='FR', seed=0):
     p   = params
     s   = stats
     N   = voice_num
     lang = language.upper()
 
     # Build bracket strings
-    xtts_arr  = [N, 0, p['trim_start'], p['trim_end'],
+    xtts_arr  = [N, seed, p['trim_start'], p['trim_end'],
                  p['fade_in'], p['fade_out'],
                  p['temperature'], p['top_k'], p['top_p']]
     xtts_str  = ', '.join(fmt(v) for v in xtts_arr)
@@ -339,8 +340,7 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR'):
     print(f"""  📋  READY TO PASTE  (voice #{N} / {lang})
   ══════════════════════════════════════════════════════════
 
-  # ── XTTS params  {{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p}}
-  # ── seed=0 → no seed  (replace with a number for reproducibility)
+  # Voice {N} [{lang}]  {s['voice_type']}  {int(s['f0_median'])} Hz
   {{{xtts_str}}}
 
   # ── Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
@@ -387,10 +387,34 @@ def main():
         print(__doc__)
         sys.exit(0)
 
-    args    = sys.argv[1:]
-    precise = '--precise' in args
-    args    = [a for a in args if a not in ('--precise', '--fast')]
-    fast    = not precise
+    args     = sys.argv[1:]
+    precise  = '--precise' in args
+    args     = [a for a in args if a not in ('--precise', '--fast')]
+    fast     = not precise
+
+    # --start-num N : numéro de la première voix (défaut: 1)
+    start_num = 1
+    if '--start-num' in args:
+        idx_sn = args.index('--start-num')
+        if idx_sn + 1 < len(args):
+            start_num = int(args[idx_sn + 1])
+            args = [a for i, a in enumerate(args) if i != idx_sn and i != idx_sn + 1]
+
+    # --seed N[,N2,...] : seed(s) par voix (défaut: 0)
+    seeds = []
+    if '--seed' in args:
+        idx_sd = args.index('--seed')
+        if idx_sd + 1 < len(args):
+            seeds = [int(x) for x in args[idx_sd + 1].split(',')]
+            args = [a for i, a in enumerate(args) if i != idx_sd and i != idx_sd + 1]
+
+    def get_seed(voice_idx):
+        """Retourne le seed pour la voix voice_idx (0-based)."""
+        if not seeds:
+            return 0
+        if voice_idx < len(seeds):
+            return seeds[voice_idx]
+        return seeds[-1]  # dernier seed répété
 
     if not args:
         print(__doc__)
@@ -415,15 +439,16 @@ def main():
 
     results = []
 
-    for idx, (wav_file, lang) in enumerate(voice_list, 1):
+    for idx, (wav_file, lang) in enumerate(voice_list, start_num):
         if not os.path.exists(wav_file):
             print(f"❌  File not found: {wav_file}")
             continue
         try:
             params, stats = analyse_voice(wav_file, fast=fast)
+            seed = get_seed(idx - start_num)
             display_results(params, stats, voice_num=idx,
-                            wav_file=wav_file, language=lang)
-            results.append((wav_file, lang, params, stats))
+                            wav_file=wav_file, language=lang, seed=seed)
+            results.append((wav_file, lang, params, stats, seed))
         except Exception as e:
             print(f"❌  Error analysing {wav_file}: {e}")
             import traceback
@@ -432,16 +457,21 @@ def main():
     # Multi-voice summary
     if len(results) > 1:
         print(f"\n{'═'*62}")
-        print(f"  📋  MULTI-VOICE SUMMARY")
+        print(f"  MULTI-VOICE SUMMARY — ready to paste")
         print(f"{'═'*62}")
-        for idx, (wav, lang, p, s) in enumerate(results, 1):
+        for idx, (wav, lang, p, s, seed) in enumerate(results, start_num):
+            xtts_arr  = [idx, seed, p['trim_start'], p['trim_end'],
+                         p['fade_in'], p['fade_out'],
+                         p['temperature'], p['top_k'], p['top_p']]
+            xtts_str  = ', '.join(fmt(v) for v in xtts_arr)
             audio_vals = [p['speed'], p['volume'],
                           p['eq_low'], p['eq_mid'], p['eq_high'],
                           p['highpass'], p['lowpass'],
                           p['noise_reduction'], p['compression'], p['deesser']]
             audio_str = f"{idx}, {lang}, " + ', '.join(fmt(v) for v in audio_vals)
-            print(f"  Voice {idx} [{lang}]  {s['voice_type']:<22} {s['f0_median']:.0f} Hz")
-            print(f"         [{audio_str}]")
+            print(f"\n  # Voice {idx} [{lang}]  {s['voice_type']:<22} {s['f0_median']:.0f} Hz  {os.path.basename(wav)}")
+            print(f"  {{{xtts_str}}}")
+            print(f"  [{audio_str}]")
         print()
 
 
