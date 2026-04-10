@@ -15,16 +15,16 @@ Usage: python guided_meditation_generator_v20.py script.txt output.wav voice1.wa
 
 Command for two voices an ambient music and 2 ponctual songs :
   
-        You need to do under ~/XTTS/ : conda active xtts (activation in Conda environnement) before use this following command
+        You need to do under ~/XTTS-Voice-Studio/ : conda active xtts (activation in Conda environnement) before use this following command
 
-	python ~/XTTS/Python_ScriptingScript_Pythonguided_meditation_generator_v20.py \
-       		~/XTTS/Prompts/prompt.txt \
-       		~/XTTS/Output_Song_files/output.wav \
-       		~/XTTS/Cloning_Voices/voice1.wav \
-       		~/XTTS/Cloning_Voices/voice2.wav \
-       		~/XTTS/Ambient_Musics/forest.wav \    
-       		~/XTTS/Punctual_Sounds/bell1.wav \
-       		~/XTTS/Punctual_Sounds/bell2.wav
+	python ~/XTTS-Voice-Studio/Python_ScriptingScript_Pythonguided_meditation_generator_v20.py \
+       		~/XTTS-Voice-Studio/Prompts/prompt.txt \
+       		~/XTTS-Voice-Studio/Output_Song_files/output.wav \
+       		~/XTTS-Voice-Studio/Cloning_Voices/voice1.wav \
+       		~/XTTS-Voice-Studio/Cloning_Voices/voice2.wav \
+       		~/XTTS-Voice-Studio/Ambient_Musics/forest.wav \    
+       		~/XTTS-Voice-Studio/Punctual_Sounds/bell1.wav \
+       		~/XTTS-Voice-Studio/Punctual_Sounds/bell2.wav
 
 TWO bracket formats in the text file:
 
@@ -103,7 +103,7 @@ Punctual music syntax (declare volume/duration at top, trigger inline):
 
 Ambient music:
   ambient_vol=-12  → loops throughout the whole track at -12 dB
-  (ambient file auto-detected: full path must contain "ambient" — e.g. ~/XTTS/Ambient_Musics/forest.wav)
+  (ambient file auto-detected: full path must contain "ambient" — e.g. ~/XTTS-Voice-Studio/Ambient_Musics/forest.wav)
 """
 
 from TTS.api import TTS
@@ -643,10 +643,10 @@ def parse_audio_files(args):
       - Anything else                   → punctual music file
 
     Examples:
-      ~/XTTS/Voices_Cloning/Monique.wav          → voice
-      ~/XTTS/Ambient_Musics/forest.wav           → ambient
-      ~/XTTS/Punctual_Sounds/bell.wav            → punctual music
-      ~/XTTS/Punctual_Sounds/metronome.wav       → punctual music
+      ~/XTTS-Voice-Studio/Voices_Cloning/Monique.wav          → voice
+      ~/XTTS-Voice-Studio/Ambient_Musics/forest.wav           → ambient
+      ~/XTTS-Voice-Studio/Punctual_Sounds/bell.wav            → punctual music
+      ~/XTTS-Voice-Studio/Punctual_Sounds/metronome.wav       → punctual music
 
     Returns: (voice_files, ambient_file, punctual_music_files)
     """
