@@ -713,9 +713,12 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
     ambient_vol, music_configs, clean_content = extract_config(text)
 
     # One TTS instance per voice
+	
+    _device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[*] TTS device: {_device}")
     tts_instances = {}
     for i, voice_path in enumerate(voice_files, 1):
-        tts_instances[i] = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+        tts_instances[i] = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(_device)
         print(f"   [OK] TTS initialised for voice {i}")
 
     # Split text into segments
