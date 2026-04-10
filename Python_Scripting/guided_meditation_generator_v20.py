@@ -8,7 +8,7 @@ Guided Meditation Generator - VERSION 20 - PER-VOICE XTTS INLINE PARAMS
            with audio brackets [ ].  Both syntaxes coexist.
 - v19: Per-voice global XTTS params (multi-line blocks)
 - v18: trim_start/end, fade_in/out, temperature, top_k, top_p configurable
-- v16: seed=value for full reproducibility
+- v16: seed=value for full reproducibility 
 
 Usage: python guided_meditation_generator_v20.py script.txt output.wav voice1.wav [voice2.wav ...] [music...]
 
@@ -643,7 +643,7 @@ def parse_audio_files(args):
       - Anything else                   → punctual music file
 
     Examples:
-      ~/XTTS-Voice-Studio/Voices_Cloning/Monique.wav          → voice
+      ~/XTTS-Voice-Studio/Voices_Cloning/Sophie.wav          → voice
       ~/XTTS-Voice-Studio/Ambient_Musics/forest.wav           → ambient
       ~/XTTS-Voice-Studio/Punctual_Sounds/bell.wav            → punctual music
       ~/XTTS-Voice-Studio/Punctual_Sounds/metronome.wav       → punctual music
