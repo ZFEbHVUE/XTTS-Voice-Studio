@@ -25,7 +25,8 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## Screenshot
 
-![XTTS Voice Studio GUI](docs/gui_main.png)
+*(Add a screenshot of the GUI here once you've taken one)*
+
 ---
 
 ## Features
@@ -34,14 +35,14 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 A unified Tkinter interface with one tab per tool. Every tab shares a consistent live progress indicator and a frozen final timer that displays `[HH:MM:SS] done` until the next run.
 
-| Tab | Script | Purpose |
+| Tab | Script / Command | Purpose |
 |---|---|---|
-| Generator | `guided_meditation_generator_v20.py` | Build multi-voice guided meditations with inline XTTS parameters, ambient music, and punctual sounds |
-| Analyser | `voice_analyser.py` | Analyse one or more voices and produce ready-to-paste XTTS parameter blocks |
-| Transcription | `transcribeSong2txt_with_pause.py` | Transcribe audio to XTTS-ready text with pause markers and optional per-word pitch annotation |
-| Voice Separation | `extract_voices.py` | Separate vocal stems from a mixed track |
-| Pitch | `apply_pitch_to_clone.py` | Apply pitch correction to a cloned voice |
-| Video→MP3 | `video2txt.py` | Extract audio from video files for downstream processing |
+| `[Gen] Generator` | `guided_meditation_generator_v20.py` | Build multi-voice guided meditations with inline XTTS parameters, ambient music, and punctual sounds |
+| `[Ana] Analyser` | `voice_analyser.py` | Analyse one or more voices and produce ready-to-paste XTTS parameter blocks |
+| `[Txt] Transcription` | `transcribeSong2txt_with_pause.py` (audio inputs) or `video2txt.py` (video inputs) | Transcribe audio or video to XTTS-ready text with pause markers and optional per-word pitch annotation. The script is chosen automatically based on the source file extension. |
+| `[Vox] Voice sep.` | `extract_voices.py` | Separate vocal stems from a mixed track |
+| `[Pit] Pitch` | `apply_pitch_to_clone.py` | Apply pitch correction to a cloned voice |
+| `[Vid] Video->MP3` | `ffmpeg` (system command) | Extract an MP3 audio track from any video file — no transcription, just a format conversion |
 
 ### Guided Meditation Generator
 
@@ -125,11 +126,11 @@ XTTS-Voice-Studio/
 ├── Python_Scripting/              # All executable scripts
 │   ├── xtts_studio.py             # Tkinter GUI (main entry point)
 │   ├── guided_meditation_generator_v20.py
-│   ├── transcribeSong2txt_with_pause.py   # v21 (faster-whisper)
+│   ├── transcribeSong2txt_with_pause.py   # v21 (faster-whisper) — audio transcription
+│   ├── video2txt.py                        # video transcription (extracts audio + transcribes)
 │   ├── voice_analyser.py
 │   ├── extract_voices.py
-│   ├── apply_pitch_to_clone.py
-│   └── video2txt.py
+│   └── apply_pitch_to_clone.py
 ├── Prompts/                       # Text scripts for meditation generation
 ├── Voices_Cloning/                # Voice samples for XTTS cloning (.wav, 6-30s)
 ├── Ambient_Musics/                # Background ambient loops
