@@ -8,23 +8,23 @@ Guided Meditation Generator - VERSION 20 - PER-VOICE XTTS INLINE PARAMS
            with audio brackets [ ].  Both syntaxes coexist.
 - v19: Per-voice global XTTS params (multi-line blocks)
 - v18: trim_start/end, fade_in/out, temperature, top_k, top_p configurable
-- v16: seed=value for full reproducibility 
+- v16: seed=value for full reproducibility
 
 Usage: python guided_meditation_generator_v20.py script.txt output.wav voice1.wav [voice2.wav ...] [music...]
 
 
 Command for two voices an ambient music and 2 ponctual songs :
   
-        You need to do under ~/XTTS-Voice-Studio/ : conda active xtts (activation in Conda environnement) before use this following command
+        You need to do under ~/XTTS/ : conda active xtts (activation in Conda environnement) before use this following command
 
-	python ~/XTTS-Voice-Studio/Python_ScriptingScript_Pythonguided_meditation_generator_v20.py \
-       		~/XTTS-Voice-Studio/Prompts/prompt.txt \
-       		~/XTTS-Voice-Studio/Output_Song_files/output.wav \
-       		~/XTTS-Voice-Studio/Cloning_Voices/voice1.wav \
-       		~/XTTS-Voice-Studio/Cloning_Voices/voice2.wav \
-       		~/XTTS-Voice-Studio/Ambient_Musics/forest.wav \    
-       		~/XTTS-Voice-Studio/Punctual_Sounds/bell1.wav \
-       		~/XTTS-Voice-Studio/Punctual_Sounds/bell2.wav
+	python ~/XTTS/Python_ScriptingScript_Pythonguided_meditation_generator_v20.py \
+       		~/XTTS/Prompts/prompt.txt \
+       		~/XTTS/Output_Song_files/output.wav \
+       		~/XTTS/Cloning_Voices/voice1.wav \
+       		~/XTTS/Cloning_Voices/voice2.wav \
+       		~/XTTS/Ambient_Musics/forest.wav \    
+       		~/XTTS/Punctual_Sounds/bell1.wav \
+       		~/XTTS/Punctual_Sounds/bell2.wav
 
 TWO bracket formats in the text file:
 
@@ -103,7 +103,7 @@ Punctual music syntax (declare volume/duration at top, trigger inline):
 
 Ambient music:
   ambient_vol=-12  → loops throughout the whole track at -12 dB
-  (ambient file auto-detected: full path must contain "ambient" — e.g. ~/XTTS-Voice-Studio/Ambient_Musics/forest.wav)
+  (ambient file auto-detected: full path must contain "ambient" — e.g. ~/XTTS/Ambient_Musics/forest.wav)
 """
 
 from TTS.api import TTS
@@ -643,10 +643,10 @@ def parse_audio_files(args):
       - Anything else                   → punctual music file
 
     Examples:
-      ~/XTTS-Voice-Studio/Voices_Cloning/Sophie.wav          → voice
-      ~/XTTS-Voice-Studio/Ambient_Musics/forest.wav           → ambient
-      ~/XTTS-Voice-Studio/Punctual_Sounds/bell.wav            → punctual music
-      ~/XTTS-Voice-Studio/Punctual_Sounds/metronome.wav       → punctual music
+      ~/XTTS/Voices_Cloning/Monique.wav          → voice
+      ~/XTTS/Ambient_Musics/forest.wav           → ambient
+      ~/XTTS/Punctual_Sounds/bell.wav            → punctual music
+      ~/XTTS/Punctual_Sounds/metronome.wav       → punctual music
 
     Returns: (voice_files, ambient_file, punctual_music_files)
     """
@@ -712,14 +712,16 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
 
     ambient_vol, music_configs, clean_content = extract_config(text)
 
-    # One TTS instance per voice
-	
+    # Single shared TTS instance — XTTS v2 is a voice cloning model, so
+    # the same model handles every voice. The actual voice switch happens
+    # later via the speaker_wav argument of tts_to_file(). This saves
+    # ~2 GB of VRAM per additional voice (critical on 4 GB GPUs).
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[*] TTS device: {_device}")
-    tts_instances = {}
-    for i, voice_path in enumerate(voice_files, 1):
-        tts_instances[i] = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(_device)
-        print(f"   [OK] TTS initialised for voice {i}")
+    shared_tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(_device)
+    tts_instances = {i: shared_tts for i in range(1, len(voice_files) + 1)}
+    for i in tts_instances:
+        print(f"   [OK] TTS ready for voice {i}")
 
     # Split text into segments
     raw_segments = re.split(
