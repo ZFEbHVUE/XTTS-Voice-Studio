@@ -25,7 +25,7 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## Screenshot
 
-*(Add a screenshot of the GUI here once you've taken one)*
+![XTTS Voice Studio GUI](docs/gui_main.png)
 
 ---
 
