@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Voice Analyser - XTTS parameter optimiser for guided_meditation_generator_v20.py
+Voice Analyser - XTTS parameter optimiser for guided_meditation_generator_v21.py
 ==================================================================================
 Analyses acoustic features of a reference WAV file and outputs ready-to-paste
 parameters for both bracket types:
 
-  {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p}
+  {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen}
   [N, LANG, speed, vol, eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
 
 Usage:
@@ -250,11 +250,30 @@ def analyse_voice(wav_file, fast=True):
 
     # ── 9. XTTS params ────────────────────────────────────────────────────
     # F0 jitter = voice expressiveness
-    # Stable voice → low temperature (reproducibility)
-    if   f0_jitter < 0.10: temperature, top_k, top_p = 0.50, 25, 0.70
-    elif f0_jitter < 0.18: temperature, top_k, top_p = 0.55, 30, 0.75
-    elif f0_jitter < 0.30: temperature, top_k, top_p = 0.60, 40, 0.80
-    else:                  temperature, top_k, top_p = 0.65, 50, 0.85
+    # Stable/monotone voice → low temperature but high repetition_penalty
+    # Expressive voice     → higher temperature, lower repetition_penalty
+    if   f0_jitter < 0.10:
+        temperature, top_k, top_p = 0.50, 25, 0.70
+        repetition_penalty        = 7.0   # monotone → high anti-repetition
+    elif f0_jitter < 0.18:
+        temperature, top_k, top_p = 0.55, 30, 0.75
+        repetition_penalty        = 6.0
+    elif f0_jitter < 0.30:
+        temperature, top_k, top_p = 0.60, 40, 0.80
+        repetition_penalty        = 5.0
+    else:
+        temperature, top_k, top_p = 0.65, 50, 0.85
+        repetition_penalty        = 4.0   # expressive → natural variation reduces repetition risk
+
+    # length_penalty: based on voiced_ratio (speech density)
+    # Dense speech (high voiced_ratio) → slightly push the model toward longer output
+    # Sparse speech (lots of pauses)   → neutral / slight shortening tendency
+    if   voiced_ratio > 0.65: length_penalty = 0.9   # fast / dense speaker
+    elif voiced_ratio > 0.45: length_penalty = 1.0   # neutral
+    else:                     length_penalty = 1.1   # slow / breathy speaker
+
+    step(f"XTTS     temp={temperature}  top_k={top_k}  top_p={top_p}  "
+         f"rep_pen={repetition_penalty}  len_pen={length_penalty}", t0)
 
     # ── 10. Fades ─────────────────────────────────────────────────────────
     fade_in  = 150  # optimal for meditation (anti-click)
@@ -263,23 +282,25 @@ def analyse_voice(wav_file, fast=True):
     step(f"Analysis complete  ({duration:.1f}s audio processed)", t0)
 
     params = dict(
-        speed           = speed,
-        volume          = volume,
-        eq_low          = eq_low,
-        eq_mid          = eq_mid,
-        eq_high         = eq_high,
-        highpass        = highpass,
-        lowpass         = lowpass,
-        noise_reduction = noise_reduction,
-        compression     = compression,
-        deesser         = deesser,
-        trim_start      = trim_start,
-        trim_end        = trim_end,
-        fade_in         = fade_in,
-        fade_out        = fade_out,
-        temperature     = temperature,
-        top_k           = top_k,
-        top_p           = top_p,
+        speed              = speed,
+        volume             = volume,
+        eq_low             = eq_low,
+        eq_mid             = eq_mid,
+        eq_high            = eq_high,
+        highpass           = highpass,
+        lowpass            = lowpass,
+        noise_reduction    = noise_reduction,
+        compression        = compression,
+        deesser            = deesser,
+        trim_start         = trim_start,
+        trim_end           = trim_end,
+        fade_in            = fade_in,
+        fade_out           = fade_out,
+        temperature        = temperature,
+        top_k              = top_k,
+        top_p              = top_p,
+        repetition_penalty = repetition_penalty,
+        length_penalty     = length_penalty,
     )
 
     stats = dict(
@@ -302,16 +323,18 @@ def analyse_voice(wav_file, fast=True):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def display_results(params, stats, voice_num=1, wav_file=None, language='FR', seed=0):
-    p   = params
-    s   = stats
-    N   = voice_num
+    p    = params
+    s    = stats
+    N    = voice_num
     lang = language.upper()
 
-    # Build bracket strings
-    xtts_arr  = [N, seed, p['trim_start'], p['trim_end'],
-                 p['fade_in'], p['fade_out'],
-                 p['temperature'], p['top_k'], p['top_p']]
-    xtts_str  = ', '.join(fmt(v) for v in xtts_arr)
+    # Build bracket strings — 11 values for XTTS block (v21)
+    xtts_arr = [N, seed,
+                p['trim_start'], p['trim_end'],
+                p['fade_in'], p['fade_out'],
+                p['temperature'], p['top_k'], p['top_p'],
+                p['repetition_penalty'], p['length_penalty']]
+    xtts_str = ', '.join(fmt(v) for v in xtts_arr)
 
     # Audio bracket includes LANG in position 2
     audio_vals = [p['speed'], p['volume'],
@@ -338,29 +361,32 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
 """)
 
     print(f"""  📋  READY TO PASTE  (voice #{N} / {lang})
-  ══════════════════════════════════════════════════════════
+  ══════════════════════════════════════════════════════════════════
 
   # Voice {N} [{lang}]  {s['voice_type']}  {int(s['f0_median'])} Hz
+  # ── XTTS params  {{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen}}
   {{{xtts_str}}}
 
   # ── Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
   [{audio_str}]
 
-  ══════════════════════════════════════════════════════════""")
+  ══════════════════════════════════════════════════════════════════""")
 
     print(f"""  🔍  DETAIL
-  ┌──────────────────────────────────────────────────────┐
+  ┌──────────────────────────────────────────────────────────────┐
   │  XTTS PARAMS  {{{xtts_str}}}
   │  [{N}]    voice number
-  │  [0]    seed         = 0  (none)
-  │  [{p['trim_start']}]  trim_start   = {p['trim_start']} ms
-  │  [{p['trim_end']}]  trim_end     = {p['trim_end']} ms
-  │  [{p['fade_in']}]  fade_in      = {p['fade_in']} ms
-  │  [{p['fade_out']}]  fade_out     = {p['fade_out']} ms
-  │  [{p['temperature']}]  temperature  = {p['temperature']}
-  │  [{p['top_k']:.0f}]   top_k        = {p['top_k']:.0f}
-  │  [{p['top_p']}]  top_p        = {p['top_p']}
-  ├──────────────────────────────────────────────────────┤
+  │  [0]    seed               = 0  (none)
+  │  [{p['trim_start']}]  trim_start         = {p['trim_start']} ms
+  │  [{p['trim_end']}]  trim_end           = {p['trim_end']} ms
+  │  [{p['fade_in']}]  fade_in            = {p['fade_in']} ms
+  │  [{p['fade_out']}]  fade_out           = {p['fade_out']} ms
+  │  [{p['temperature']}]  temperature        = {p['temperature']}
+  │  [{p['top_k']:.0f}]   top_k              = {p['top_k']:.0f}
+  │  [{p['top_p']}]  top_p              = {p['top_p']}
+  │  [{p['repetition_penalty']}]  repetition_penalty = {p['repetition_penalty']}  (anti-bégaiement)
+  │  [{p['length_penalty']}]  length_penalty     = {p['length_penalty']}  (durée phrase)
+  ├──────────────────────────────────────────────────────────────┤
   │  AUDIO PARAMS  [{audio_str}]
   │  [{p['speed']}]  speed        = {p['speed']}  (rubberband)
   │  [{p['volume']:+d}]   volume       = {p['volume']:+d} dB
@@ -372,7 +398,7 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
   │  [{p['noise_reduction']}]  noise redu.  = {p['noise_reduction']}
   │  [{p['compression']}]  compression  = {p['compression']}
   │  [{p['deesser']}]  de-esser     = {p['deesser']}
-  └──────────────────────────────────────────────────────┘""")
+  └──────────────────────────────────────────────────────────────┘""")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -460,9 +486,11 @@ def main():
         print(f"  MULTI-VOICE SUMMARY — ready to paste")
         print(f"{'═'*62}")
         for idx, (wav, lang, p, s, seed) in enumerate(results, start_num):
-            xtts_arr  = [idx, seed, p['trim_start'], p['trim_end'],
-                         p['fade_in'], p['fade_out'],
-                         p['temperature'], p['top_k'], p['top_p']]
+            xtts_arr = [idx, seed,
+                        p['trim_start'], p['trim_end'],
+                        p['fade_in'], p['fade_out'],
+                        p['temperature'], p['top_k'], p['top_p'],
+                        p['repetition_penalty'], p['length_penalty']]
             xtts_str  = ', '.join(fmt(v) for v in xtts_arr)
             audio_vals = [p['speed'], p['volume'],
                           p['eq_low'], p['eq_mid'], p['eq_high'],
