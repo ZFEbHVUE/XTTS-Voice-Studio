@@ -19,6 +19,8 @@ XTTS Voice Studio is a personal production suite for:
 
 Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) or directly from the command line.
 
+![XTTS Voice Studio GUI](dos/gui_main.png)
+
 ---
 
 ## Features
