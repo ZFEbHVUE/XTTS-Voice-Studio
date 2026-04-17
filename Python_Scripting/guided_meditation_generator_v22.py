@@ -767,22 +767,24 @@ def generate_sentence_audio(clean, voice_num, voice_files, tts_instances,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_parallel_block(inner_segments, voice_files, tts_instances,
-                            xtts_params_by_voice, offset_ms, temp_file):
+                            xtts_params_by_voice, offsets, temp_file):
     """
     Process a [parallel] ... [/parallel] block.
 
     inner_segments : list of segment strings between [parallel] and [/parallel]
-    offset_ms      : milliseconds to delay each successive voice track
-                     (voice 1 starts at 0, voice 2 at offset_ms, voice 3 at 2*offset_ms, ...)
+    offsets        : list of absolute start times in ms for voices 2, 3, 4, ...
+                     Voice 1 always starts at 0ms.
+                     If the list is shorter than the number of voices, extra voices start at 0ms.
+                     Examples:
+                       []          -> all voices at 0ms
+                       [1000]      -> voice 2 at 1s, others at 0ms
+                       [1000,5000] -> voice 2 at 1s, voice 3 at 5s
     temp_file      : path for TTS temp WAV output
 
     Returns: (mixed AudioSegment, total_duration_ms, sentences_generated_count)
-
-    Each voice track is built from the segments attributed to it (via {N} / [N,...] switches).
-    All tracks are then mixed via pydub.overlay() into a single segment.
-    The total duration equals that of the longest track (accounting for offsets).
     """
-    print(f"\n  [PARALLEL] Starting parallel block (offset={offset_ms}ms, "
+    offsets_str = ','.join(f"{o/1000:.1f}s" for o in offsets) if offsets else "0s"
+    print(f"\n  [PARALLEL] Starting parallel block (offsets=[{offsets_str}], "
           f"{len(inner_segments)} inner segments)")
 
     # ── Parse inner segments into per-voice tracks ────────────────────────────
@@ -885,17 +887,26 @@ def process_parallel_block(inner_segments, voice_files, tts_instances,
     # ── Mix all tracks with offsets ───────────────────────────────────────────
     voices_ordered = track_order  # preserves declaration order in the block
 
+    # Build per-voice absolute start times:
+    # voice index 0 (first declared) always starts at 0ms
+    # voice index 1 -> offsets[0] if available, else 0
+    # voice index 2 -> offsets[1] if available, else 0
+    def get_start_ms(idx):
+        if idx == 0:
+            return 0
+        return offsets[idx - 1] if (idx - 1) < len(offsets) else 0
+
     # Start with an empty base long enough to hold all tracks
     max_needed = 0
     for idx, vn in enumerate(voices_ordered):
-        end_ms = idx * offset_ms + len(track_audios[vn])
+        end_ms = get_start_ms(idx) + len(track_audios[vn])
         if end_ms > max_needed:
             max_needed = end_ms
 
     mixed = AudioSegment.silent(duration=max_needed)
 
     for idx, vn in enumerate(voices_ordered):
-        start_ms = idx * offset_ms
+        start_ms = get_start_ms(idx)
         mixed = mixed.overlay(track_audios[vn], position=start_ms)
         print(f"  [PARALLEL] Mixed voice {vn} at position {start_ms/1000:.2f}s "
               f"(duration {len(track_audios[vn])/1000:.2f}s)")
@@ -912,13 +923,31 @@ def process_parallel_block(inner_segments, voice_files, tts_instances,
 
 def parse_parallel_offset(segment):
     """
-    Parse [parallel] or [parallel, offset=1.5s] -> offset in milliseconds.
-    Returns offset_ms (int), default 0.
+    Parse [parallel] or [parallel, offset=1s,5s] -> list of offsets in milliseconds.
+
+    The list contains the absolute start time for voices 2, 3, 4, ...
+    Voice 1 always starts at 0ms.
+
+    Examples:
+      [parallel]              -> []           voice 1 only, or all at 0
+      [parallel, offset=1s]   -> [1000]       voice 2 at 1s
+      [parallel, offset=1s,5s]-> [1000, 5000] voice 2 at 1s, voice 3 at 5s
+
+    If there are more voices than offsets, extra voices start at 0ms.
     """
-    m = re.search(r'offset\s*=\s*([\d.]+)\s*s?', segment, re.IGNORECASE)
-    if m:
-        return int(float(m.group(1)) * 1000)
-    return 0
+    m = re.search(r'offset\s*=\s*([\d.,s ]+)', segment, re.IGNORECASE)
+    if not m:
+        return []
+    raw = m.group(1)
+    # Split on commas, strip trailing 's' and spaces
+    parts = [p.strip().rstrip('s').strip() for p in raw.split(',')]
+    offsets = []
+    for p in parts:
+        try:
+            offsets.append(int(float(p) * 1000))
+        except ValueError:
+            pass
+    return offsets
 
 
 def count_total_sentences(segments):
@@ -1043,8 +1072,9 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
 
         # ── [parallel, offset=Xs] block ───────────────────────────────────────
         if re.match(r'^\[parallel[^\]]*\]$', segment, re.IGNORECASE):
-            offset_ms = parse_parallel_offset(segment)
-            print(f"  [*] [parallel] block detected (offset={offset_ms}ms)")
+            offsets = parse_parallel_offset(segment)
+            offsets_str = ','.join(f"{o/1000:.1f}s" for o in offsets) if offsets else "0s"
+            print(f"  [*] [parallel] block detected (offsets=[{offsets_str}])")
 
             # Collect all inner segments until [/parallel]
             inner_segments = []
@@ -1067,7 +1097,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
             t_parallel_start = time.time()
             mixed_audio, block_dur_ms, n_sentences = process_parallel_block(
                 inner_segments, voice_files, tts_instances,
-                xtts_params_by_voice, offset_ms, temp_file
+                xtts_params_by_voice, offsets, temp_file
             )
 
             if block_dur_ms > 0:

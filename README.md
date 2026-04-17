@@ -53,12 +53,11 @@ Produces long-form guided meditation WAV files from a simple text script. Suppor
   ```
   [N, LANG, speed, volume, eq_low, eq_mid, eq_high, hp, lp, noise_reduction, compression, de-esser]
   ```
-- **Parallel voice overlay** (v22): mix two or more voices simultaneously with optional time offset:
+- **Parallel voice overlay** (v22): mix two or more voices simultaneously with per-voice absolute offsets:
   ```
-  [parallel, offset=1.5s]
-  {1, ...} [1, FR, ...] Voice one speaks here.
-  {2, ...} [2, FR, ...] Voice two speaks something different at the same time.
-  [/parallel]
+  [parallel]                    # all voices simultaneous
+  [parallel, offset=1s]         # voice 2 starts at 1s
+  [parallel, offset=1s,5s]      # voice 2 at 1s, voice 3 at 5s
   ```
 - **Smart pause handling**: `[pause=2s]` for fixed silences, `[pause=4s,start]` to ensure total sentence+silence duration
 - **Ambient tracks** that loop throughout the entire meditation at a chosen volume
@@ -192,7 +191,7 @@ The last two values in the `{}` block are `rep_pen` (repetition penalty, default
 Two or more voices can speak simultaneously — each with its own text and full XTTS/audio parameter set. All parallel blocks support `{N,...}`, `[N,...]`, and `[pause=Xs]` syntax identically to normal blocks.
 
 ```
-# Example 1 — two voices start simultaneously
+# Example 1 — two voices simultaneous
 [parallel]
 {1, 42, 110, 255, 150, 300, 0.65, 50, 0.85, 5.0, 1.0}
 [1, FR, 0.85, +1, -5, +1, -1, 90, 9000, 0.3, 0.4, 0.2]
@@ -202,15 +201,21 @@ The main narrator speaks this phrase slowly.
 A second voice whispers something different underneath.
 [/parallel]
 
-# Example 2 — three voices in a staggered canon (1s offset between each)
-[parallel, offset=1s]
-{1, ...} [1, FR, ...] First voice begins the phrase.
-{2, ...} [2, FR, ...] Second voice echoes one second later.
-{3, ...} [3, FR, ...] Third voice joins another second after that.
+# Example 2 — voice 2 starts at 1s, voice 3 starts at 5s
+[parallel, offset=1s,5s]
+{1, ...} [1, FR, ...] First voice begins immediately.
+{2, ...} [2, FR, ...] Second voice enters after 1 second.
+{3, ...} [3, FR, ...] Third voice joins at 5 seconds.
+[/parallel]
+
+# Example 3 — only two voices, second offset value ignored
+[parallel, offset=1s,5s]
+{1, ...} [1, FR, ...] First voice.
+{2, ...} [2, FR, ...] Second voice starts at 1s. The 5s is simply ignored.
 [/parallel]
 ```
 
-The `offset=` parameter delays each successive voice relative to the one declared before it. The total block duration equals the longest track including its offset. With no `offset=`, all voices start at exactly the same time.
+The `offset=` values are **absolute start times** for voices 2, 3, 4, ... — voice 1 always starts at 0s. Extra offset values beyond the number of declared voices are ignored. Voices without a corresponding offset value start at 0s.
 
 The number of voices is unlimited — the only hard constraint is having a matching WAV reference file for each voice number used.
 
@@ -233,9 +238,10 @@ python Python_Scripting/transcribeSong2txt_with_pause.py \
 
 #### `guided_meditation_generator_v22.py` *(new script)*
 
-- **Parallel voice overlay** — new `[parallel, offset=Xs]` / `[/parallel]` block syntax allows two or more voices to speak simultaneously, each with independent text and full `{N,...}` / `[N,...]` / `[pause=Xs]` parameter control
-- Each voice track inside a parallel block is generated independently and mixed into a single segment via `pydub.overlay()`
-- The `offset=` parameter (default `0s`) staggers voice entry times — voice 1 at 0s, voice 2 at offset, voice 3 at 2×offset, and so on
+- **Parallel voice overlay** — new `[parallel, offset=...]` / `[/parallel]` block syntax allows two or more voices to speak simultaneously, each with independent text and full `{N,...}` / `[N,...]` / `[pause=Xs]` parameter control
+- Each voice track is generated independently and mixed via `pydub.overlay()`
+- The `offset=` values are **absolute start times** for voices 2, 3, 4, ... (voice 1 always at 0s): `offset=1s` places voice 2 at 1s; `offset=1s,5s` places voice 2 at 1s and voice 3 at 5s
+- Extra offset values beyond the number of declared voices are ignored; voices without a corresponding offset start at 0s
 - No limit on the number of simultaneous voices — requires one WAV reference file per voice number used
 - New `generate_sentence_audio()` helper extracted from the main generation loop — shared by normal and parallel modes, ensuring identical audio processing in both paths
 - Progress bar correctly counts sentences inside parallel blocks
