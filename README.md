@@ -31,7 +31,7 @@ A unified Tkinter interface with one tab per tool. Every tab shares a consistent
 
 | Tab | Script / Command | Purpose |
 |-----|-----------------|---------|
-| **[Gen] Generator** | `guided_meditation_generator_v22.py` | Build multi-voice guided meditations with inline XTTS parameters, ambient music, punctual sounds, and parallel voice overlay |
+| **[Gen] Generator** | `guided_meditation_generator_v23.py` | Build multi-voice guided meditations with inline XTTS parameters, ambient music, punctual sounds, parallel voice overlay, reverb, noise gate, pan, and limiter |
 | **[Ana] Analyser** | `voice_analyser.py` | Analyse one or more voices and produce ready-to-paste XTTS parameter blocks |
 | **[Txt] Transcription** | `transcribeSong2txt_with_pause.py` (audio) or `video2txt.py` (video) | Transcribe audio or video to XTTS-ready text with pause markers and optional per-word pitch annotation |
 | **[Vox] Voice sep.** | `extract_voices.py` | Separate vocal stems from a mixed track |
@@ -44,14 +44,15 @@ A unified Tkinter interface with one tab per tool. Every tab shares a consistent
 
 Produces long-form guided meditation WAV files from a simple text script. Supports:
 
-- **Inline XTTS parameters per voice** using curly-brace syntax — 9 values (v20, still valid) or 11 values (v21/v22):
+- **Inline XTTS parameters per voice** using curly-brace syntax — fully backward-compatible from v20 (9 values) up to v23 (14 values):
   ```
   {N, seed, trim_start, trim_end, fade_in, fade_out, temperature, top_k, top_p}
   {N, seed, trim_start, trim_end, fade_in, fade_out, temperature, top_k, top_p, rep_pen, len_pen}
+  {N, seed, trim_start, trim_end, fade_in, fade_out, temperature, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs}
   ```
-- **Per-voice audio configuration** using bracket syntax:
+- **Per-voice audio configuration** using bracket syntax — up to 16 values (v23):
   ```
-  [N, LANG, speed, volume, eq_low, eq_mid, eq_high, hp, lp, noise_reduction, compression, de-esser]
+  [N, LANG, speed, volume, eq_low, eq_mid, eq_high, hp, lp, NR, compression, de-esser, reverb, noise_gate, pan, limiter]
   ```
 - **Parallel voice overlay** (v22): mix two or more voices simultaneously with per-voice absolute offsets:
   ```
@@ -137,7 +138,7 @@ If you see `CUDA OK`, everything is ready. If not, the scripts will automaticall
 XTTS-Voice-Studio/
 ├── Python_Scripting/              # All executable scripts
 │   ├── xtts_studio.py             # Tkinter GUI (main entry point)
-│   ├── guided_meditation_generator_v22.py
+│   ├── guided_meditation_generator_v23.py
 │   ├── transcribeSong2txt_with_pause.py   # v21 (faster-whisper) — audio transcription
 │   ├── video2txt.py                        # video transcription (extracts audio + transcribes)
 │   ├── voice_analyser.py
@@ -170,11 +171,14 @@ Every tab has a **Browse** button that opens in the appropriate default director
 
 ### Generating a guided meditation
 
-Create a text file in `Prompts/` using this syntax:
+Create a text file in `Prompts/` using this syntax (v23 full example):
 
 ```
-{1, 42, 110, 255, 150, 300, 0.65, 50, 0.85, 5.0, 1.0}
-[1, FR, 0.85, +1, -5, +1, -1, 90, 9000, 0.3, 0.4, 0.2]
+ambient_volume=-18
+music_1=5s,-10
+
+{1, 42, 110, 255, 150, 300, 0.65, 50, 0.85, 5.0, 1.0, 40, 4, 0}
+[1, FR, 0.85, +1, -5, +1, -1, 90, 9000, 0.3, 0.4, 0.2, 0, 0, 0, 1]
 Welcome to this guided meditation session.
 [pause=3s]
 Take a deep breath in through your nose.
@@ -184,20 +188,39 @@ And slowly exhale through your mouth.
 [pause=4s]
 ```
 
-The last two values in the `{}` block are `rep_pen` (repetition penalty, default 5.0) and `len_pen` (length penalty, default 1.0). They can be omitted for backward compatibility with v20 scripts.
+All values beyond position 11 in `{}` and beyond position 12 in `[]` default to 0 and can be omitted — v20/v21/v22 scripts run unchanged.
+
+### New parameters (v23)
+
+**XTTS block `{}` — positions 12, 13, 14:**
+
+| Position | Parameter | Default | Description |
+|----------|-----------|---------|-------------|
+| 12 | `gpt_cond_len` | 30 | Seconds of reference WAV used for cloning. Longer = better fidelity. Set to actual WAV duration, capped at 60. |
+| 13 | `gpt_cond_chunk_len` | 4 | GPT conditioning chunk size in seconds. Rarely needs changing. |
+| 14 | `sound_norm_refs` | 0 | Normalise reference WAV before cloning (0=off, 1=on). Enable if the reference is very quiet or very loud. |
+
+**Audio block `[]` — positions 13, 14, 15, 16:**
+
+| Position | Parameter | Default | Description |
+|----------|-----------|---------|-------------|
+| 13 | `reverb` | 0 | Reverb wet level via ffmpeg `aecho` (0=off, 0.3=subtle, 0.7=prominent). Adds spatial presence. |
+| 14 | `noise_gate` | 0 | Noise gate threshold in dB via ffmpeg `agate` (0=off, e.g. -40=gentle, -30=moderate). Removes breath noise between words. |
+| 15 | `pan` | 0 | Stereo pan position (-1.0=hard left, 0=centre, +1.0=hard right). Useful inside `[parallel]` blocks. |
+| 16 | `limiter` | 0 | Output limiter (0=off, 1=on). Prevents inter-sample clipping after all processing stages. |
 
 ### Using parallel voice overlay (v22)
 
 Two or more voices can speak simultaneously — each with its own text and full XTTS/audio parameter set. All parallel blocks support `{N,...}`, `[N,...]`, and `[pause=Xs]` syntax identically to normal blocks.
 
 ```
-# Example 1 — two voices simultaneous
+# Example 1 — two voices simultaneous, panned left/right (v23)
 [parallel]
-{1, 42, 110, 255, 150, 300, 0.65, 50, 0.85, 5.0, 1.0}
-[1, FR, 0.85, +1, -5, +1, -1, 90, 9000, 0.3, 0.4, 0.2]
+{1, 42, 110, 255, 150, 300, 0.65, 50, 0.85, 5.0, 1.0, 40, 4, 0}
+[1, FR, 0.85, +1, -5, +1, -1, 90, 9000, 0.3, 0.4, 0.2, 0.2, -40, -0.3, 1]
 The main narrator speaks this phrase slowly.
-{2, 42, 60, 339, 150, 300, 0.60, 40, 0.80, 5.0, 1.0}
-[2, FR, 0.90, -6, -5, +1, -1, 90, 9000, 0.3, 0.4, 0.2]
+{2, 42, 60, 339, 150, 300, 0.60, 40, 0.80, 5.0, 1.0, 40, 4, 0}
+[2, FR, 0.90, -6, -5, +1, -1, 90, 9000, 0.3, 0.4, 0.2, 0.2, -40, +0.3, 1]
 A second voice whispers something different underneath.
 [/parallel]
 
@@ -235,6 +258,36 @@ python Python_Scripting/transcribeSong2txt_with_pause.py \
 ---
 
 ## Recent changes
+
+### Version 23 (May 2026)
+
+#### `guided_meditation_generator_v23.py` *(new script)*
+
+- **`{}` block extended to 14 values** — three new XTTS cloning quality parameters: `gpt_cond_len` (seconds of reference WAV used for cloning, default 30, recommended: set to actual WAV duration up to 60), `gpt_cond_chunk_len` (GPT chunk size, default 4), `sound_norm_refs` (normalise reference before cloning, default 0)
+- **`[]` block extended to 16 values** — four new audio processing parameters:
+  - `reverb` — room reverb via ffmpeg `aecho` (wet level 0–1)
+  - `noise_gate` — silence gate via ffmpeg `agate` (threshold in dB, 0=off)
+  - `pan` — stereo positioning (-1.0 to +1.0), especially useful in `[parallel]` blocks
+  - `limiter` — output limiter via ffmpeg `alimiter` to prevent clipping (0=off, 1=on)
+- Full pipeline order: Trim → Filters → EQ → NR → De-esser → Compression → Noise gate → Reverb → Fades → Pan → Limiter
+- Fully backward-compatible: all v20, v21, v22 scripts run unchanged (new params default to 0 = off)
+
+#### `voice_analyser.py`
+
+- Output `{}` block updated to **14 values** — `gpt_cond_len` auto-derived from WAV duration (capped at 60s)
+- Output `[]` block updated to **16 values** — `noise_gate` auto-derived from SNR, `limiter` always recommended on, `reverb` and `pan` default to 0
+- **Breathiness detection** via spectral flatness — breathy voices automatically get higher NR and compression
+- **voiced_ratio fix** in fast (YIN) mode — RMS energy gate prevents spurious F0 estimates from inflating voiced_ratio
+- **Volume target** lowered from -16 to -18 dBFS — better headroom for ambient music mix
+- **Adaptive fades** — fade_in/fade_out derived from voice dynamics instead of hardcoded values
+- **Short file handling** — explicit warning when fewer than 5 voiced frames are detected, then clean fallback
+- All emojis replaced with ASCII tags — fixes Windows console cp1252 crashes
+
+#### `xtts_studio.py`
+
+- Generator tab now calls `guided_meditation_generator_v23.py`
+
+---
 
 ### Version 22 (April 2026)
 

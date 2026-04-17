@@ -418,7 +418,7 @@ def tab_generator(nb):
         if not v_script.get() or not v_output.get() or not v_voices.get():
             log(console, "ERR Script, sortie et voix obligatoires."); return
         cmd = [sys.executable,
-               os.path.join(SCRIPTS_DIR, 'guided_meditation_generator_v22.py'),
+               os.path.join(SCRIPTS_DIR, 'guided_meditation_generator_v23.py'),
                v_script.get(), v_output.get()]
         cmd += v_voices.get().split()
         if v_ambient.get(): cmd += v_ambient.get().split()
