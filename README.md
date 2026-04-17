@@ -217,6 +217,8 @@ A second voice whispers something different underneath.
 
 The `offset=` values are **absolute start times** for voices 2, 3, 4, ... — voice 1 always starts at 0s. Extra offset values beyond the number of declared voices are ignored. Voices without a corresponding offset value start at 0s.
 
+The block can be written on a single line or across multiple lines — the parser is whitespace-agnostic.
+
 The number of voices is unlimited — the only hard constraint is having a matching WAV reference file for each voice number used.
 
 ### Transcribing a song
