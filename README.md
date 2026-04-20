@@ -34,7 +34,7 @@ A unified Tkinter interface with one tab per tool. Every tab shares a consistent
 | **[Gen] Generator** | `guided_meditation_generator_v23.py` | Build multi-voice guided meditations with inline XTTS parameters, ambient music, punctual sounds, parallel voice overlay, reverb, noise gate, pan, and limiter |
 | **[Ana] Analyser** | `voice_analyser.py` | Analyse one or more voices and produce ready-to-paste XTTS parameter blocks |
 | **[Txt] Transcription** | `transcribeSong2txt_with_pause.py` (audio) or `video2txt.py` (video) | Transcribe audio or video to XTTS-ready text with pause markers and optional per-word pitch annotation |
-| **[Vox] Voice sep.** | `extract_voices.py` | Separate vocal stems from a mixed track |
+| **[Vox] Voice sep.** | `extract_voices.py` | Separate voices by F0 threshold, remove background music via demucs, and apply dereverberation (noisereduce, WPE, DeepFilterNet) |
 | **[Pit] Pitch** | `apply_pitch_to_clone.py` | Apply pitch correction to a cloned voice |
 | **[Vid] Video->MP3** | `ffmpeg` (system command) | Extract an MP3 audio track from any video file |
 
@@ -83,6 +83,66 @@ Fast and accurate audio-to-text transcription powered by `faster-whisper`:
 - Automatic CUDA → CPU fallback if the GPU is unavailable
 - Output is drop-in compatible with the Guided Meditation Generator
 
+
+---
+
+### Voice Separation (`extract_voices.py`)
+
+Separates voices and cleans audio from any MP3/WAV source. Two main modes:
+
+**Voice separation by F0** — classifies speech segments as female, male, or overlap using pitch analysis, and keeps only the requested category:
+
+```bash
+python extract_voices.py input.wav output.wav --keep female --silence auto \
+    --threshold 165 --overlap-range 200
+```
+
+**Music removal (demucs)** — uses a neural source separation model to strip background music and noise, outputting a clean vocal stem with no F0 filtering and no cuts:
+
+```bash
+python extract_voices.py input.mp3 output.wav --remove-music --demucs-model htdemucs_ft
+```
+
+When `--remove-music` is active, the vocal stem is saved directly — `--keep` is ignored and no segment detection is performed.
+
+**Dereverberation** — apply acoustic cleaning to an already-isolated vocal file:
+
+```bash
+# DeepFilterNet on GPU (best quality)
+python extract_voices.py vocals.wav clean.wav \
+    --keep "vocals only" --dereverberate deepfilter
+
+# Other options: noisereduce (fast), wpe (precise reverb)
+python extract_voices.py vocals.wav clean.wav --dereverberate noisereduce
+```
+
+When `--keep "vocals only"` is combined with `--dereverberate`, the cleaned file is saved directly with no F0 filtering.
+
+**GPU acceleration** — device is selected via `--device cpu|cuda`. The GUI auto-detects CUDA and pre-selects it. Demucs and DeepFilterNet both support GPU; noisereduce and WPE are CPU-only.
+
+**Key parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--keep` | `female` | `female`, `male`, `overlap`, `all`, `female,male`, `vocals only` |
+| `--silence` | `auto` | Natural gap between kept segments; `0` = no silence; `N` = fixed N seconds |
+| `--threshold` | 165 | F0 boundary between male and female in Hz |
+| `--overlap-range` | 200 | F0 range above which a segment is classified as overlap. Use 200+ for solo voice files to avoid cutting expressive segments |
+| `--remove-music` | off | Run demucs before any processing to strip background music |
+| `--demucs-model` | `htdemucs_ft` | `htdemucs` (fast), `htdemucs_ft` (best vocals), `mdx_extra` (dense music) |
+| `--dereverberate` | `none` | `noisereduce`, `wpe`, `deepfilter` |
+| `--device` | `cpu` | `cpu` or `cuda` — affects demucs and DeepFilterNet |
+| `--debug` | off | Print per-segment classification detail |
+
+**Install optional dereverberation backends:**
+
+```bash
+pip install noisereduce        # fast, CPU only
+pip install nara-wpe           # precise reverb removal, CPU only
+pip install deepfilternet      # best quality, GPU supported
+pip install demucs             # required for --remove-music
+```
+
 ---
 
 ## Installation
@@ -116,7 +176,13 @@ conda activate xtts
 pip install TTS torch torchaudio
 pip install faster-whisper
 pip install librosa pydub numpy
-pip install pyrubberband
+pip install pyrubberband soundfile
+
+# Voice separation (optional backends)
+pip install demucs             # music removal
+pip install noisereduce        # fast dereverberation
+pip install nara-wpe           # precise reverb removal
+pip install deepfilternet      # best quality dereverberation (GPU supported)
 
 # System libraries (Ubuntu/Debian)
 sudo apt install ffmpeg rubberband-cli
@@ -283,9 +349,20 @@ python Python_Scripting/transcribeSong2txt_with_pause.py \
 - **Short file handling** — explicit warning when fewer than 5 voiced frames are detected, then clean fallback
 - All emojis replaced with ASCII tags — fixes Windows console cp1252 crashes
 
+#### `extract_voices.py` *(new script)*
+
+- **Music removal mode** via `--remove-music` — runs demucs source separation before any processing, outputs clean vocal stem directly with no F0 filtering and no cuts
+- **`--keep "vocals only"`** — when combined with `--dereverberate`, applies acoustic cleaning and saves directly, bypassing all F0 analysis
+- **Demucs model selector** — `--demucs-model htdemucs|htdemucs_ft|mdx_extra`
+- **GPU support** via `--device cuda` — accelerates demucs and DeepFilterNet; device auto-detected and pre-selected in GUI
+- **`--overlap-range`** exposed as parameter — default raised to 200 Hz (was 80) to prevent expressive solo voices from being misclassified as overlap and cut
+- All emojis replaced with ASCII tags
+
 #### `xtts_studio.py`
 
 - Generator tab now calls `guided_meditation_generator_v23.py`
+- **[Vox] Voice sep.** tab: added `Overlap range (Hz)` field (default 200), `Remove background music (demucs)` checkbox, `Demucs model` dropdown, `Device` selector (cpu/cuda, auto-detected)
+- Checking `Remove background music` automatically sets `Keep` to `vocals only`
 
 ---
 
@@ -378,6 +455,27 @@ Edit `~/.local/share/tts/` to pre-accept, or answer `y` the first time.
 **Windows console shows `?` or crashes on Unicode characters**
 This should no longer happen as of v21 — all scripts output pure ASCII. If you still see issues, verify you are running the latest versions from `main`.
 
+**`demucs` not installed**
+```bash
+conda activate xtts
+pip install demucs
+```
+
+**`deepfilternet` not installed**
+```bash
+conda activate xtts
+pip install deepfilternet
+```
+
+**DeepFilterNet crashes with CUDA tensor error**
+DeepFilterNet manages GPU placement internally. Always pass CPU tensors — do not move them to CUDA before calling `enhance()`. This is handled automatically in `extract_voices.py`.
+
+**`scipy` UnicodeDecodeError with `mdx_extra`**
+```bash
+pip install --upgrade scipy
+```
+If the error persists, prefix the command with `LC_ALL=C`.
+
 ---
 
 ## Credits
@@ -386,6 +484,8 @@ This should no longer happen as of v21 — all scripts output pure ASCII. If you
 - **faster-whisper** by [SYSTRAN](https://github.com/SYSTRAN/faster-whisper) (CTranslate2 backend)
 - **librosa** for F0 analysis
 - **pydub** and **Rubberband** for audio processing
+- **demucs** by [Facebook Research](https://github.com/facebookresearch/demucs) for source separation
+- **DeepFilterNet** by [Hendrik Schröter](https://github.com/Rikorose/DeepFilterNet) for neural dereverberation
 - Guided meditation concept and multi-voice orchestration: personal project
 
 ---

@@ -671,7 +671,7 @@ def tab_extract(nb):
 
     tk.Label(f, text="Keep", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_keep, width=14, state='readonly',
-        values=['female','male','overlap','all','female,male']
+        values=['female','male','overlap','all','female,male','vocals only']
     ).grid(row=2, column=1, sticky='w', padx=4)
 
     tk.Label(f, text="Silence (s/auto/0)", anchor='w', width=20).grid(row=3, column=0, sticky='w', padx=6, pady=3)
@@ -680,15 +680,52 @@ def tab_extract(nb):
     tk.Label(f, text="F0 threshold (Hz)", anchor='w', width=20).grid(row=4, column=0, sticky='w', padx=6, pady=3)
     tk.Entry(f, textvariable=v_thr, width=8).grid(row=4, column=1, sticky='w', padx=4)
 
-    tk.Label(f, text="Dereverberation", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
+    v_ovrange = tk.StringVar(value='200')
+    tk.Label(f, text="Overlap range (Hz)", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_ovrange, width=8).grid(row=5, column=1, sticky='w', padx=4)
+
+    tk.Label(f, text="Dereverberation", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_deverb, width=14, state='readonly',
         values=['none','noisereduce','wpe','deepfilter']
-    ).grid(row=5, column=1, sticky='w', padx=4)
+    ).grid(row=6, column=1, sticky='w', padx=4)
 
     tk.Checkbutton(f, text="Debug mode", variable=v_debug).grid(
-        row=6, column=1, sticky='w', padx=4, pady=3)
+        row=7, column=1, sticky='w', padx=4, pady=3)
 
-    console = add_console(f, 8)
+    v_remove_music = tk.BooleanVar(value=False)
+    v_demucs_model = tk.StringVar(value='htdemucs_ft')
+
+    # ── Device selector (default: auto-detect) ───────────────────────────
+    try:
+        import torch as _torch_vox
+        _vox_default = "cuda" if _torch_vox.cuda.is_available() else "cpu"
+    except Exception:
+        _vox_default = "cpu"
+    v_vox_device = tk.StringVar(value=_vox_default)
+    tk.Label(f, text="Device", anchor='w', width=20).grid(row=8, column=0, sticky='w', padx=6, pady=3)
+    ttk.Combobox(f, textvariable=v_vox_device, width=8, state='readonly',
+        values=['cpu', 'cuda']).grid(row=8, column=1, sticky='w', padx=4)
+
+    def on_remove_music_toggle(*args):
+        if v_remove_music.get():
+            v_keep.set('vocals only')
+        else:
+            if v_keep.get() == 'vocals only':
+                v_keep.set('female')
+
+    v_remove_music.trace_add('write', on_remove_music_toggle)
+
+    tk.Checkbutton(f, text="Remove background music (demucs)",
+                   variable=v_remove_music).grid(
+        row=9, column=0, columnspan=2, sticky='w', padx=6, pady=2)
+
+    tk.Label(f, text="Demucs model", anchor='w', width=20).grid(
+        row=10, column=0, sticky='w', padx=6, pady=3)
+    ttk.Combobox(f, textvariable=v_demucs_model, width=16, state='readonly',
+        values=['htdemucs', 'htdemucs_ft', 'mdx_extra']
+    ).grid(row=10, column=1, sticky='w', padx=4)
+
+    console = add_console(f, 12)
 
     def lancer(btn, stop_btn=None):
         if not v_input.get() or not v_output.get():
@@ -698,11 +735,17 @@ def tab_extract(nb):
                '--keep', v_keep.get(),
                '--silence', v_silence.get(),
                '--threshold', v_thr.get(),
+               '--overlap-range', v_ovrange.get(),
                '--dereverberate', v_deverb.get()]
-        if v_debug.get(): cmd.append('--debug')
+        if v_debug.get():
+            cmd.append('--debug')
+        cmd += ['--device', v_vox_device.get()]
+        if v_remove_music.get():
+            cmd += ['--remove-music', '--demucs-model', v_demucs_model.get()]
+
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Separate", lancer, 7)
+    make_btn(f, ">  Separate", lancer, 11)
 
 
 # ── Tab: Pitch ──────────────────────────────────────────────────────────────
