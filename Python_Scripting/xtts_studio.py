@@ -307,7 +307,7 @@ def tab_generator(nb):
     f = ttk.Frame(nb)
     nb.add(f, text="[Gen] Generator")
     f.grid_columnconfigure(1, weight=1)
-    f.grid_rowconfigure(6, weight=1)
+    f.grid_rowconfigure(7, weight=1)
 
     v_script  = tk.StringVar()
     v_output  = tk.StringVar()
@@ -316,14 +316,26 @@ def tab_generator(nb):
     v_music   = tk.StringVar()
 
     add_row(f, "Script (.txt)",  v_script,  0, [("Text","*.txt"),("All","*.*")], initialdir=DIR_PROMPTS)
-    add_row(f, "Output (.wav)",  v_output,  1, [("WAV","*.wav")], save=True, initialdir=DIR_OUTPUT)
-    add_row(f, "Voices (1+)",     v_voices,  2, [("Audio","*.wav *.mp3")], multi=True, initialdir=DIR_VOICES)
-    add_row(f, "Ambient",       v_ambient, 3, [("Audio","*.wav *.mp3")], initialdir=DIR_AMBIENT)
-    add_row(f, "Punctual music (1+)", v_music, 4, [("Audio","*.wav *.mp3")], multi=True, initialdir=DIR_PUNCTUAL)
+    add_row(f, "Output (wav/mp3)", v_output, 1, [("WAV","*.wav"),("MP3","*.mp3"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")], save=True, initialdir=DIR_OUTPUT)
+    add_row(f, "Voices (1+)",     v_voices,  2, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], multi=True, initialdir=DIR_VOICES)
+    add_row(f, "Ambient",       v_ambient, 3, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_AMBIENT)
+    add_row(f, "Punctual music (1+)", v_music, 4, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], multi=True, initialdir=DIR_PUNCTUAL)
+
+    # ── MP3 output options ────────────────────────────────────────────────────
+    v_gen_mp3_bitrate = tk.StringVar(value='192')
+    v_gen_mp3_mode    = tk.StringVar(value='cbr')
+    tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
+    frm_gen_mp3 = tk.Frame(f)
+    frm_gen_mp3.grid(row=5, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_gen_mp3, textvariable=v_gen_mp3_bitrate, width=6, state='readonly',
+        values=['128','160','192','256','320']).pack(side='left')
+    ttk.Combobox(frm_gen_mp3, textvariable=v_gen_mp3_mode, width=5, state='readonly',
+        values=['cbr','vbr']).pack(side='left', padx=6)
+    tk.Label(frm_gen_mp3, text="(only used if output is .mp3)", fg='grey').pack(side='left')
 
     # ── Éditeur de prompt ────────────────────────────────────────────────────
     editor_frame = ttk.LabelFrame(f, text="Prompt Editor")
-    editor_frame.grid(row=6, column=0, columnspan=3, sticky='nsew', padx=6, pady=4)
+    editor_frame.grid(row=7, column=0, columnspan=3, sticky='nsew', padx=6, pady=4)
     editor_frame.grid_columnconfigure(0, weight=1)
     editor_frame.grid_rowconfigure(1, weight=1)
 
@@ -404,7 +416,7 @@ def tab_generator(nb):
 
     # Console output
     console_frame = ttk.LabelFrame(f, text="Console")
-    console_frame.grid(row=7, column=0, columnspan=3, sticky='ew', padx=6, pady=4)
+    console_frame.grid(row=8, column=0, columnspan=3, sticky='ew', padx=6, pady=4)
     console_frame.grid_columnconfigure(0, weight=1)
     console = scrolledtext.ScrolledText(console_frame, height=10, bg='#1e1e1e',
                                          fg='#d4d4d4', font=('Courier', 9), state='normal')
@@ -423,9 +435,10 @@ def tab_generator(nb):
         cmd += v_voices.get().split()
         if v_ambient.get(): cmd += v_ambient.get().split()
         if v_music.get():   cmd += v_music.get().split()
+        cmd += ['--mp3-bitrate', v_gen_mp3_bitrate.get(), '--mp3-mode', v_gen_mp3_mode.get()]
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Run", lancer, 8)
+    make_btn(f, ">  Run", lancer, 9)
 
 
 # ── Tab: Analyser ───────────────────────────────────────────────────────────
@@ -459,7 +472,7 @@ def tab_analyser(nb):
         tk.Spinbox(row_f, from_=1, to=20, textvariable=v_num, width=3).pack(side='left', padx=1)
         tk.Entry(row_f, textvariable=v_path).pack(side='left', fill='x', expand=True, padx=3)
         tk.Button(row_f, text="Browse", width=8,
-            command=lambda vp=v_path: browse_file(vp, [("Audio","*.wav *.mp3")], initialdir=DIR_VOICES)).pack(side='left', padx=1)
+            command=lambda vp=v_path: browse_file(vp, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_VOICES)).pack(side='left', padx=1)
 
         ttk.Combobox(row_f, textvariable=v_lang, values=LANGS,
                      width=6, state='readonly').pack(side='left', padx=1)
@@ -666,7 +679,7 @@ def tab_extract(nb):
     v_deverb  = tk.StringVar(value='none')
     v_debug   = tk.BooleanVar(value=False)
 
-    add_row(f, "Audio source",   v_input,  0, [("Audio","*.wav *.mp3 *.flac"),("All","*.*")], initialdir=DIR_VOICES)
+    add_row(f, "Audio source",   v_input,  0, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_VOICES)
     add_row(f, "Output (wav/mp3)", v_output, 1, [("WAV","*.wav"),("MP3","*.mp3"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")], save=True, initialdir=DIR_OUTPUT)
 
     tk.Label(f, text="Keep", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
@@ -825,17 +838,50 @@ def tab_convert(nb):
 
     add_row(f, "Video source",  v_input,  0,
             [("Video","*.mp4 *.mkv *.avi *.mov *.flv *.webm *.wmv"),("All","*.*")])
-    add_row(f, "Output (.mp3)", v_output, 1, [("MP3","*.mp3")], save=True, initialdir=DIR_OUTPUT)
+    add_row(f, "Output (mp3/wav/flac/ogg)", v_output, 1,
+            [("MP3","*.mp3"),("WAV","*.wav"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")],
+            save=True, initialdir=DIR_OUTPUT)
 
-    console = add_console(f, 3)
+    # ── MP3 options (only used if output is .mp3) ─────────────────────────
+    v_vid_mp3_bitrate = tk.StringVar(value='192')
+    v_vid_mp3_mode    = tk.StringVar(value='cbr')
+    tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
+    frm_vid_mp3 = tk.Frame(f)
+    frm_vid_mp3.grid(row=2, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_vid_mp3, textvariable=v_vid_mp3_bitrate, width=6, state='readonly',
+        values=['128','160','192','256','320']).pack(side='left')
+    ttk.Combobox(frm_vid_mp3, textvariable=v_vid_mp3_mode, width=5, state='readonly',
+        values=['cbr','vbr']).pack(side='left', padx=6)
+    tk.Label(frm_vid_mp3, text="(only used if output is .mp3)", fg='grey').pack(side='left')
+
+    console = add_console(f, 4)
 
     def lancer(btn, stop_btn=None):
         if not v_input.get() or not v_output.get():
             log(console, "[ERR] Source and output required."); return
-        cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn', '-q:a', '0', v_output.get()]
+        ext = os.path.splitext(v_output.get())[1].lower()
+        if ext == '.mp3':
+            br  = v_vid_mp3_bitrate.get()
+            if v_vid_mp3_mode.get() == 'vbr':
+                vbr_map = {'128':'6','160':'5','192':'4','256':'2','320':'0'}
+                cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn',
+                       '-codec:a', 'libmp3lame', '-q:a', vbr_map.get(br,'4'),
+                       v_output.get()]
+            else:
+                cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn',
+                       '-codec:a', 'libmp3lame', '-b:a', f'{br}k',
+                       v_output.get()]
+        elif ext == '.flac':
+            cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn',
+                   '-codec:a', 'flac', v_output.get()]
+        elif ext == '.ogg':
+            cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn',
+                   '-codec:a', 'libvorbis', v_output.get()]
+        else:  # .wav or anything else
+            cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn', v_output.get()]
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Convert", lancer, 2)
+    make_btn(f, ">  Convert", lancer, 3)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -867,7 +913,7 @@ def main():
     v_player_path = tk.StringVar()
     tk.Entry(player_bar, textvariable=v_player_path, width=50).pack(side='left', padx=4, fill='x', expand=True)
     def _pbrowse():
-        p = filedialog.askopenfilename(filetypes=[("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=os.path.expanduser('~/XTTS'))
+        p = filedialog.askopenfilename(filetypes=[("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_MP3)
         if p: v_player_path.set(p)
     tk.Button(player_bar, text="Browse", width=8, command=_pbrowse).pack(side='left', padx=2)
     play_btn = tk.Button(player_bar, text="> Play", width=8, bg='#1a6b9e', fg='white', font=('Arial',9,'bold'))

@@ -31,12 +31,12 @@ A unified Tkinter interface with one tab per tool. Every tab shares a consistent
 
 | Tab | Script / Command | Purpose |
 |-----|-----------------|---------|
-| **[Gen] Generator** | `guided_meditation_generator_v23.py` | Build multi-voice guided meditations with inline XTTS parameters, ambient music, punctual sounds, parallel voice overlay, reverb, noise gate, pan, and limiter |
+| **[Gen] Generator** | `guided_meditation_generator_v23.py` | Build multi-voice guided meditations with inline XTTS parameters, ambient music, punctual sounds, parallel voice overlay, reverb, noise gate, pan, and limiter — output to WAV, MP3 (CBR/VBR), FLAC, or OGG |
 | **[Ana] Analyser** | `voice_analyser.py` | Analyse one or more voices and produce ready-to-paste XTTS parameter blocks |
 | **[Txt] Transcription** | `transcribeSong2txt_with_pause.py` (audio) or `video2txt.py` (video) | Transcribe audio or video to XTTS-ready text with pause markers and optional per-word pitch annotation |
-| **[Vox] Voice sep.** | `extract_voices.py` | Separate voices by F0, remove background music via demucs, dereverberate (noisereduce / WPE / DeepFilterNet), export to WAV / MP3 / FLAC / OGG |
+| **[Vox] Voice sep.** | `extract_voices.py` | Separate vocal stems from a mixed track |
 | **[Pit] Pitch** | `apply_pitch_to_clone.py` | Apply pitch correction to a cloned voice |
-| **[Vid] Video->MP3** | `ffmpeg` (system command) | Extract an MP3 audio track from any video file |
+| **[Vid] Video->Audio** | `ffmpeg` (system command) | Extract audio from any video file — output to MP3 (CBR/VBR), WAV, FLAC, or OGG |
 
 ---
 
@@ -65,7 +65,6 @@ Produces long-form guided meditation WAV files from a simple text script. Suppor
 - **Punctual music cues** triggered at specific positions (e.g. bells, chimes, metronomes)
 - **Multi-language support**: FR, EN, ES, DE, IT, PT, PL, TR, RU, NL, CS, AR, ZH-CN, HU, KO, JA, HI
 - **Rubberband-based speed adjustment** without pitch distortion
-- **Multi-format output**: WAV, MP3 (CBR/VBR), FLAC, OGG — format auto-detected from output file extension
 - **Live progress tracking** via hidden `[PROGRESS=n/N]` markers consumed by the GUI
 - **Acoustic parameter derivation**: use `voice_analyser.py` to generate ready-to-paste `{}` and `[]` blocks from any reference WAV
 
@@ -83,75 +82,6 @@ Fast and accurate audio-to-text transcription powered by `faster-whisper`:
 - Silero VAD pre-filtering (`--vad`) to skip long silences and accelerate further
 - Automatic CUDA → CPU fallback if the GPU is unavailable
 - Output is drop-in compatible with the Guided Meditation Generator
-
----
-
-### Voice Separation (`extract_voices.py`)
-
-Separates voices and cleans audio from any MP3/WAV source. Two main modes:
-
-**Music removal (demucs)** — strips background music and noise, outputting a clean vocal stem with no cuts. Enable via the GUI checkbox or `--remove-music`:
-
-```bash
-python extract_voices.py input.mp3 output.mp3 --remove-music --demucs-model htdemucs_ft
-```
-
-When `--remove-music` is active, the vocal stem is saved directly — no F0 analysis, no segment detection, no cuts whatsoever.
-
-**Voice separation by F0** — classifies speech segments as female, male, or overlap using pitch analysis and keeps only the requested category:
-
-```bash
-python extract_voices.py input.wav output.wav --keep female \
-    --threshold 165 --overlap-range 200 --silence auto
-```
-
-**Dereverberation** — apply acoustic cleaning to an already-isolated vocal:
-
-```bash
-# DeepFilterNet (best quality, GPU supported)
-python extract_voices.py vocals.wav clean.wav \
-    --keep "vocals only" --dereverberate deepfilter
-
-# Other options: noisereduce (fast, CPU), wpe (precise reverb, CPU)
-```
-
-When `--keep "vocals only"` is combined with `--dereverberate`, the cleaned file is saved directly with no F0 filtering.
-
-**Output format** — auto-detected from the output file extension. WAV, MP3, FLAC, and OGG are supported. MP3 encoding options:
-
-```bash
-python extract_voices.py input.mp3 output.mp3 --remove-music \
-    --mp3-bitrate 256 --mp3-mode cbr   # constant bitrate
-python extract_voices.py input.mp3 output.mp3 --remove-music \
-    --mp3-bitrate 320 --mp3-mode vbr   # variable bitrate
-```
-
-**GPU acceleration** — auto-detected at startup (CUDA if available, else CPU). Can be overridden in the GUI. Demucs and DeepFilterNet both benefit from GPU; noisereduce and WPE are CPU-only.
-
-**Key parameters:**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--keep` | `female` | `female`, `male`, `overlap`, `all`, `female,male`, `vocals only` |
-| `--silence` | `auto` | Gap between kept segments: `auto` = natural, `0` = none, `N` = fixed N seconds |
-| `--threshold` | 165 | F0 boundary male/female in Hz |
-| `--overlap-range` | 200 | F0 range above which a segment is classified as overlap. Use 200+ for solo voice files |
-| `--remove-music` | off | Run demucs before processing to strip background music/noise |
-| `--demucs-model` | `htdemucs_ft` | `htdemucs` (fast), `htdemucs_ft` (best vocals), `mdx_extra` (dense music) |
-| `--dereverberate` | `none` | `noisereduce`, `wpe`, `deepfilter` |
-| `--device` | auto | `cpu` or `cuda` — affects demucs and DeepFilterNet |
-| `--mp3-bitrate` | 192 | 128 / 160 / 192 / 256 / 320 kbps — only when output is `.mp3` |
-| `--mp3-mode` | `cbr` | `cbr` (constant) or `vbr` (variable) |
-| `--debug` | off | Print per-segment classification detail |
-
-**Install optional backends:**
-
-```bash
-pip install demucs             # required for --remove-music
-pip install noisereduce        # fast dereverberation (CPU)
-pip install nara-wpe           # precise reverb removal (CPU)
-pip install deepfilternet      # best quality dereverberation (GPU supported)
-```
 
 ---
 
@@ -185,14 +115,8 @@ conda activate xtts
 # Core dependencies
 pip install TTS torch torchaudio
 pip install faster-whisper
-pip install librosa pydub numpy soundfile
+pip install librosa pydub numpy
 pip install pyrubberband
-
-# Voice separation (optional backends)
-pip install demucs             # music removal
-pip install noisereduce        # fast dereverberation
-pip install nara-wpe           # precise reverb removal
-pip install deepfilternet      # best quality dereverberation (GPU supported)
 
 # System libraries (Ubuntu/Debian)
 sudo apt install ffmpeg rubberband-cli
@@ -215,7 +139,6 @@ XTTS-Voice-Studio/
 ├── Python_Scripting/              # All executable scripts
 │   ├── xtts_studio.py             # Tkinter GUI (main entry point)
 │   ├── guided_meditation_generator_v23.py
-│   ├── extract_voices.py
 │   ├── transcribeSong2txt_with_pause.py   # v21 (faster-whisper) — audio transcription
 │   ├── video2txt.py                        # video transcription (extracts audio + transcribes)
 │   ├── voice_analyser.py
@@ -340,6 +263,7 @@ python Python_Scripting/transcribeSong2txt_with_pause.py \
 
 #### `guided_meditation_generator_v23.py` *(new script)*
 
+- **Multi-format output**: WAV, MP3 (CBR/VBR via `--mp3-bitrate` and `--mp3-mode`), FLAC, OGG — format auto-detected from output extension, ffmpeg required for non-WAV formats
 - **`{}` block extended to 14 values** — three new XTTS cloning quality parameters: `gpt_cond_len` (seconds of reference WAV used for cloning, default 30, recommended: set to actual WAV duration up to 60), `gpt_cond_chunk_len` (GPT chunk size, default 4), `sound_norm_refs` (normalise reference before cloning, default 0)
 - **`[]` block extended to 16 values** — four new audio processing parameters:
   - `reverb` — room reverb via ffmpeg `aecho` (wet level 0–1)
@@ -360,21 +284,14 @@ python Python_Scripting/transcribeSong2txt_with_pause.py \
 - **Short file handling** — explicit warning when fewer than 5 voiced frames are detected, then clean fallback
 - All emojis replaced with ASCII tags — fixes Windows console cp1252 crashes
 
-#### `extract_voices.py` *(new script)*
-
-- **Music removal** via `--remove-music` — runs demucs before any processing and saves the clean vocal stem directly, with no F0 filtering and no cuts
-- **`--keep "vocals only"`** — when combined with `--dereverberate`, applies dereverberation and saves directly, bypassing all F0 analysis
-- **Demucs model selector**: `htdemucs`, `htdemucs_ft`, `mdx_extra`
-- **GPU support**: auto-detected at startup; demucs passes `--device cuda` automatically; DeepFilterNet uses its own internal GPU routing
-- **`--overlap-range`** exposed as parameter — default raised to 200 Hz (was hardcoded 80) to prevent expressive solo voices from being misclassified as overlap
-- **Multi-format output**: WAV, MP3 (CBR/VBR with `--mp3-bitrate` and `--mp3-mode`), FLAC, OGG — format auto-detected from output extension
-- All comments, output messages, and argparse help strings in English
-
 #### `xtts_studio.py`
 
 - Generator tab now calls `guided_meditation_generator_v23.py`
-- **[Vox] Voice sep.** tab: `Overlap range (Hz)` field (default 200), `Device` selector (cpu/cuda, auto-detected), `Remove background music` checkbox (auto-sets Keep to "vocals only"), `Demucs model` dropdown, `MP3 bitrate` and `MP3 mode` selectors
-- Output file browser now offers WAV / MP3 / FLAC / OGG / All file types
+- **All audio input browsers** now accept WAV / MP3 / FLAC / OGG (Voices, Ambient, Punctual, Audio source, Analyser, Player)
+- **[Gen] Generator** output: WAV / MP3 / FLAC / OGG; `MP3 bitrate` (128–320 kbps) and `MP3 mode` (CBR/VBR) selectors added
+- **[Vox] Voice sep.** output: WAV / MP3 / FLAC / OGG; `MP3 bitrate` and `MP3 mode` selectors; `Overlap range (Hz)` (default 200); `Remove background music` checkbox; `Demucs model` and `Device` selectors
+- **[Vid] Video->Audio** output: MP3 / WAV / FLAC / OGG; `MP3 bitrate` and `MP3 mode` selectors; ffmpeg codec auto-selected from output extension
+- Hardcoded `~/XTTS` path replaced by auto-detected `DIR_*` variables
 
 ---
 
@@ -467,30 +384,6 @@ Edit `~/.local/share/tts/` to pre-accept, or answer `y` the first time.
 **Windows console shows `?` or crashes on Unicode characters**
 This should no longer happen as of v21 — all scripts output pure ASCII. If you still see issues, verify you are running the latest versions from `main`.
 
-**`demucs` not installed**
-```bash
-conda activate xtts
-pip install demucs
-```
-
-**`deepfilternet` not installed**
-```bash
-conda activate xtts
-pip install deepfilternet
-```
-
-**DeepFilterNet crashes with CUDA tensor error**
-DeepFilterNet manages GPU placement internally — always pass CPU tensors and let it handle the device routing. This is done automatically in `extract_voices.py`.
-
-**`scipy` UnicodeDecodeError with `mdx_extra`**
-```bash
-pip install --upgrade scipy
-```
-If the error persists, prefix the command with `LC_ALL=C`.
-
-**MP3 output fails**
-Requires `ffmpeg` with `libmp3lame` support. Verify with `ffmpeg -codecs | grep mp3lame`.
-
 ---
 
 ## Credits
@@ -499,8 +392,6 @@ Requires `ffmpeg` with `libmp3lame` support. Verify with `ffmpeg -codecs | grep 
 - **faster-whisper** by [SYSTRAN](https://github.com/SYSTRAN/faster-whisper) (CTranslate2 backend)
 - **librosa** for F0 analysis
 - **pydub** and **Rubberband** for audio processing
-- **demucs** by [Facebook Research](https://github.com/facebookresearch/demucs) for source separation
-- **DeepFilterNet** by [Hendrik Schröter](https://github.com/Rikorose/DeepFilterNet) for neural dereverberation
 - Guided meditation concept and multi-voice orchestration: personal project
 
 ---
