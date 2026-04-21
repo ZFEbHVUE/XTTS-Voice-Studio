@@ -2,7 +2,7 @@
 
 A complete toolkit for voice cloning, guided meditation generation, song transcription, and audio processing — built around Coqui XTTS v2 with a Tkinter GUI that unifies every script under one roof.
 
-![Python](https://img.shields.io/badge/Python-3.10-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-lightgrey)
+![Python](https://img.shields.io/badge/Python-3.10-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20WSL-lightgrey)
 
 ---
 
@@ -18,6 +18,8 @@ XTTS Voice Studio is a personal production suite for:
 - **Converting video files** to MP3 for further processing
 
 Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) or directly from the command line.
+
+The suite runs natively on Linux and under WSL (Windows Subsystem for Linux) with Ubuntu. Audio playback in the GUI player is not available under WSL due to audio stack limitations, but all generation and processing features work normally.
 
 ![XTTS Voice Studio GUI](docs/gui_main.png)
 
@@ -383,6 +385,9 @@ Edit `~/.local/share/tts/` to pre-accept, or answer `y` the first time.
 
 **Windows console shows `?` or crashes on Unicode characters**
 This should no longer happen as of v21 — all scripts output pure ASCII. If you still see issues, verify you are running the latest versions from `main`.
+
+**Audio player silent under WSL**
+`ffplay` under WSL has no direct access to the Windows audio stack. The player button in the GUI will not produce sound. Workaround: open the generated WAV/MP3 directly in Windows Explorer, or configure PulseAudio for Windows and set `PULSE_SERVER` in your WSL environment. Note that XTTS generation itself works fine under WSL — only audio playback is affected.
 
 ---
 
