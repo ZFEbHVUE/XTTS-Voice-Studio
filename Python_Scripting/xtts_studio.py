@@ -890,17 +890,21 @@ def tab_extract(nb):
     tk.Label(f, text="F0 threshold (Hz)", anchor='w', width=20).grid(row=4, column=0, sticky='w', padx=6, pady=3)
     tk.Entry(f, textvariable=v_thr, width=8).grid(row=4, column=1, sticky='w', padx=4)
 
-    v_ovrange = tk.StringVar(value='200')
+    v_ovrange   = tk.StringVar(value='200')
+    v_minsilence = tk.StringVar(value='0.30')
     tk.Label(f, text="Overlap range (Hz)", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
     tk.Entry(f, textvariable=v_ovrange, width=8).grid(row=5, column=1, sticky='w', padx=4)
 
-    tk.Label(f, text="Dereverberation", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
+    tk.Label(f, text="Min silence (s)", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_minsilence, width=8).grid(row=6, column=1, sticky='w', padx=4)
+
+    tk.Label(f, text="Dereverberation", anchor='w', width=20).grid(row=7, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_deverb, width=14, state='readonly',
         values=['none','noisereduce','wpe','deepfilter']
-    ).grid(row=6, column=1, sticky='w', padx=4)
+    ).grid(row=7, column=1, sticky='w', padx=4)
 
     tk.Checkbutton(f, text="Debug mode", variable=v_debug).grid(
-        row=7, column=1, sticky='w', padx=4, pady=3)
+        row=8, column=1, sticky='w', padx=4, pady=3)
 
     v_remove_music = tk.BooleanVar(value=False)
     v_demucs_model = tk.StringVar(value='htdemucs_ft')
@@ -938,7 +942,7 @@ def tab_extract(nb):
     ).grid(row=10, column=1, sticky='w', padx=4)
 
     # ── MP3 output options ───────────────────────────────────────────────
-    tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=11, column=0, sticky='w', padx=6, pady=3)
+    tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=12, column=0, sticky='w', padx=6, pady=3)
     frm_mp3 = tk.Frame(f)
     frm_mp3.grid(row=11, column=1, sticky='w', padx=4)
     ttk.Combobox(frm_mp3, textvariable=v_mp3_bitrate, width=6, state='readonly',
@@ -947,7 +951,7 @@ def tab_extract(nb):
         values=['cbr','vbr']).pack(side='left', padx=6)
     tk.Label(frm_mp3, text="(only used if output is .mp3)", fg='grey').pack(side='left')
 
-    console = add_console(f, 13)
+    console = add_console(f, 14)
 
     def lancer(btn, stop_btn=None):
         if not v_input.get() or not v_output.get():
@@ -958,6 +962,7 @@ def tab_extract(nb):
                '--silence', v_silence.get(),
                '--threshold', v_thr.get(),
                '--overlap-range', v_ovrange.get(),
+               '--min-silence', v_minsilence.get(),
                '--dereverberate', v_deverb.get()]
         if v_debug.get():
             cmd.append('--debug')
@@ -968,7 +973,7 @@ def tab_extract(nb):
 
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Separate", lancer, 12)
+    make_btn(f, ">  Separate", lancer, 13)
 
 
 # ── Tab: Pitch ──────────────────────────────────────────────────────────────

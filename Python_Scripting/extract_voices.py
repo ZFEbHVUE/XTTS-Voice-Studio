@@ -47,7 +47,10 @@ def dereverberate(y, sr, method='none', device='cpu'):
         except ImportError:
             print("[!] pip install noisereduce"); return y
         print("   [*] noisereduce...")
-        return nr.reduce_noise(y=y, sr=sr, stationary=False, prop_decrease=0.85).astype(np.float32)
+        result = nr.reduce_noise(y=y, sr=sr, stationary=False, prop_decrease=0.85).astype(np.float32)
+        # Sanitize: replace NaN/inf that noisereduce can produce on clean signals
+        result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+        return result
     elif method == 'wpe':
         try:
             from nara_wpe.wpe import wpe
@@ -204,7 +207,18 @@ def detect_segments(y, sr, min_silence=0.15, min_speech=0.2):
     rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop)[0]
     times = librosa.times_like(rms, sr=sr, hop_length=hop)
     rms_norm = rms / (np.max(rms) + 1e-10)
+    # Adaptive threshold: try median*0.4 first, but if it would yield
+    # 0 segments (over-processed / already clean audio), fall back to
+    # a percentile-based threshold so we always detect something.
     threshold = max(0.02, np.median(rms_norm) * 0.4)
+    if np.sum(rms_norm > threshold) < 3:
+        # fallback: use 10th percentile of non-zero values
+        nonzero = rms_norm[rms_norm > 0.001]
+        if len(nonzero) > 0:
+            threshold = float(np.percentile(nonzero, 10))
+        else:
+            threshold = 0.01
+        print(f"   [*] Adaptive RMS threshold: {threshold:.4f} (fallback mode)")
     is_speech = rms_norm > threshold
     segs = []; in_seg = False; t0 = 0.0
     for i, sp in enumerate(is_speech):
@@ -237,7 +251,7 @@ def classify(y, sr, start, end, f0_thr=165, ov_range=80):
 def process(input_file, output_file, keep_set=None, silence_mode='auto',
             deverb_method='none', f0_thr=165, ov_range=80, min_dur=0.2,
             debug=False, remove_music=False, demucs_model='htdemucs_ft', device='cpu',
-            mp3_bitrate=192, mp3_mode='cbr'):
+            mp3_bitrate=192, mp3_mode='cbr', min_silence=0.15):
 
     if keep_set is None: keep_set = {'female_solo'}
 
@@ -272,7 +286,7 @@ def process(input_file, output_file, keep_set=None, silence_mode='auto',
             save_audio(y, sr, output_file, mp3_bitrate, mp3_mode)
             return
 
-    segs = detect_segments(y, sr)
+    segs = detect_segments(y, sr, min_silence=min_silence)
     print(f"   {len(segs)} segments detected")
 
     # Compute silence to insert between kept segments
@@ -360,6 +374,9 @@ if __name__ == "__main__":
     p.add_argument("--threshold", type=int, default=165)
     p.add_argument("--overlap-range", type=int, default=80)
     p.add_argument("--min-dur", type=float, default=0.2)
+    p.add_argument("--min-silence", type=float, default=0.15,
+                   help="Minimum silence duration in seconds to split segments (default: 0.15). "
+                        "Increase to 0.3-0.5 to detect sentence pauses in single-voice files.")
     p.add_argument("--debug", action="store_true")
     p.add_argument("--mp3-bitrate", type=int, default=192,
                    choices=[128, 160, 192, 256, 320],
@@ -377,4 +394,4 @@ if __name__ == "__main__":
     process(args.input, args.output, args.keep, args.silence, args.dereverberate,
             args.threshold, args.overlap_range, args.min_dur, args.debug,
             args.remove_music, args.demucs_model, args.device,
-            args.mp3_bitrate, args.mp3_mode)
+            args.mp3_bitrate, args.mp3_mode, args.min_silence)
