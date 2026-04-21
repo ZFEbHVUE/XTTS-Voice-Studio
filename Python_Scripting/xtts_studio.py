@@ -375,26 +375,223 @@ def tab_generator(nb):
                 fh.write(editor.get('1.0', 'end-1c'))
             log_editor(f"Saved as: {path}")
 
-    tk.Button(btn_bar, text="New",    command=nouveau_prompt,    width=10).pack(side='left', padx=2)
-    tk.Button(btn_bar, text="Open",     command=ouvrir_prompt,     width=10).pack(side='left', padx=2)
-    tk.Button(btn_bar, text="Save",command=sauvegarder_prompt,width=13).pack(side='left', padx=2)
-    tk.Button(btn_bar, text="Save as",    command=sauvegarder_sous,  width=10).pack(side='left', padx=2)
+    tk.Button(btn_bar, text="New",       command=nouveau_prompt,    width=8).pack(side='left', padx=2)
+    tk.Button(btn_bar, text="Open",      command=ouvrir_prompt,     width=8).pack(side='left', padx=2)
+    tk.Button(btn_bar, text="Save",      command=sauvegarder_prompt,width=8).pack(side='left', padx=2)
+    tk.Button(btn_bar, text="Save as",   command=sauvegarder_sous,  width=8).pack(side='left', padx=2)
+    ttk.Separator(btn_bar, orient='vertical').pack(side='left', fill='y', padx=6, pady=2)
+    tk.Button(btn_bar, text="Find/Replace (Ctrl+H)", width=20,
+              command=lambda: open_find_replace()).pack(side='left', padx=2)
+    tk.Button(btn_bar, text="Go to line (Ctrl+G)", width=18,
+              command=lambda: open_goto_line()).pack(side='left', padx=2)
 
-    # Editor area
-    editor = tk.Text(editor_frame, height=12, font=('Courier', 9),
+    # ── Editor area with line numbers ─────────────────────────────────────
+    editor_container = tk.Frame(editor_frame)
+    editor_container.grid(row=1, column=0, sticky='nsew', padx=4, pady=2)
+    editor_container.grid_columnconfigure(1, weight=1)
+    editor_container.grid_rowconfigure(0, weight=1)
+
+    line_nums = tk.Text(editor_container, width=4, font=('Courier', 9),
+                        bg='#e8e8e8', fg='#888', state='disabled',
+                        cursor='arrow', takefocus=False)
+    line_nums.grid(row=0, column=0, sticky='ns')
+
+    editor = tk.Text(editor_container, height=12, font=('Courier', 9),
                      wrap='word', undo=True)
-    editor.grid(row=1, column=0, sticky='nsew', padx=4, pady=2)
-    editor.bind('<Button-1>', lambda e: editor.focus_set())
-    editor.bind('<Button-2>', lambda e: editor.focus_set())  # clic milieu X11
-    scroll_e = ttk.Scrollbar(editor_frame, orient='vertical', command=editor.yview)
-    scroll_e.grid(row=1, column=1, sticky='ns')
-    editor.config(yscrollcommand=scroll_e.set)
+    editor.grid(row=0, column=1, sticky='nsew')
 
-    # Status bar
-    status_var = tk.StringVar(value="Ready")
+    scroll_e = ttk.Scrollbar(editor_frame, orient='vertical')
+    scroll_e.grid(row=1, column=1, sticky='ns')
+
+    def sync_scroll(*args):
+        editor.yview(*args)
+        line_nums.yview(*args)
+
+    scroll_e.config(command=sync_scroll)
+    editor.config(yscrollcommand=scroll_e.set)
+    line_nums.config(yscrollcommand=scroll_e.set)
+
+    def update_line_numbers(event=None):
+        line_nums.config(state='normal')
+        line_nums.delete('1.0', 'end')
+        n_lines = int(editor.index('end-1c').split('.')[0])
+        line_nums.insert('1.0', '\n'.join(str(i) for i in range(1, n_lines + 1)))
+        line_nums.config(state='disabled')
+
+    editor.bind('<KeyRelease>', update_line_numbers)
+    editor.bind('<Button-1>',   lambda e: editor.focus_set())
+    editor.bind('<Button-2>',   lambda e: editor.focus_set())  # X11 middle-click
+
+    # ── Right-click context menu ──────────────────────────────────────────
+    ctx_menu = tk.Menu(editor, tearoff=0)
+    ctx_menu.add_command(label="Cut",        command=lambda: editor.event_generate('<<Cut>>'))
+    ctx_menu.add_command(label="Copy",       command=lambda: editor.event_generate('<<Copy>>'))
+    ctx_menu.add_command(label="Paste",      command=lambda: editor.event_generate('<<Paste>>'))
+    ctx_menu.add_separator()
+    ctx_menu.add_command(label="Select All", command=lambda: editor.tag_add('sel','1.0','end'))
+    ctx_menu.add_separator()
+    ctx_menu.add_command(label="Find/Replace...", command=lambda: open_find_replace())
+    ctx_menu.add_command(label="Go to line...",   command=lambda: open_goto_line())
+
+    def show_ctx_menu(event):
+        try:
+            ctx_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            ctx_menu.grab_release()
+
+    editor.bind('<Button-3>', show_ctx_menu)
+
+    # ── Keyboard shortcuts ────────────────────────────────────────────────
+    editor.bind('<Control-h>', lambda e: (open_find_replace(), 'break'))
+    editor.bind('<Control-H>', lambda e: (open_find_replace(), 'break'))
+    editor.bind('<Control-g>', lambda e: (open_goto_line(),    'break'))
+    editor.bind('<Control-G>', lambda e: (open_goto_line(),    'break'))
+    editor.bind('<Control-s>', lambda e: (sauvegarder_prompt(),'break'))
+    editor.bind('<Control-S>', lambda e: (sauvegarder_prompt(),'break'))
+
+    # ── Find & Replace dialog ─────────────────────────────────────────────
+    _fr_win = [None]
+
+    def open_find_replace():
+        if _fr_win[0] and _fr_win[0].winfo_exists():
+            _fr_win[0].lift(); return
+
+        win = tk.Toplevel(editor_frame)
+        win.title("Find & Replace")
+        win.resizable(False, False)
+        win.transient(editor_frame)
+        _fr_win[0] = win
+
+        tk.Label(win, text="Find:",    width=8, anchor='e').grid(row=0, column=0, padx=4, pady=4)
+        tk.Label(win, text="Replace:", width=8, anchor='e').grid(row=1, column=0, padx=4, pady=4)
+
+        v_find    = tk.StringVar()
+        v_replace = tk.StringVar()
+        e_find    = tk.Entry(win, textvariable=v_find,    width=32)
+        e_replace = tk.Entry(win, textvariable=v_replace, width=32)
+        e_find.grid(   row=0, column=1, columnspan=2, padx=4, pady=4, sticky='ew')
+        e_replace.grid(row=1, column=1, columnspan=2, padx=4, pady=4, sticky='ew')
+        e_find.focus_set()
+
+        v_case = tk.BooleanVar(value=False)
+        tk.Checkbutton(win, text="Match case", variable=v_case).grid(
+            row=2, column=1, sticky='w', padx=4)
+
+        status_fr = tk.StringVar(value="")
+        tk.Label(win, textvariable=status_fr, fg='gray', width=30, anchor='w').grid(
+            row=3, column=1, columnspan=2, padx=4)
+
+        def find_next(start='insert'):
+            editor.tag_remove('found', '1.0', 'end')
+            needle = v_find.get()
+            if not needle: return
+            nocase = not v_case.get()
+            pos = editor.search(needle, start, stopindex='end', nocase=nocase)
+            if pos:
+                end = f"{pos}+{len(needle)}c"
+                editor.tag_add('found', pos, end)
+                editor.tag_config('found', background='#ffff00', foreground='#000')
+                editor.mark_set('insert', end)
+                editor.see(pos)
+                status_fr.set(f"Found at line {pos.split('.')[0]}")
+            else:
+                status_fr.set("Not found — wrapping...")
+                pos2 = editor.search(needle, '1.0', stopindex='end', nocase=nocase)
+                if pos2:
+                    end2 = f"{pos2}+{len(needle)}c"
+                    editor.tag_add('found', pos2, end2)
+                    editor.tag_config('found', background='#ffff00', foreground='#000')
+                    editor.mark_set('insert', end2)
+                    editor.see(pos2)
+                    status_fr.set(f"Wrapped — found at line {pos2.split('.')[0]}")
+                else:
+                    status_fr.set("Not found.")
+
+        def replace_one():
+            needle  = v_find.get()
+            rep     = v_replace.get()
+            nocase  = not v_case.get()
+            if editor.tag_ranges('found'):
+                start, end = str(editor.tag_ranges('found')[0]), str(editor.tag_ranges('found')[1])
+                editor.delete(start, end)
+                editor.insert(start, rep)
+                editor.tag_remove('found', '1.0', 'end')
+                find_next(start)
+            else:
+                find_next()
+
+        def replace_all():
+            needle = v_find.get()
+            rep    = v_replace.get()
+            nocase = not v_case.get()
+            if not needle: return
+            count = 0
+            pos = '1.0'
+            while True:
+                pos = editor.search(needle, pos, stopindex='end', nocase=nocase)
+                if not pos: break
+                end = f"{pos}+{len(needle)}c"
+                editor.delete(pos, end)
+                editor.insert(pos, rep)
+                pos = f"{pos}+{len(rep)}c"
+                count += 1
+            status_fr.set(f"Replaced {count} occurrence(s).")
+
+        btn_frame = tk.Frame(win)
+        btn_frame.grid(row=4, column=0, columnspan=3, pady=6)
+        tk.Button(btn_frame, text="Find Next",    width=12, command=find_next).pack(side='left', padx=4)
+        tk.Button(btn_frame, text="Replace",      width=12, command=replace_one).pack(side='left', padx=4)
+        tk.Button(btn_frame, text="Replace All",  width=12, command=replace_all).pack(side='left', padx=4)
+        tk.Button(btn_frame, text="Close",        width=8,  command=win.destroy).pack(side='left', padx=4)
+
+        e_find.bind('<Return>',   lambda e: find_next())
+        e_find.bind('<KP_Enter>', lambda e: find_next())
+        win.bind('<Escape>',      lambda e: win.destroy())
+
+    # ── Go to line dialog ─────────────────────────────────────────────────
+    def open_goto_line():
+        win = tk.Toplevel(editor_frame)
+        win.title("Go to line")
+        win.resizable(False, False)
+        win.transient(editor_frame)
+
+        n_lines = int(editor.index('end-1c').split('.')[0])
+        tk.Label(win, text=f"Line (1–{n_lines}):").grid(row=0, column=0, padx=8, pady=8)
+        v_line = tk.StringVar()
+        e_line = tk.Entry(win, textvariable=v_line, width=8)
+        e_line.grid(row=0, column=1, padx=4)
+        e_line.focus_set()
+
+        def go():
+            try:
+                n = int(v_line.get())
+                n = max(1, min(n, n_lines))
+                editor.mark_set('insert', f'{n}.0')
+                editor.see(f'{n}.0')
+                editor.focus_set()
+                win.destroy()
+            except ValueError:
+                pass
+
+        tk.Button(win, text="Go", command=go, width=6).grid(row=0, column=2, padx=4)
+        e_line.bind('<Return>',   lambda e: go())
+        e_line.bind('<KP_Enter>', lambda e: go())
+        win.bind('<Escape>',      lambda e: win.destroy())
+
+    # ── Status bar ────────────────────────────────────────────────────────
+    status_var = tk.StringVar(value="Ready  |  Ctrl+S: Save  |  Ctrl+H: Find/Replace  |  Ctrl+G: Go to line  |  Right-click: menu")
     status_lbl = tk.Label(editor_frame, textvariable=status_var,
                           anchor='w', font=('Arial', 8), fg='gray')
     status_lbl.grid(row=2, column=0, columnspan=2, sticky='ew', padx=4)
+
+    def update_cursor_pos(event=None):
+        pos  = editor.index('insert')
+        line, col = pos.split('.')
+        status_var.set(f"Line {line}, Col {int(col)+1}  |  Ctrl+S: Save  |  Ctrl+H: Find/Replace  |  Ctrl+G: Go to line")
+        update_line_numbers()
+
+    editor.bind('<KeyRelease>',   update_cursor_pos)
+    editor.bind('<ButtonRelease>', update_cursor_pos)
 
     def log_editor(msg):
         status_var.set(msg)
