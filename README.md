@@ -30,8 +30,8 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 | Tab | Script | Purpose |
 |-----|--------|---------|
 | **[Gen] Generator** | `guided_meditation_generator_v23.py` | Multi-voice guided meditations — XTTS v2, ambient music, parallel overlay, reverb, noise gate, pan, limiter — output to WAV / MP3 / FLAC / OGG |
-| **[Ana] Analyser** | `voice_analyser.py` | Analyse a voice WAV and produce ready-to-paste `{}` and `[]` parameter blocks |
-| **[Txt] Transcription** | `transcribeSong2txt_with_pause.py` or `video2txt.py` | Whisper transcription with pause markers and optional per-word pitch annotation |
+| **[Ana] Analyser** | `voice_analyser.py` | Analyse a voice WAV and produce ready-to-paste `{}` and `[]` parameter blocks. F0 engine selectable: torchcrepe (GPU) or pyin (multicore CPU) |
+| **[Txt] Transcription** | `transcribeSong2txt_with_pause.py` or `video2txt.py` | Whisper transcription with pause markers and optional per-word pitch annotation — audio and video input |
 | **[Vox] Voice sep.** | `extract_voices.py` | Separate voices by F0, remove background music (demucs), dereverberate, replace silences — output to WAV / MP3 / FLAC / OGG |
 | **[Pit] Pitch** | `apply_pitch_to_clone.py` | Apply pitch correction to a cloned voice file |
 | **[Vid] Video->Audio** | `ffmpeg` | Extract audio from any video — output to MP3 / WAV / FLAC / OGG |
@@ -64,16 +64,19 @@ pip install faster-whisper
 pip install librosa pydub numpy soundfile
 pip install pyrubberband
 
-# 4. Voice separation backends (optional)
-pip install demucs             # music removal
-pip install noisereduce        # fast dereverberation (CPU)
-pip install nara-wpe           # precise reverb removal (CPU)
-pip install deepfilternet      # best quality dereverberation (GPU supported)
+# 4. F0 engine for voice analysis (recommended)
+pip install torchcrepe       # GPU-accelerated F0 estimation (uses existing PyTorch)
 
-# 5. System packages (Ubuntu/Debian)
+# 5. Voice separation backends (optional)
+pip install demucs            # music removal
+pip install noisereduce       # fast dereverberation (CPU)
+pip install nara-wpe          # precise reverb removal (CPU)
+pip install deepfilternet     # best quality dereverberation (GPU supported)
+
+# 6. System packages (Ubuntu/Debian)
 sudo apt install ffmpeg rubberband-cli
 
-# 6. Verify CUDA (optional)
+# 7. Verify CUDA (optional)
 python -c "from faster_whisper import WhisperModel; m = WhisperModel('tiny', device='cuda', compute_type='float16'); print('CUDA OK')"
 ```
 
@@ -112,6 +115,8 @@ conda activate xtts
 python ~/XTTS-Voice-Studio/Python_Scripting/xtts_studio.py
 ```
 
+All device selectors (Device: cpu/cuda) auto-detect CUDA at startup and pre-select it when available.
+
 ---
 
 ## Guided Meditation Generator
@@ -139,7 +144,7 @@ python ~/XTTS-Voice-Studio/Python_Scripting/xtts_studio.py
 | Position | Parameter | Default | Notes |
 |----------|-----------|---------|-------|
 | 13 | `reverb` | 0 | Wet level 0–1 via ffmpeg `aecho`. Adds spatial presence. |
-| 14 | `noise_gate` | 0 | Threshold dB via ffmpeg `agate` (e.g. -40). Removes breath noise between words. |
+| 14 | `noise_gate` | 0 | Threshold dB via ffmpeg `agate` (e.g. -40). Removes breath noise. |
 | 15 | `pan` | 0 | Stereo pan: -1.0=left, 0=centre, +1.0=right. |
 | 16 | `limiter` | 0 | Output limiter (0=off, 1=on). Prevents clipping. |
 
@@ -200,17 +205,35 @@ python guided_meditation_generator_v23.py prompt.txt output.mp3 voice.wav \
     --mp3-bitrate 256 --mp3-mode cbr
 ```
 
-### Command line
+---
+
+## Voice Analyser
+
+Analyses a reference WAV and outputs ready-to-paste `{}` and `[]` blocks for `guided_meditation_generator_v23.py`. Derives all 14 XTTS params and all 16 audio params from acoustic analysis.
 
 ```bash
-python guided_meditation_generator_v23.py \
-    ~/XTTS-Voice-Studio/Prompts/prompt.txt \
-    ~/XTTS-Voice-Studio/Output_Song_files/output.wav \
-    ~/XTTS-Voice-Studio/Voices_Cloning/voice1.wav \
-    ~/XTTS-Voice-Studio/Voices_Cloning/voice2.wav \
-    ~/XTTS-Voice-Studio/Ambient_Musics/forest.wav \
-    ~/XTTS-Voice-Studio/Punctual_sounds/bell.wav
+python voice_analyser.py --precise --f0-engine auto --start-num 1 voice.wav FR
 ```
+
+### F0 engine options
+
+| Engine | Backend | Speed | Best for |
+|--------|---------|-------|----------|
+| `auto` | torchcrepe if available, else pyin | Fast | Default — GPU when possible |
+| `crepe` | torchcrepe (GPU/CPU) | Fast on GPU | Expressive, singing voices |
+| `pyin` | librosa (multicore CPU) | Medium | Monotone, spoken voices |
+
+- **torchcrepe** uses CUDA automatically if available. Falls back to CPU on OOM. Processes in 30s chunks.
+- **pyin** uses all available CPU cores via `ProcessPoolExecutor`. Processes in 30s chunks.
+- Both engines give slightly different results — torchcrepe tends to be more generous on voiced_ratio; pyin is more precise on stable fundamentals.
+
+**Derived parameters include:**
+- `gpt_cond_len` — set to actual WAV duration (capped at 60s) for best cloning fidelity
+- `repetition_penalty` — from F0 jitter (expressive → 4.0, monotone → 6.0–7.0)
+- `length_penalty` — from voiced_ratio (fast speaker → 0.9, slow/breathy → 1.1)
+- `noise_gate` — auto-suggested from SNR
+- Adaptive fades derived from voice dynamics
+- Breathiness detection via spectral flatness — adjusts NR and compression automatically
 
 ---
 
@@ -218,27 +241,27 @@ python guided_meditation_generator_v23.py \
 
 ### Modes
 
-**1. Music removal (demucs)** — strips background music and noise, outputs a clean vocal stem with no F0 filtering and no cuts:
+**1. Music removal (demucs)** — strips background music and noise, outputs a clean vocal stem with no cuts:
 
 ```bash
 python extract_voices.py input.mp3 output.mp3 --remove-music --demucs-model htdemucs_ft
 ```
 
-**2. Voice separation by F0** — classifies segments as female, male, or overlap, keeps the requested category, and replaces discarded segments with silence:
+**2. Voice separation by F0** — classifies segments as female, male, or overlap:
 
 ```bash
 python extract_voices.py input.wav output.wav \
     --keep female --silence 1.0 --threshold 165 --overlap-range 200
 ```
 
-**3. Dereverberation only** — clean a file without any F0 filtering:
+**3. Dereverberation only** — clean a file without F0 filtering:
 
 ```bash
 python extract_voices.py vocals.wav clean.wav \
     --keep "vocals only" --dereverberate deepfilter
 ```
 
-**4. Silence replacement in a single-voice file** — replace natural pauses with a fixed duration. Set `--min-silence` to match the natural pause length in the recording:
+**4. Silence replacement in a single-voice file** — replace natural pauses with a fixed duration:
 
 ```bash
 python extract_voices.py voice.wav output.wav \
@@ -251,9 +274,9 @@ python extract_voices.py voice.wav output.wav \
 |-----------|---------|-------------|
 | `--keep` | `female` | `female`, `male`, `overlap`, `all`, `female,male`, `vocals only` |
 | `--silence` | `auto` | Gap between kept segments: `auto`=natural, `0`=none, `N`=fixed N seconds |
-| `--min-silence` | 0.15 | Minimum pause (s) to split segments. Use 0.3–0.5 for sentence-level splitting in single-voice files |
+| `--min-silence` | 0.15 | Minimum pause (s) to split segments. Use 0.3–0.5 for single-voice files |
 | `--threshold` | 165 | F0 boundary male/female in Hz |
-| `--overlap-range` | 200 | F0 range above which a segment is classified as overlap. Use 200+ for solo voice files |
+| `--overlap-range` | 200 | F0 range above which a segment is classified as overlap |
 | `--remove-music` | off | Run demucs to strip background music before processing |
 | `--demucs-model` | `htdemucs_ft` | `htdemucs` (fast), `htdemucs_ft` (best vocals), `mdx_extra` (dense music) |
 | `--dereverberate` | `none` | `noisereduce` (CPU), `wpe` (CPU), `deepfilter` (GPU supported) |
@@ -261,29 +284,35 @@ python extract_voices.py voice.wav output.wav \
 | `--mp3-mode` | `cbr` | `cbr` (constant) or `vbr` (variable) |
 | `--debug` | off | Print per-segment classification detail |
 
-**GPU**: auto-detected at startup. Demucs and DeepFilterNet use CUDA when available; noisereduce and WPE are CPU-only.
+**GPU**: auto-detected. Demucs and DeepFilterNet use CUDA when available; noisereduce and WPE are CPU-only.
 
 ---
 
-## Song Transcription
+## Song / Video Transcription
 
-Powered by `faster-whisper` (2–4× faster than openai-whisper at identical quality).
+### Audio transcription
 
 ```bash
-# Recommended for GTX 1650 (optiplex)
-python transcribeSong2txt_with_pause.py audio.mp3 output.txt small 0.3 fr --pitch --device cuda --vad
-
-# Recommended for RTX A4500 (asteria) — best quality
-python transcribeSong2txt_with_pause.py audio.mp3 output.txt large-v3 0.1 fr --pitch --device cuda --vad
+python transcribeSong2txt_with_pause.py audio.mp3 output.txt small 0.3 fr \
+    --device cuda --vad
 ```
 
-**Model selection by GPU:**
+### Video transcription
 
-| GPU VRAM | Recommended model |
-|----------|-------------------|
-| ~4 GB (GTX 1650) | `small` |
-| ~8 GB | `medium` or `turbo` |
-| 20 GB+ (RTX A4500) | `large-v3` |
+```bash
+python video2txt.py video.mp4 output.txt --model large-v3 --lang fr \
+    --pause 0.1 --device cuda
+```
+
+`video2txt.py` extracts audio via ffmpeg (mono 16kHz WAV) then calls `transcribeSong2txt_with_pause.py`. The Stop button kills the entire process tree immediately (SIGKILL).
+
+### Model selection by GPU VRAM
+
+| GPU VRAM | Recommended model | Notes |
+|----------|-------------------|-------|
+| ~4 GB (GTX 1650) | `small` | Max safe model |
+| ~8 GB | `medium` or `turbo` | |
+| 20 GB+ (RTX A4500) | `large-v3` | Best quality |
 
 **Features:**
 - Word-level timestamps for precise pause detection
@@ -294,29 +323,16 @@ python transcribeSong2txt_with_pause.py audio.mp3 output.txt large-v3 0.1 fr --p
 
 ---
 
-## Voice Analyser
-
-Analyses a reference WAV and outputs ready-to-paste `{}` and `[]` blocks for `guided_meditation_generator_v23.py`. Derives all 14 XTTS params and all 16 audio params from acoustic analysis.
-
-```bash
-python voice_analyser.py --precise --start-num 1 voice.wav FR
-```
-
-**Derived parameters include:**
-- `gpt_cond_len` — set to actual WAV duration (capped at 60s) for best cloning fidelity
-- `repetition_penalty` — derived from F0 jitter (expressive → 4.0, monotone → 6.0–7.0)
-- `length_penalty` — derived from voiced_ratio (fast speaker → 0.9, slow/breathy → 1.1)
-- `noise_gate` — auto-suggested from SNR
-- Adaptive fades derived from voice dynamics
-- Breathiness detection via spectral flatness — adjusts NR and compression automatically
-
----
-
 ## Troubleshooting
 
 **`faster-whisper` not installed**
 ```bash
 pip install faster-whisper
+```
+
+**`torchcrepe` not installed**
+```bash
+pip install torchcrepe
 ```
 
 **`demucs` not installed**
@@ -328,6 +344,9 @@ pip install demucs
 ```bash
 pip install deepfilternet
 ```
+
+**CUDA out of memory in voice analyser**
+torchcrepe automatically retries on CPU if CUDA OOM. For very long files (20min+), use `--f0-engine pyin` which uses multicore CPU without GPU memory constraints.
 
 **CUDA errors about missing `cudnn_ops_infer.so`**
 ```bash
@@ -346,7 +365,7 @@ ffmpeg -codecs | grep mp3lame   # verify libmp3lame is available
 ```
 
 **`0 segments detected` in voice separation**
-The RMS threshold adapts automatically. If noisereduce produced NaN values on an already-clean file, re-run without `--dereverberate` or use `--keep all`. For single-voice files where silences are not detected, increase `--min-silence` to 0.3–0.5.
+The RMS threshold adapts automatically. If noisereduce produced NaN values on an already-clean file, re-run without `--dereverberate`. For single-voice files where silences are not detected, increase `--min-silence` to 0.3–0.5.
 
 **Audio player silent under WSL**
 `ffplay` has no direct access to the Windows audio stack under WSL. Open the generated file directly in Windows Explorer instead.
@@ -360,6 +379,7 @@ Answer `y` at the prompt, or pre-accept by editing `~/.local/share/tts/`.
 
 - **XTTS v2** by [Coqui](https://github.com/coqui-ai/TTS)
 - **faster-whisper** by [SYSTRAN](https://github.com/SYSTRAN/faster-whisper)
+- **torchcrepe** by [maxrmorrison](https://github.com/maxrmorrison/torchcrepe)
 - **librosa** for F0 analysis
 - **pydub** and **Rubberband** for audio processing
 - **demucs** by [Facebook Research](https://github.com/facebookresearch/demucs)

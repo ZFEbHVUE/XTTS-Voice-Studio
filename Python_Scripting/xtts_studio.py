@@ -275,7 +275,16 @@ def run_cmd(cmd, console, btn, stop_btn=None):
 
     def stop():
         if proc_holder[0]:
-            proc_holder[0].terminate()
+            import signal as _sig, os as _os
+            try:
+                pgid = _os.getpgid(proc_holder[0].pid)
+                _os.killpg(pgid, _sig.SIGTERM)
+                _os.killpg(pgid, _sig.SIGKILL)   # immediately force-kill — Python ignores SIGTERM
+            except Exception:
+                try:
+                    proc_holder[0].kill()          # SIGKILL directly
+                except Exception:
+                    pass
             log(console, "\n[STOP] Stop requested...")
 
     if stop_btn:
@@ -695,8 +704,13 @@ def tab_analyser(nb):
     tk.Button(ctrl_frame, text="+ Add voice",
         command=lambda: add_voice_row(),
         bg='#444', fg='white', width=14).pack(side='left', padx=4)
-    tk.Label(ctrl_frame, text="Prec = precise mode (pyin, slower)",
-             fg='gray', font=('Arial',8)).pack(side='left', padx=10)
+    tk.Label(ctrl_frame, text="Prec = precise mode",
+             fg='gray', font=('Arial',8)).pack(side='left', padx=6)
+    v_f0_engine = tk.StringVar(value='auto')
+    ttk.Combobox(ctrl_frame, textvariable=v_f0_engine, width=8, state='readonly',
+        values=['auto','crepe','pyin']).pack(side='left', padx=2)
+    tk.Label(ctrl_frame, text="F0 engine (auto=crepe if available)",
+             fg='gray', font=('Arial',8)).pack(side='left', padx=4)
 
     console = add_console(f, 2)
 
@@ -713,6 +727,7 @@ def tab_analyser(nb):
             cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'voice_analyser.py')]
             if vprec:
                 cmd.append('--precise')
+            cmd += ['--f0-engine', v_f0_engine.get()]
             cmd += ['--start-num', str(vnum)]
             if vseed != 0:
                 cmd += ['--seed', str(vseed)]
@@ -814,7 +829,9 @@ def tab_transcribe(nb):
     v_pitch  = tk.BooleanVar(value=False)
 
     add_row(f, "Video/Audio", v_input,  0,
-            [("Video/Audio","*.mp4 *.mkv *.avi *.mov *.mp3 *.wav *.flac"),("All","*.*")], initialdir=DIR_MP3)
+            [("Video","*.mp4 *.mkv *.avi *.mov *.flv *.webm *.wmv *.m4v *.ts *.mpg"),
+             ("Audio","*.mp3 *.wav *.flac *.ogg"),
+             ("All","*.*")], initialdir=DIR_MP3)
     add_row(f, "Output (.txt)", v_output, 1, [("Text","*.txt")], save=True, initialdir=DIR_TXT)
 
     tk.Label(f, text="Whisper model", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
@@ -827,7 +844,12 @@ def tab_transcribe(nb):
         values=['fr','en','es','de','it','pt','pl','tr','ru','nl','cs','ar','zh','hu','ko','ja','hi']
     ).grid(row=3, column=1, sticky='w', padx=4)
 
-    v_device = tk.StringVar(value='cpu')
+    try:
+        import torch as _torch_txt
+        _txt_dev = "cuda" if _torch_txt.cuda.is_available() else "cpu"
+    except Exception:
+        _txt_dev = "cpu"
+    v_device = tk.StringVar(value=_txt_dev)
     tk.Label(f, text="Device", anchor='w', width=20).grid(row=4, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_device, width=8, state='readonly',
         values=['cpu','cuda']).grid(row=4, column=1, sticky='w', padx=4)
@@ -1007,7 +1029,12 @@ def tab_pitch(nb):
         values=['tiny','base','small','medium']
     ).grid(row=5, column=1, sticky='w', padx=4)
 
-    v_device = tk.StringVar(value='cpu')
+    try:
+        import torch as _torch_pit
+        _pit_dev = "cuda" if _torch_pit.cuda.is_available() else "cpu"
+    except Exception:
+        _pit_dev = "cpu"
+    v_device = tk.StringVar(value=_pit_dev)
     tk.Label(f, text="Device", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_device, width=8, state='readonly',
         values=['cpu','cuda']).grid(row=6, column=1, sticky='w', padx=4)

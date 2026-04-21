@@ -42,6 +42,11 @@ except ImportError:
     sys.exit("[!] numpy missing -> pip install numpy")
 
 try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
     import librosa
 except ImportError:
     sys.exit("[!] librosa missing -> pip install librosa")
@@ -88,7 +93,16 @@ def fmt(v):
 # Core analysis
 # -----------------------------------------------------------------------------
 
-def analyse_voice(wav_file, fast=True):
+def _pyin_worker(args):
+    """Module-level worker for multiprocessing pyin — must be at top level for pickling."""
+    chunk, sr, hop_len, fmin_hz, fmax_hz, frames_main = args
+    import librosa as _lb
+    import numpy as _np
+    f0c, vc, _ = _lb.pyin(chunk, fmin=fmin_hz, fmax=fmax_hz, sr=sr, hop_length=hop_len)
+    return f0c[:frames_main], vc[:frames_main]
+
+
+def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     """
     Analyse an XTTS reference WAV file.
 
@@ -152,10 +166,107 @@ def analyse_voice(wav_file, fast=True):
                        (f0_raw < librosa.note_to_hz('C6')))
         f0 = np.where(voiced_flag, f0_raw, np.nan)
     else:
-        f0, voiced_flag, _ = librosa.pyin(y,
-                                           fmin=librosa.note_to_hz('C2'),
-                                           fmax=librosa.note_to_hz('C6'),
-                                           sr=sr, hop_length=hop_len)
+        # F0 engine selection: auto / crepe / pyin
+        import math
+
+        try:
+            import torch as _torch_tc
+        except ImportError:
+            _torch_tc = None
+        _device_tc = "cuda" if (_torch_tc and _torch_tc.cuda.is_available()) else "cpu"
+        _use_crepe = False
+
+        if f0_engine == 'pyin':
+            print("   [*] F0 engine: pyin (forced)")
+        else:
+            try:
+                import torchcrepe
+                if f0_engine in ('auto', 'crepe'):
+                    _use_crepe = True
+                    print(f"   [*] F0 engine: torchcrepe ({'forced' if f0_engine == 'crepe' else 'auto'}) on {_device_tc}")
+            except ImportError:
+                if f0_engine == 'crepe':
+                    print("   [!] torchcrepe not installed -- falling back to pyin (pip install torchcrepe)")
+                else:
+                    print("   [*] torchcrepe not found, using pyin (pip install torchcrepe to enable GPU)")
+
+        if _use_crepe:
+            print(f"   [*] torchcrepe on {_device_tc} (30s chunks)...")
+            import math
+            chunk_s = int(30 * sr)
+            starts  = list(range(0, len(y), chunk_s))
+            freq_parts, conf_parts = [], []
+
+            def _run_crepe(device):
+                freq_parts.clear(); conf_parts.clear()
+                for i, start in enumerate(starts):
+                    chunk = y[start:min(start + chunk_s, len(y))]
+                    y_tc  = torch.from_numpy(chunk).unsqueeze(0)
+                    f_tc, c_tc = torchcrepe.predict(
+                        y_tc, sr,
+                        hop_length=hop_len,
+                        fmin=32.7, fmax=2093.0,
+                        model='full',
+                        decoder=torchcrepe.decode.viterbi,
+                        return_periodicity=True,
+                        batch_size=512,
+                        device=device,
+                    )
+                    freq_parts.append(f_tc.squeeze(0).cpu().numpy())
+                    conf_parts.append(c_tc.squeeze(0).cpu().numpy())
+                    pct = int((i + 1) * 100 / len(starts))
+                    print(f"   [*] torchcrepe {i+1}/{len(starts)} ({pct}%)...", end='\r', flush=True)
+                print()
+
+            try:
+                _run_crepe(_device_tc)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"\n   [!] CUDA OOM - retrying on CPU...")
+                    torch.cuda.empty_cache()
+                    _run_crepe("cpu")
+                else:
+                    raise
+
+            freq_tc     = np.concatenate(freq_parts)
+            conf_tc     = np.concatenate(conf_parts)
+            voiced_flag = conf_tc > 0.5
+            f0          = np.where(voiced_flag, freq_tc, np.nan)
+            print(f"   [*] torchcrepe done ({len(f0)} frames)")
+
+        else:
+            # pyin multiprocessing: 30s chunks on all CPU cores
+            from concurrent.futures import ProcessPoolExecutor
+            import os as _os
+
+            fmin_hz  = librosa.note_to_hz('C2')
+            fmax_hz  = librosa.note_to_hz('C6')
+            chunk_s  = int(30 * sr)
+            overlap  = int(0.5 * sr)
+            n_cores  = _os.cpu_count() or 1  # all available cores
+            starts   = list(range(0, len(y), chunk_s))
+
+            # Build args list for each chunk
+            job_args = []
+            for start in starts:
+                end         = min(start + chunk_s + overlap, len(y))
+                chunk       = y[start:end].copy()
+                frames_main = math.ceil((min(start + chunk_s, len(y)) - start) / hop_len)
+                if len(chunk) >= 2048:
+                    job_args.append((chunk, sr, hop_len, fmin_hz, fmax_hz, frames_main))
+
+            print(f"   [*] pyin: {len(job_args)} chunks on {n_cores} cores...")
+            f0_parts, vc_parts = [], []
+            with ProcessPoolExecutor(max_workers=n_cores) as pool:
+                for i, (f0c, vc) in enumerate(pool.map(_pyin_worker, job_args)):
+                    f0_parts.append(f0c)
+                    vc_parts.append(vc)
+                    pct = int((i + 1) * 100 / len(job_args))
+                    print(f"   [*] pyin {i+1}/{len(job_args)} ({pct}%)...", end='\r', flush=True)
+
+            print()
+            f0          = np.concatenate(f0_parts)
+            voiced_flag = np.concatenate(vc_parts)
 
     f0_voiced = f0[voiced_flag & ~np.isnan(f0)]
     if len(f0_voiced) < 5:
@@ -495,6 +606,14 @@ def main():
     args     = [a for a in args if a not in ('--precise', '--fast')]
     fast     = not precise
 
+    # --f0-engine auto|crepe|pyin
+    f0_engine = 'auto'
+    if '--f0-engine' in args:
+        idx_fe = args.index('--f0-engine')
+        if idx_fe + 1 < len(args):
+            f0_engine = args[idx_fe + 1].lower()
+            args = [a for i, a in enumerate(args) if i != idx_fe and i != idx_fe + 1]
+
     # --start-num N : numero de la premiere voix (defaut: 1)
     start_num = 1
     if '--start-num' in args:
@@ -547,7 +666,7 @@ def main():
             print(f"[!] File not found: {wav_file}")
             continue
         try:
-            params, stats = analyse_voice(wav_file, fast=fast)
+            params, stats = analyse_voice(wav_file, fast=fast, f0_engine=f0_engine)
             seed = get_seed(idx - start_num)
             display_results(params, stats, voice_num=idx,
                             wav_file=wav_file, language=lang, seed=seed)
