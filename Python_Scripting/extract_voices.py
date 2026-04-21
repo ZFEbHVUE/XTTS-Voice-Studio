@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Separation voix feminine / masculine avec gestion fine des silences
+Female / male voice separation with fine silence handling
 et de-reverberation optionnelle.
 
 Regles :
   female_solo  -> F0 >= seuil, faible variance
   male_solo    -> F0 <  seuil, faible variance
-  overlap      -> deux voix simultanees
+  overlap      -> two simultaneous voices
   silence      -> pas de parole
 
-Options --keep :
+Options --keep:
   female, male, overlap, all, female,male
 
-Options --silence :
-  auto  -> duree naturelle
-  0     -> aucun silence
+Options --silence:
+  auto  -> natural duration
+  0     -> no silence
   N     -> exactement N secondes entre chaque segment garde
 
-Options --dereverberate :
+Options --dereverberate:
   none, noisereduce, wpe, deepfilter
 
-Usage :
+Output format is auto-detected from the output file extension: .wav, .mp3, .flac, .ogg
+
+Usage:
   python extract_voices.py input.mp3 output.wav --keep female --silence 0.5
+  python extract_voices.py input.mp3 output.mp3 --keep female --mp3-bitrate 256 --mp3-mode cbr
+  python extract_voices.py input.mp3 output.mp3 --remove-music --mp3-bitrate 192 --mp3-mode vbr
 """
 
 import numpy as np
@@ -30,6 +34,8 @@ import soundfile as sf
 import librosa
 import argparse
 import os
+import tempfile
+import subprocess
 
 
 def dereverberate(y, sr, method='none', device='cpu'):
@@ -39,16 +45,16 @@ def dereverberate(y, sr, method='none', device='cpu'):
         try:
             import noisereduce as nr
         except ImportError:
-            print("[!]  pip install noisereduce"); return y
-        print("   [*]  noisereduce...")
+            print("[!] pip install noisereduce"); return y
+        print("   [*] noisereduce...")
         return nr.reduce_noise(y=y, sr=sr, stationary=False, prop_decrease=0.85).astype(np.float32)
     elif method == 'wpe':
         try:
             from nara_wpe.wpe import wpe
             from nara_wpe.utils import stft, istft
         except ImportError:
-            print("[!]  pip install nara-wpe"); return y
-        print("   [*]  WPE...")
+            print("[!] pip install nara-wpe"); return y
+        print("   [*] WPE...")
         size, shift = 512, 128
         Y = stft(y, size=size, shift=shift).T[None, ...]
         Z = wpe(Y, taps=10, delay=3, iterations=3)[0]
@@ -59,9 +65,9 @@ def dereverberate(y, sr, method='none', device='cpu'):
         try:
             from df.enhance import enhance, init_df
         except ImportError:
-            print("[!]  pip install deepfilternet"); return y
+            print("[!] pip install deepfilternet"); return y
         use_gpu = device == 'cuda'
-        print(f"   [*]  DeepFilterNet par chunks 30s ({'GPU' if use_gpu else 'CPU'})...")
+        print(f"   [*] DeepFilterNet by 30s chunks ({'GPU' if use_gpu else 'CPU'})...")
         import torch
         if not use_gpu:
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -142,6 +148,57 @@ def remove_music_demucs(input_file, demucs_model='htdemucs_ft', device='cpu'):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+
+def save_audio(y, sr, output_file, mp3_bitrate=192, mp3_mode='cbr'):
+    """
+    Save audio array to file. Format is auto-detected from extension.
+    Supported: .wav, .mp3, .flac, .ogg
+    MP3 requires ffmpeg.
+    """
+    ext = os.path.splitext(output_file)[1].lower()
+
+    if ext == '.wav':
+        sf.write(output_file, y, sr)
+
+    elif ext in ('.mp3', '.flac', '.ogg'):
+        # Write temp WAV then convert via ffmpeg
+        tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        try:
+            sf.write(tmp.name, y, sr)
+            codec_map = {'.flac': 'flac', '.ogg': 'libvorbis'}
+            if ext == '.mp3':
+                if mp3_mode == 'vbr':
+                    # VBR: quality 0 (best) to 9 (worst) — map bitrate to quality
+                    vbr_q = {128: 6, 160: 5, 192: 4, 256: 2, 320: 0}.get(mp3_bitrate, 4)
+                    cmd = ['ffmpeg', '-i', tmp.name,
+                           '-codec:a', 'libmp3lame', '-q:a', str(vbr_q),
+                           '-y', output_file]
+                else:  # CBR
+                    cmd = ['ffmpeg', '-i', tmp.name,
+                           '-codec:a', 'libmp3lame', '-b:a', f'{mp3_bitrate}k',
+                           '-y', output_file]
+            else:
+                cmd = ['ffmpeg', '-i', tmp.name,
+                       '-codec:a', codec_map[ext], '-y', output_file]
+            subprocess.run(cmd, check=True, capture_output=True)
+            mode_str = f"VBR q={vbr_q}" if ext == '.mp3' and mp3_mode == 'vbr' else f"CBR {mp3_bitrate}k"
+            print(f"   [*] Encoded to {ext[1:].upper()} ({mode_str})")
+        except subprocess.CalledProcessError as e:
+            print(f"   [!] ffmpeg encoding error: {e}")
+            print(f"   [!] Falling back to WAV: {output_file.replace(ext, '.wav')}")
+            output_file = output_file.replace(ext, '.wav')
+            sf.write(output_file, y, sr)
+        finally:
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+    else:
+        print(f"   [!] Unknown extension '{ext}', saving as WAV")
+        sf.write(output_file, y, sr)
+
+    size_mb = os.path.getsize(output_file) / (1024 * 1024)
+    print(f"[OK] {output_file}  ({len(y)/sr:.1f}s, {size_mb:.1f} MB)")
+
+
 def detect_segments(y, sr, min_silence=0.15, min_speech=0.2):
     hop = 512
     rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop)[0]
@@ -179,7 +236,8 @@ def classify(y, sr, start, end, f0_thr=165, ov_range=80):
 
 def process(input_file, output_file, keep_set=None, silence_mode='auto',
             deverb_method='none', f0_thr=165, ov_range=80, min_dur=0.2,
-            debug=False, remove_music=False, demucs_model='htdemucs_ft', device='cpu'):
+            debug=False, remove_music=False, demucs_model='htdemucs_ft', device='cpu',
+            mp3_bitrate=192, mp3_mode='cbr'):
 
     if keep_set is None: keep_set = {'female_solo'}
 
@@ -196,32 +254,30 @@ def process(input_file, output_file, keep_set=None, silence_mode='auto',
             # --remove-music alone: save clean vocals stem and exit.
             # No F0 filtering, no segment detection, no cuts.
             print(f"[OK] Music removed. Saving clean vocals directly (no F0 filtering).")
-            sf.write(output_file, y, sr)
-            print(f"[OK] {output_file}  ({len(y)/sr:.1f}s)")
+            save_audio(y, sr, output_file, mp3_bitrate, mp3_mode)
             return
     else:
         y, sr = librosa.load(input_file, sr=None, mono=True)
     total_dur = len(y) / sr
     rm_str = "none"
-    sil_str = 'duree naturelle' if silence_mode == 'auto' else \
-              'aucun silence' if silence_mode == 0.0 else f'{silence_mode}s fixe'
-    print(f"   Duree:{total_dur:.1f}s  Garder:{keep_set}  Silence:{sil_str}  Dereverb:{deverb_method}")
+    sil_str = 'natural duration' if silence_mode == 'auto' else \
+              'no silence' if silence_mode == 0.0 else f'{silence_mode}s fixed'
+    print(f"   Duree:{total_dur:.1f}s  Keep:{keep_set}  Silence:{sil_str}  Dereverb:{deverb_method}")
 
     if deverb_method != 'none':
         y = dereverberate(y, sr, deverb_method, device)
         # If keep is vocals_only, just save the cleaned file and exit — no F0 cuts.
         if 'vocals_only' in keep_set:
             print(f"[OK] Dereverberation done. Saving directly (no F0 filtering).")
-            sf.write(output_file, y, sr)
-            print(f"[OK] {output_file}  ({len(y)/sr:.1f}s)")
+            save_audio(y, sr, output_file, mp3_bitrate, mp3_mode)
             return
 
     segs = detect_segments(y, sr)
-    print(f"   {len(segs)} segments detectes")
+    print(f"   {len(segs)} segments detected")
 
-    # Calculer le silence a inserer entre deux segments gardes
+    # Compute silence to insert between kept segments
     if silence_mode == 'auto':
-        sil_n = None  # variable selon les gaps
+        sil_n = None  # variable — follows natural gaps
     elif silence_mode == 0.0:
         sil_n = 0
     else:
@@ -248,7 +304,7 @@ def process(input_file, output_file, keep_set=None, silence_mode='auto',
                 if n > 0:
                     result.append(np.zeros(n, dtype=np.float32))
 
-            # Garder le segment avec fade
+            # Keep the segment with fade in/out
             chunk = y[int(start*sr):int(end*sr)].copy()
             fade = min(int(0.02*sr), len(chunk)//4)
             if fade > 0:
@@ -258,9 +314,9 @@ def process(input_file, output_file, keep_set=None, silence_mode='auto',
             last_kept_end = end
 
     if not result:
-        print("[!]  Aucun segment garde !"); return
+        print("[!]  No segment kept!"); return
 
-    # Silence final optionnel
+    # Optional trailing silence
     if last_kept_end is not None and last_kept_end < total_dur:
         if silence_mode == 'auto':
             result.append(np.zeros(int((total_dur - last_kept_end) * sr), dtype=np.float32))
@@ -269,7 +325,7 @@ def process(input_file, output_file, keep_set=None, silence_mode='auto',
 
     final = np.concatenate(result)
     sf.write(output_file, final, sr)
-    print(f"\n[OK]  {output_file}  ({len(final)/sr:.1f}s)")
+    print(f"\n[OK] {output_file}  ({len(final)/sr:.1f}s)")
 
 
 KEEP_ALIASES = {
@@ -284,14 +340,14 @@ def parse_keep(s):
         p = p.strip().lower()
         if p in KEEP_ALIASES: result |= KEEP_ALIASES[p]
         elif p in ('female_solo','male_solo'): result.add(p)
-        else: raise argparse.ArgumentTypeError(f"Inconnu: {p}")
+        else: raise argparse.ArgumentTypeError(f"Unknown: {p}")
     return result
 
 def parse_silence(s):
     s = s.strip().lower()
     if s == 'auto': return 'auto'
     v = float(s)
-    if v < 0: raise argparse.ArgumentTypeError("Valeur negative")
+    if v < 0: raise argparse.ArgumentTypeError("Negative value")
     return v
 
 if __name__ == "__main__":
@@ -305,6 +361,11 @@ if __name__ == "__main__":
     p.add_argument("--overlap-range", type=int, default=80)
     p.add_argument("--min-dur", type=float, default=0.2)
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--mp3-bitrate", type=int, default=192,
+                   choices=[128, 160, 192, 256, 320],
+                   help="MP3 bitrate in kbps (default: 192) — only used when output is .mp3")
+    p.add_argument("--mp3-mode", choices=["cbr", "vbr"], default="cbr",
+                   help="MP3 encoding mode: cbr (constant) or vbr (variable, default: cbr)")
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu",
                    help="Device for demucs and deepfilter (default: cpu)")
     p.add_argument("--remove-music", action="store_true",
@@ -315,4 +376,5 @@ if __name__ == "__main__":
     args = p.parse_args()
     process(args.input, args.output, args.keep, args.silence, args.dereverberate,
             args.threshold, args.overlap_range, args.min_dur, args.debug,
-            args.remove_music, args.demucs_model, args.device)
+            args.remove_music, args.demucs_model, args.device,
+            args.mp3_bitrate, args.mp3_mode)

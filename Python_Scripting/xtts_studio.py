@@ -667,7 +667,7 @@ def tab_extract(nb):
     v_debug   = tk.BooleanVar(value=False)
 
     add_row(f, "Audio source",   v_input,  0, [("Audio","*.wav *.mp3 *.flac"),("All","*.*")], initialdir=DIR_VOICES)
-    add_row(f, "Output (.wav)",  v_output, 1, [("WAV","*.wav")], save=True, initialdir=DIR_OUTPUT)
+    add_row(f, "Output (wav/mp3)", v_output, 1, [("WAV","*.wav"),("MP3","*.mp3"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")], save=True, initialdir=DIR_OUTPUT)
 
     tk.Label(f, text="Keep", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_keep, width=14, state='readonly',
@@ -694,6 +694,8 @@ def tab_extract(nb):
 
     v_remove_music = tk.BooleanVar(value=False)
     v_demucs_model = tk.StringVar(value='htdemucs_ft')
+    v_mp3_bitrate  = tk.StringVar(value='192')
+    v_mp3_mode     = tk.StringVar(value='cbr')
 
     # ── Device selector (default: auto-detect) ───────────────────────────
     try:
@@ -725,7 +727,17 @@ def tab_extract(nb):
         values=['htdemucs', 'htdemucs_ft', 'mdx_extra']
     ).grid(row=10, column=1, sticky='w', padx=4)
 
-    console = add_console(f, 12)
+    # ── MP3 output options ───────────────────────────────────────────────
+    tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=11, column=0, sticky='w', padx=6, pady=3)
+    frm_mp3 = tk.Frame(f)
+    frm_mp3.grid(row=11, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_mp3, textvariable=v_mp3_bitrate, width=6, state='readonly',
+        values=['128','160','192','256','320']).pack(side='left')
+    ttk.Combobox(frm_mp3, textvariable=v_mp3_mode, width=5, state='readonly',
+        values=['cbr','vbr']).pack(side='left', padx=6)
+    tk.Label(frm_mp3, text="(only used if output is .mp3)", fg='grey').pack(side='left')
+
+    console = add_console(f, 13)
 
     def lancer(btn, stop_btn=None):
         if not v_input.get() or not v_output.get():
@@ -740,12 +752,13 @@ def tab_extract(nb):
         if v_debug.get():
             cmd.append('--debug')
         cmd += ['--device', v_vox_device.get()]
+        cmd += ['--mp3-bitrate', v_mp3_bitrate.get(), '--mp3-mode', v_mp3_mode.get()]
         if v_remove_music.get():
             cmd += ['--remove-music', '--demucs-model', v_demucs_model.get()]
 
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Separate", lancer, 11)
+    make_btn(f, ">  Separate", lancer, 12)
 
 
 # ── Tab: Pitch ──────────────────────────────────────────────────────────────
