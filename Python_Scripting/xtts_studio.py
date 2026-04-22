@@ -277,14 +277,18 @@ def run_cmd(cmd, console, btn, stop_btn=None):
         if proc_holder[0]:
             import signal as _sig, os as _os
             try:
-                pgid = _os.getpgid(proc_holder[0].pid)
-                _os.killpg(pgid, _sig.SIGTERM)
-                _os.killpg(pgid, _sig.SIGKILL)   # immediately force-kill — Python ignores SIGTERM
+                # Kill only the child process and its children, NOT the GUI process
+                proc_holder[0].kill()   # SIGKILL directly on child
             except Exception:
-                try:
-                    proc_holder[0].kill()          # SIGKILL directly
-                except Exception:
-                    pass
+                pass
+            try:
+                # Also kill grandchildren (e.g. whisper spawned by video2txt)
+                pgid = _os.getpgid(proc_holder[0].pid)
+                gui_pgid = _os.getpgid(_os.getpid())
+                if pgid != gui_pgid:   # safety: never kill our own process group
+                    _os.killpg(pgid, _sig.SIGKILL)
+            except Exception:
+                pass
             log(console, "\n[STOP] Stop requested...")
 
     if stop_btn:
