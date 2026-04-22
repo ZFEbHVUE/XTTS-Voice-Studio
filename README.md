@@ -64,8 +64,9 @@ pip install faster-whisper
 pip install librosa pydub numpy soundfile
 pip install pyrubberband
 
-# 4. F0 engine for voice analysis (recommended)
+# 4. F0 engine and acoustic analysis (recommended)
 pip install torchcrepe       # GPU-accelerated F0 estimation (uses existing PyTorch)
+pip install praat-parselmouth  # Praat acoustic measurements (HNR, shimmer, jitter)
 
 # 5. Voice separation backends (optional)
 pip install demucs            # music removal
@@ -229,11 +230,17 @@ python voice_analyser.py --precise --f0-engine auto --start-num 1 voice.wav FR
 
 **Derived parameters include:**
 - `gpt_cond_len` — set to actual WAV duration (capped at 60s) for best cloning fidelity
-- `repetition_penalty` — from F0 jitter (expressive → 4.0, monotone → 6.0–7.0)
+- `repetition_penalty` — from Praat shimmer+jitter combined score (expressive → 4.5, monotone → 7.0)
+- `temperature`, `top_k`, `top_p` — from Praat expressiveness score (shimmer × 0.6 + jitter × 0.4)
+- `NR` — from Praat HNR (HNR > 20dB → 0.15, HNR < 10dB → 0.50)
+- `compression` — from Praat shimmer (shimmer > 15% → 0.7, shimmer < 6% → 0.35)
+- `volume` — computed on voiced frames only (silences excluded) — prevents over-boosting on long files with many pauses. Capped at +8dB.
+- `trim_start` — set to 0 (empirically validated: XTTS handles its own start artifact)
 - `length_penalty` — from voiced_ratio (fast speaker → 0.9, slow/breathy → 1.1)
 - `noise_gate` — auto-suggested from SNR
 - Adaptive fades derived from voice dynamics
 - Breathiness detection via spectral flatness — adjusts NR and compression automatically
+- All Praat measurements limited to first 60s for speed — falls back to librosa if parselmouth not installed
 
 ---
 
@@ -334,6 +341,12 @@ pip install faster-whisper
 ```bash
 pip install torchcrepe
 ```
+
+**`praat-parselmouth` not installed**
+```bash
+pip install praat-parselmouth
+```
+Without it the analyser falls back to librosa estimates (less accurate for rep_pen, NR, compression).
 
 **`demucs` not installed**
 ```bash
