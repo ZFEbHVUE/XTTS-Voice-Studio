@@ -47,6 +47,12 @@ except ImportError:
     torch = None
 
 try:
+    import parselmouth
+    _HAS_PARSELMOUTH = True
+except ImportError:
+    _HAS_PARSELMOUTH = False
+
+try:
     import librosa
 except ImportError:
     sys.exit("[!] librosa missing -> pip install librosa")
@@ -138,9 +144,14 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     natural_start_ms = int(start_frame * hop_len / sr * 1000)
     natural_end_ms   = int(end_frame   * hop_len / sr * 1000)
 
-    # XTTS adds 30-80 ms artifact at start, 150-400 ms tail at end
-    trim_start = int(np.clip(natural_start_ms + 40,  60, 160))
-    trim_end   = int(np.clip(natural_end_ms   + 120, 200, 420))
+    # XTTS adds 30-80 ms artifact at start, 150-400 ms tail at end.
+    # trim_start: only cut if natural silence is significant (>100ms),
+    # otherwise keep minimal (60ms) to avoid cutting first syllables.
+    # trim_start: compensate XTTS artifact only (30-60ms) — NOT the reference silence.
+    # The reference silence tells us how the voice starts, not how much XTTS will add.
+    # Validated empirically: 0ms is safe for voices that start cleanly.
+    trim_start = 0
+    trim_end = int(np.clip(natural_end_ms + 120, 200, 420))
 
     print(f"   Natural silence: start {natural_start_ms}ms  end {natural_end_ms}ms")
     step(f"Silence  -> trim_start={trim_start}ms  trim_end={trim_end}ms", t0)
@@ -281,6 +292,35 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
         voiced_ratio = float(np.mean(voiced_flag))
     step(f"F0={f0_median:.0f}Hz  std={f0_std:.0f}Hz  jitter={f0_jitter:.3f}  voiced={voiced_ratio:.0%}", t0)
 
+    # -- 2b. Parselmouth (Praat) acoustic measurements ----------------------
+    # HNR, shimmer, jitter — more accurate than librosa estimates.
+    # Analysis limited to first 60s to keep it fast on long files.
+    praat_hnr     = None
+    praat_shimmer = None
+    praat_jitter  = None
+
+    if _HAS_PARSELMOUTH:
+        try:
+            step("Praat analysis (HNR, shimmer, jitter)")
+            _y60   = y[:int(min(60, duration) * sr)]  # max 60s
+            _snd   = parselmouth.Sound(_y60.astype('float64'), sr)
+            # HNR
+            _hnr_obj   = _snd.to_harmonicity()
+            _hnr_vals  = _hnr_obj.values[_hnr_obj.values > -200]
+            if len(_hnr_vals) > 0:
+                praat_hnr = float(np.mean(_hnr_vals))
+            # Shimmer + Jitter (on voiced segment only)
+            _pp = parselmouth.praat.call(_snd, 'To PointProcess (periodic, cc)', 75, 600)
+            praat_shimmer = parselmouth.praat.call(
+                [_snd, _pp], 'Get shimmer (local)', 0, 0, 0.0001, 0.02, 1.3, 1.6)
+            praat_jitter  = parselmouth.praat.call(
+                _pp, 'Get jitter (local)', 0, 0, 0.0001, 0.02, 1.3)
+            step(f"Praat   HNR={praat_hnr:.1f}dB  shimmer={praat_shimmer*100:.1f}%  jitter={praat_jitter*100:.2f}%", t0)
+        except Exception as e:
+            print(f"   [!] Praat analysis failed: {e} — using librosa fallback")
+    else:
+        print("   [*] parselmouth not installed — using librosa estimates (pip install praat-parselmouth)")
+
     # Voice type classification
     if f0_median < 110:
         voice_type = "bass / deep male"
@@ -361,8 +401,18 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     # -- 5. Level -> volume boost -------------------------------------------
     rms_global  = float(np.sqrt(np.mean(y ** 2)))
     rms_db      = 20.0 * np.log10(rms_global + 1e-10)
+    # Use voiced-frames-only RMS for volume — avoids silences pulling the value down
+    # on long files with many pauses (e.g. 20min meditation with lots of silence)
+    rms_frames  = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
+    voiced_mask = rms_frames > (rms_frames.max() * 0.05)
+    if voiced_mask.any():
+        rms_voiced = float(np.sqrt(np.mean(rms_frames[voiced_mask] ** 2)))
+        rms_voiced_db = 20.0 * np.log10(rms_voiced + 1e-10)
+    else:
+        rms_voiced_db = rms_db
     target_db   = -18.0   # meditation target level (leaves headroom for ambient mix)
-    volume      = int(np.clip(round(target_db - rms_db), -6, +12))
+    volume      = int(np.clip(round(target_db - rms_voiced_db), -6, +8))
+    print(f"   [*] RMS global={rms_db:.1f}dBFS  voiced={rms_voiced_db:.1f}dBFS -> vol={volume:+d}dB")
 
     # -- 6. Noise floor -> noise reduction ----------------------------------
     rms_sorted  = np.sort(rms)
@@ -370,25 +420,41 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     noise_floor = float(np.mean(rms_sorted[:n_quiet]))
     snr         = 20.0 * np.log10(rms_global / (noise_floor + 1e-10))
 
-    if   snr < 18: noise_reduction = 1.0
-    elif snr < 28: noise_reduction = 0.7
-    elif snr < 38: noise_reduction = 0.5
-    else:          noise_reduction = 0.3
+    if praat_hnr is not None:
+        # HNR-based NR (more accurate than SNR)
+        if   praat_hnr > 20: noise_reduction = 0.15
+        elif praat_hnr > 15: noise_reduction = 0.25
+        elif praat_hnr > 10: noise_reduction = 0.35
+        else:                noise_reduction = 0.50
+        print(f"   [*] HNR={praat_hnr:.1f}dB -> NR={noise_reduction}")
+    else:
+        if   snr < 18: noise_reduction = 1.0
+        elif snr < 28: noise_reduction = 0.7
+        elif snr < 38: noise_reduction = 0.5
+        else:          noise_reduction = 0.3
 
     # Breathy voice boost: high spectral flatness -> noisier signal -> more NR
     if breathiness > 0.20:
-        noise_reduction = min(1.2, noise_reduction + 0.2)
-        print(f"   [*]  Breathy voice detected (flatness={breathiness:.3f}) "
-              f"-> NR boosted to {noise_reduction:.1f}")
+        noise_reduction = min(0.8, noise_reduction + 0.1)
+        print(f"   [*] Breathy voice detected (flatness={breathiness:.3f}) "
+              f"-> NR boosted to {noise_reduction:.2f}")
 
     # -- 7. Dynamics -> compression -----------------------------------------
     peak            = float(np.max(np.abs(y)))
     crest_factor_db = 20.0 * np.log10(peak / (rms_global + 1e-10))
 
-    if   crest_factor_db > 22: compression = 0.7
-    elif crest_factor_db > 16: compression = 0.5
-    elif crest_factor_db > 11: compression = 0.4
-    else:                      compression = 0.3
+    if praat_shimmer is not None:
+        # Shimmer-based compression (more accurate than crest factor)
+        if   praat_shimmer > 0.15: compression = 0.7
+        elif praat_shimmer > 0.10: compression = 0.6
+        elif praat_shimmer > 0.06: compression = 0.5
+        else:                      compression = 0.35
+        print(f"   [*] Shimmer={praat_shimmer*100:.1f}% -> comp={compression}")
+    else:
+        if   crest_factor_db > 22: compression = 0.7
+        elif crest_factor_db > 16: compression = 0.5
+        elif crest_factor_db > 11: compression = 0.4
+        else:                      compression = 0.3
 
     # Breathy voice has uneven dynamics -> more compression needed
     if breathiness > 0.20:
@@ -402,21 +468,43 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     else:                     speed = 0.93
 
     # -- 9. XTTS params ----------------------------------------------------
-    # F0 jitter = voice expressiveness
-    # Stable/monotone voice -> low temperature but high repetition_penalty
-    # Expressive voice     -> higher temperature, lower repetition_penalty
-    if   f0_jitter < 0.10:
-        temperature, top_k, top_p = 0.50, 25, 0.70
-        repetition_penalty        = 7.0   # monotone -> high anti-repetition
-    elif f0_jitter < 0.18:
-        temperature, top_k, top_p = 0.55, 30, 0.75
-        repetition_penalty        = 6.0
-    elif f0_jitter < 0.30:
-        temperature, top_k, top_p = 0.60, 40, 0.80
-        repetition_penalty        = 5.0
+    # Use Praat shimmer+jitter when available (more accurate than F0 jitter)
+    # Stable/monotone -> high rep_pen, low temp
+    # Expressive      -> lower rep_pen, higher temp
+
+    if praat_shimmer is not None and praat_jitter is not None:
+        # Combined expressiveness score from Praat
+        expr_score = (praat_shimmer * 0.6) + (min(praat_jitter, 0.05) * 0.4 / 0.05)
+        if   expr_score < 0.06:
+            temperature, top_k, top_p = 0.55, 30, 0.75
+            repetition_penalty        = 7.0
+        elif expr_score < 0.10:
+            temperature, top_k, top_p = 0.60, 35, 0.78
+            repetition_penalty        = 6.0
+        elif expr_score < 0.15:
+            temperature, top_k, top_p = 0.65, 45, 0.82
+            repetition_penalty        = 5.5
+        elif expr_score < 0.20:
+            temperature, top_k, top_p = 0.68, 50, 0.85
+            repetition_penalty        = 5.0
+        else:
+            temperature, top_k, top_p = 0.72, 55, 0.88
+            repetition_penalty        = 4.5
+        print(f"   [*] Praat expr_score={expr_score:.3f} -> temp={temperature} rep_pen={repetition_penalty}")
     else:
-        temperature, top_k, top_p = 0.65, 50, 0.85
-        repetition_penalty        = 4.0   # expressive -> natural variation reduces repetition risk
+        # Fallback: F0 jitter from librosa
+        if   f0_jitter < 0.10:
+            temperature, top_k, top_p = 0.55, 30, 0.75
+            repetition_penalty        = 7.0
+        elif f0_jitter < 0.18:
+            temperature, top_k, top_p = 0.60, 35, 0.78
+            repetition_penalty        = 6.0
+        elif f0_jitter < 0.30:
+            temperature, top_k, top_p = 0.65, 45, 0.82
+            repetition_penalty        = 5.5
+        else:
+            temperature, top_k, top_p = 0.70, 50, 0.85
+            repetition_penalty        = 5.0
 
     # length_penalty: based on voiced_ratio (speech density)
     # Dense speech (high voiced_ratio) -> slightly push the model toward longer output

@@ -421,7 +421,12 @@ def tab_generator(nb):
         line_nums.yview(*args)
 
     scroll_e.config(command=sync_scroll)
-    editor.config(yscrollcommand=scroll_e.set)
+
+    def _on_editor_yscroll(*args):
+        scroll_e.set(*args)
+        line_nums.yview_moveto(args[0])
+
+    editor.config(yscrollcommand=_on_editor_yscroll)
     line_nums.config(yscrollcommand=scroll_e.set)
 
     def update_line_numbers(event=None):
@@ -434,6 +439,31 @@ def tab_generator(nb):
     editor.bind('<KeyRelease>', update_line_numbers)
     editor.bind('<Button-1>',   lambda e: editor.focus_set())
     editor.bind('<Button-2>',   lambda e: editor.focus_set())  # X11 middle-click
+
+    # Sync mousewheel scroll between editor and line numbers
+    def _on_mousewheel(event):
+        editor.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        line_nums.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _on_scroll_up(event):   # Linux Button-4
+        editor.yview_scroll(-1, "units")
+        line_nums.yview_scroll(-1, "units")
+        return "break"
+
+    def _on_scroll_down(event):  # Linux Button-5
+        editor.yview_scroll(1, "units")
+        line_nums.yview_scroll(1, "units")
+        return "break"
+
+    editor.bind("<MouseWheel>", _on_mousewheel)   # Windows/macOS
+    editor.bind("<Button-4>",   _on_scroll_up)    # Linux scroll up
+    editor.bind("<Button-5>",   _on_scroll_down)  # Linux scroll down
+
+    # Also block line_nums from scrolling independently
+    line_nums.bind("<MouseWheel>", _on_mousewheel)
+    line_nums.bind("<Button-4>",   _on_scroll_up)
+    line_nums.bind("<Button-5>",   _on_scroll_down)
 
     # ── Right-click context menu ──────────────────────────────────────────
     ctx_menu = tk.Menu(editor, tearoff=0)
@@ -944,9 +974,9 @@ def tab_extract(nb):
     except Exception:
         _vox_default = "cpu"
     v_vox_device = tk.StringVar(value=_vox_default)
-    tk.Label(f, text="Device", anchor='w', width=20).grid(row=8, column=0, sticky='w', padx=6, pady=3)
+    tk.Label(f, text="Device", anchor='w', width=20).grid(row=9, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_vox_device, width=8, state='readonly',
-        values=['cpu', 'cuda']).grid(row=8, column=1, sticky='w', padx=4)
+        values=['cpu', 'cuda']).grid(row=9, column=1, sticky='w', padx=4)
 
     def on_remove_music_toggle(*args):
         if v_remove_music.get():
@@ -959,18 +989,18 @@ def tab_extract(nb):
 
     tk.Checkbutton(f, text="Remove background music (demucs)",
                    variable=v_remove_music).grid(
-        row=9, column=0, columnspan=2, sticky='w', padx=6, pady=2)
+        row=10, column=0, columnspan=2, sticky='w', padx=6, pady=2)
 
     tk.Label(f, text="Demucs model", anchor='w', width=20).grid(
-        row=10, column=0, sticky='w', padx=6, pady=3)
+        row=11, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_demucs_model, width=16, state='readonly',
         values=['htdemucs', 'htdemucs_ft', 'mdx_extra']
-    ).grid(row=10, column=1, sticky='w', padx=4)
+    ).grid(row=11, column=1, sticky='w', padx=4)
 
     # ── MP3 output options ───────────────────────────────────────────────
     tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=12, column=0, sticky='w', padx=6, pady=3)
     frm_mp3 = tk.Frame(f)
-    frm_mp3.grid(row=11, column=1, sticky='w', padx=4)
+    frm_mp3.grid(row=12, column=1, sticky='w', padx=4)
     ttk.Combobox(frm_mp3, textvariable=v_mp3_bitrate, width=6, state='readonly',
         values=['128','160','192','256','320']).pack(side='left')
     ttk.Combobox(frm_mp3, textvariable=v_mp3_mode, width=5, state='readonly',
@@ -1162,6 +1192,12 @@ def main():
     tab_pitch(nb)
     tab_convert(nb)
 
+    def on_close():
+        _stop_player()       # stop audio player if running
+        root.destroy()
+        os._exit(0)          # force-kill any background threads/processes
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 
