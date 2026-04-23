@@ -1121,9 +1121,13 @@ def tab_convert(nb):
             [("MP3","*.mp3"),("WAV","*.wav"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")],
             save=True, initialdir=DIR_OUTPUT)
 
-    # ── MP3 options (only used if output is .mp3) ─────────────────────────
+    # ── Audio options ─────────────────────────────────────────────────────
     v_vid_mp3_bitrate = tk.StringVar(value='192')
     v_vid_mp3_mode    = tk.StringVar(value='cbr')
+    v_vid_channels    = tk.StringVar(value='stereo')
+    v_vid_samplerate  = tk.StringVar(value='44100')
+
+    # Row 2: MP3 bitrate
     tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
     frm_vid_mp3 = tk.Frame(f)
     frm_vid_mp3.grid(row=2, column=1, sticky='w', padx=4)
@@ -1133,34 +1137,58 @@ def tab_convert(nb):
         values=['cbr','vbr']).pack(side='left', padx=6)
     tk.Label(frm_vid_mp3, text="(only used if output is .mp3)", fg='grey').pack(side='left')
 
-    console = add_console(f, 4)
+    # Row 3: Channels + Sample rate + XTTS preset
+    tk.Label(f, text="Channels", anchor='w', width=20).grid(row=3, column=0, sticky='w', padx=6, pady=3)
+    frm_vid_audio = tk.Frame(f)
+    frm_vid_audio.grid(row=3, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_vid_audio, textvariable=v_vid_channels, width=8, state='readonly',
+        values=['stereo','mono']).pack(side='left')
+    tk.Label(frm_vid_audio, text="Sample rate (Hz)").pack(side='left', padx=(12,4))
+    ttk.Combobox(frm_vid_audio, textvariable=v_vid_samplerate, width=8, state='readonly',
+        values=['16000','22050','44100','48000']).pack(side='left')
+
+    def _xtts_preset():
+        # Force WAV output path extension
+        p = v_output.get()
+        if p:
+            base = os.path.splitext(p)[0]
+            v_output.set(base + '.wav')
+        v_vid_channels.set('mono')
+        v_vid_samplerate.set('22050')
+
+    tk.Button(frm_vid_audio, text="XTTS preset", bg='#1a6b9e', fg='white',
+              command=_xtts_preset).pack(side='left', padx=10)
+
+    console = add_console(f, 5)
 
     def lancer(btn, stop_btn=None):
         if not v_input.get() or not v_output.get():
             log(console, "[ERR] Source and output required."); return
         ext = os.path.splitext(v_output.get())[1].lower()
+        ch  = '1' if v_vid_channels.get() == 'mono' else '2'
+        sr  = v_vid_samplerate.get()
+
+        base_args = ['ffmpeg', '-y', '-i', v_input.get(), '-vn',
+                     '-ac', ch, '-ar', sr]
+
         if ext == '.mp3':
-            br  = v_vid_mp3_bitrate.get()
+            br = v_vid_mp3_bitrate.get()
             if v_vid_mp3_mode.get() == 'vbr':
                 vbr_map = {'128':'6','160':'5','192':'4','256':'2','320':'0'}
-                cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn',
-                       '-codec:a', 'libmp3lame', '-q:a', vbr_map.get(br,'4'),
-                       v_output.get()]
+                cmd = base_args + ['-codec:a', 'libmp3lame', '-q:a',
+                                   vbr_map.get(br,'4'), v_output.get()]
             else:
-                cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn',
-                       '-codec:a', 'libmp3lame', '-b:a', f'{br}k',
-                       v_output.get()]
+                cmd = base_args + ['-codec:a', 'libmp3lame', '-b:a',
+                                   f'{br}k', v_output.get()]
         elif ext == '.flac':
-            cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn',
-                   '-codec:a', 'flac', v_output.get()]
+            cmd = base_args + ['-codec:a', 'flac', v_output.get()]
         elif ext == '.ogg':
-            cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn',
-                   '-codec:a', 'libvorbis', v_output.get()]
-        else:  # .wav or anything else
-            cmd = ['ffmpeg', '-y', '-i', v_input.get(), '-vn', v_output.get()]
+            cmd = base_args + ['-codec:a', 'libvorbis', v_output.get()]
+        else:  # .wav
+            cmd = base_args + ['-sample_fmt', 's16', v_output.get()]
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Convert", lancer, 3)
+    make_btn(f, ">  Convert", lancer, 4)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
