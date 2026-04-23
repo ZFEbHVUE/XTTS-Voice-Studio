@@ -704,6 +704,7 @@ def tab_analyser(nb):
         v_num     = tk.IntVar(value=num)
         v_seed    = tk.IntVar(value=0)
         v_precise = tk.BooleanVar(value=False)
+        v_f0      = tk.StringVar(value='auto')
 
         row_f = tk.Frame(voices_frame)
         row_f.pack(fill='x', padx=4, pady=2)
@@ -718,15 +719,29 @@ def tab_analyser(nb):
                      width=6, state='readonly').pack(side='left', padx=1)
         tk.Label(row_f, text="Seed:").pack(side='left', padx=(4,0))
         tk.Spinbox(row_f, from_=0, to=99999, textvariable=v_seed, width=6).pack(side='left', padx=1)
-        tk.Checkbutton(row_f, text="Prec", variable=v_precise).pack(side='left', padx=1)
 
-        entry = (v_path, v_lang, v_num, v_seed, v_precise, row_f)
+        cb_f0 = ttk.Combobox(row_f, textvariable=v_f0, values=['auto','crepe','pyin'],
+                              width=6, state='readonly')
+        # hidden by default
+
+        def _on_prec_toggle(var=v_precise, cb=cb_f0):
+            if var.get():
+                cb.pack(side='left', padx=2, before=btn_x)
+            else:
+                cb.pack_forget()
+
+        tk.Checkbutton(row_f, text="Prec", variable=v_precise,
+                       command=_on_prec_toggle).pack(side='left', padx=1)
+
+        entry = (v_path, v_lang, v_num, v_seed, v_precise, row_f, v_f0)
 
         def remove(e=entry):
             e[5].destroy()
             voice_rows.remove(e)
 
-        tk.Button(row_f, text="X", width=2, fg='red', command=remove).pack(side='left', padx=1)
+        btn_x = tk.Button(row_f, text="X", width=2, fg='red', command=remove)
+        btn_x.pack(side='left', padx=1)
+
         voice_rows.append(entry)
 
     add_voice_row(1)
@@ -738,30 +753,25 @@ def tab_analyser(nb):
     tk.Button(ctrl_frame, text="+ Add voice",
         command=lambda: add_voice_row(),
         bg='#444', fg='white', width=14).pack(side='left', padx=4)
-    tk.Label(ctrl_frame, text="Prec = precise mode",
+    tk.Label(ctrl_frame, text="Prec = precise mode  |  F0: auto/crepe/pyin per voice",
              fg='gray', font=('Arial',8)).pack(side='left', padx=6)
-    v_f0_engine = tk.StringVar(value='auto')
-    ttk.Combobox(ctrl_frame, textvariable=v_f0_engine, width=8, state='readonly',
-        values=['auto','crepe','pyin']).pack(side='left', padx=2)
-    tk.Label(ctrl_frame, text="F0 engine (auto=crepe if available)",
-             fg='gray', font=('Arial',8)).pack(side='left', padx=4)
 
     console = add_console(f, 2)
 
     def lancer(btn, stop_btn=None):
-        valids = [(vp.get(), vl.get(), vn.get(), vs.get(), vpr.get())
-                  for vp, vl, vn, vs, vpr, _ in voice_rows if vp.get().strip()]
+        valids = [(vp.get(), vl.get(), vn.get(), vs.get(), vpr.get(), vf0.get())
+                  for vp, vl, vn, vs, vpr, _, vf0 in voice_rows if vp.get().strip()]
         if not valids:
             log(console, "[ERR] Add at least one voice."); return
 
         # One call per voice (individual precise mode)
         
         cmds = []
-        for vpath, vlang, vnum, vseed, vprec in valids:
+        for vpath, vlang, vnum, vseed, vprec, vf0eng in valids:
             cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'voice_analyser.py')]
             if vprec:
                 cmd.append('--precise')
-            cmd += ['--f0-engine', v_f0_engine.get()]
+                cmd += ['--f0-engine', vf0eng]
             cmd += ['--start-num', str(vnum)]
             if vseed != 0:
                 cmd += ['--seed', str(vseed)]
