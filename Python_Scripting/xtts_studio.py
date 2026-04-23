@@ -720,18 +720,13 @@ def tab_analyser(nb):
         tk.Label(row_f, text="Seed:").pack(side='left', padx=(4,0))
         tk.Spinbox(row_f, from_=0, to=99999, textvariable=v_seed, width=6).pack(side='left', padx=1)
 
+        tk.Checkbutton(row_f, text="Prec", variable=v_precise,
+                       command=lambda: _on_prec_toggle()).pack(side='left', padx=1)
+
         cb_f0 = ttk.Combobox(row_f, textvariable=v_f0, values=['auto','crepe','pyin'],
                               width=6, state='readonly')
-        # hidden by default
-
-        def _on_prec_toggle(var=v_precise, cb=cb_f0):
-            if var.get():
-                cb.pack(side='left', padx=2, before=btn_x)
-            else:
-                cb.pack_forget()
-
-        tk.Checkbutton(row_f, text="Prec", variable=v_precise,
-                       command=_on_prec_toggle).pack(side='left', padx=1)
+        lbl_none = tk.Label(row_f, text='none', relief='sunken',
+                            bg='#d9d9d9', fg='#888')
 
         entry = (v_path, v_lang, v_num, v_seed, v_precise, row_f, v_f0)
 
@@ -740,7 +735,18 @@ def tab_analyser(nb):
             voice_rows.remove(e)
 
         btn_x = tk.Button(row_f, text="X", width=2, fg='red', command=remove)
+
+        lbl_none.pack(side='left', padx=2, ipadx=16)  # shown by default
         btn_x.pack(side='left', padx=1)
+
+        def _on_prec_toggle(var=v_precise, cb=cb_f0, lbl=lbl_none, bx=btn_x):
+            if var.get():
+                lbl.pack_forget()
+                v_f0.set('auto')
+                cb.pack(side='left', padx=2, before=bx)
+            else:
+                cb.pack_forget()
+                lbl.pack(side='left', padx=2, ipadx=16, before=bx)
 
         voice_rows.append(entry)
 
