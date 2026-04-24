@@ -18,7 +18,7 @@ _root = None
 
 # Default directories
 
-XTTS_ROOT     = os.path.expanduser("~/XTTS-Voice-Studio")
+XTTS_ROOT     = os.path.dirname(SCRIPTS_DIR)  # parent of Python_Scripting/
 DIR_PROMPTS   = os.path.join(XTTS_ROOT, "Prompts")
 DIR_OUTPUT    = os.path.join(XTTS_ROOT, "Output_Song_files")
 DIR_VOICES    = os.path.join(XTTS_ROOT, "Voices_Cloning")
