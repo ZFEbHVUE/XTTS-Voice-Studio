@@ -567,7 +567,12 @@ def apply_speed_rubberband(audio_segment, speed,
 # Bracket parsers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_voice_config(config_str):
+# Per-voice config memory — stores last fully-specified config for each voice number
+# so that subsequent short blocks [N, FR, speed, vol] inherit the rest
+_voice_last_config = {}
+
+
+def parse_voice_config(config_str, use_last=True):
     """
     Parse audio bracket:
       [N, speed, vol, eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
@@ -587,7 +592,17 @@ def parse_voice_config(config_str):
     except (ValueError, IndexError):
         return None, None
 
-    config = DEFAULT_AUDIO_CONFIG.copy()
+    # Start from last known config for this voice (if any), else use defaults
+    # This allows short blocks like [1, FR, 0.9, 7] to inherit previous full config
+    # Note: voice_num not yet parsed here, so we do a quick peek
+    try:
+        _peek_num = int(parts[0])
+        if use_last and _peek_num in _voice_last_config:
+            config = _voice_last_config[_peek_num].copy()
+        else:
+            config = DEFAULT_AUDIO_CONFIG.copy()
+    except (ValueError, IndexError):
+        config = DEFAULT_AUDIO_CONFIG.copy()
 
     # Detect optional language in position 1
     offset = 1
@@ -614,6 +629,10 @@ def parse_voice_config(config_str):
 
     print(f"  [OK] Voice {voice_num} [{config['language'].upper()}] "
           f"speed={config['speed']} vol={config['volume']:+.0f}dB")
+
+    # Save as last known config for this voice
+    _voice_last_config[voice_num] = config.copy()
+
     return voice_num, config
 
 
@@ -1136,61 +1155,10 @@ def count_total_sentences(segments):
 # Main generation
 # ─────────────────────────────────────────────────────────────────────────────
 
+def generate_meditation(text, output_file, voice_files, ambient_file, music_files):
+    # Reset per-voice config memory for this generation run
+    _voice_last_config.clear()
 
-def save_audio_file(audio_segment, output_file, mp3_bitrate=192, mp3_mode='cbr'):
-    """
-    Save a pydub AudioSegment to file. Format auto-detected from extension.
-    Supported: .wav, .mp3, .flac, .ogg
-    MP3/FLAC/OGG require ffmpeg.
-    """
-    ext = os.path.splitext(output_file)[1].lower()
-
-    if ext == '.wav':
-        audio_segment.export(output_file, format='wav')
-
-    elif ext in ('.mp3', '.flac', '.ogg'):
-        tmp_in = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-        try:
-            audio_segment.export(tmp_in.name, format='wav')
-            fmt_map  = {'.flac': 'flac', '.ogg': 'ogg'}
-            if ext == '.mp3':
-                if mp3_mode == 'vbr':
-                    vbr_q = {128: 6, 160: 5, 192: 4, 256: 2, 320: 0}.get(mp3_bitrate, 4)
-                    cmd = ['ffmpeg', '-i', tmp_in.name,
-                           '-codec:a', 'libmp3lame', '-q:a', str(vbr_q),
-                           '-y', output_file]
-                    mode_str = f"VBR q={vbr_q}"
-                else:
-                    cmd = ['ffmpeg', '-i', tmp_in.name,
-                           '-codec:a', 'libmp3lame', '-b:a', f'{mp3_bitrate}k',
-                           '-y', output_file]
-                    mode_str = f"CBR {mp3_bitrate}k"
-            else:
-                codec = 'flac' if ext == '.flac' else 'libvorbis'
-                cmd = ['ffmpeg', '-i', tmp_in.name,
-                       '-codec:a', codec, '-y', output_file]
-                mode_str = ext[1:].upper()
-            subprocess.run(cmd, check=True, capture_output=True)
-            print(f"[*] Encoded to {ext[1:].upper()} ({mode_str})")
-        except subprocess.CalledProcessError as e:
-            print(f"[!] ffmpeg encoding error: {e}")
-            fallback = output_file.replace(ext, '.wav')
-            print(f"[!] Falling back to WAV: {fallback}")
-            audio_segment.export(fallback, format='wav')
-            output_file = fallback
-        finally:
-            if os.path.exists(tmp_in.name):
-                os.unlink(tmp_in.name)
-    else:
-        print(f"[!] Unknown extension '{ext}', saving as WAV")
-        audio_segment.export(output_file, format='wav')
-
-    size_mb = os.path.getsize(output_file) / (1024 * 1024)
-    print(f"[*] File size: {size_mb:.1f} MB")
-    return output_file
-
-
-def generate_meditation(text, output_file, voice_files, ambient_file, music_files, mp3_bitrate=192, mp3_mode="cbr"):
     print("[*] Guided Meditation Generator - VERSION 23 - GPT_COND_LEN + REVERB + GATE + PAN + LIMITER")
     print(f"   [*] Available voices: {len(voice_files)}")
     for i, v in enumerate(voice_files, 1):
@@ -1497,7 +1465,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
     print(f"[PROGRESS={step_done}/{total_steps}]")
 
     print(f"\n[*] Saving...")
-    output_file = save_audio_file(final_audio, output_file, mp3_bitrate, mp3_mode)
+    final_audio.export(output_file, format="wav")
     step_done += 1
     print(f"[PROGRESS={step_done}/{total_steps}]")
 
@@ -1546,25 +1514,9 @@ def main():
             print(f"  {k}: {v}")
         sys.exit(1)
 
-    import argparse
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('--mp3-bitrate', type=int, default=192,
-                        choices=[128, 160, 192, 256, 320])
-    parser.add_argument('--mp3-mode', default='cbr', choices=['cbr', 'vbr'])
-    known, remaining_args = parser.parse_known_args(sys.argv[1:])
-
-    # positional: script output voices/music (filter out --mp3-* already consumed)
-    positional = remaining_args
-    if len(positional) < 3:
-        print("Usage: python guided_meditation_generator_v23.py script.txt output.wav voice1.wav [voice2.wav ...] [music...]")
-        print("       [--mp3-bitrate 128|160|192|256|320] [--mp3-mode cbr|vbr]")
-        sys.exit(1)
-
-    input_file  = positional[0]
-    output_file = positional[1]
-    audio_files = positional[2:]
-    mp3_bitrate = known.mp3_bitrate
-    mp3_mode    = known.mp3_mode
+    input_file  = sys.argv[1]
+    output_file = sys.argv[2]
+    audio_files = sys.argv[3:]
 
     if not audio_files:
         print("[!] At least one voice file is required!")
@@ -1594,7 +1546,7 @@ def main():
         print("[!] Could not read input file (encoding issue).")
         sys.exit(1)
 
-    generate_meditation(text, output_file, voice_files, ambient_file, music_files, mp3_bitrate, mp3_mode)
+    generate_meditation(text, output_file, voice_files, ambient_file, music_files)
 
     # Flush stdout and exit hard: os._exit(0) skips Python's normal teardown,
     # which prevents XTTS/torch/CUDA shutdown logs from scrolling past the
