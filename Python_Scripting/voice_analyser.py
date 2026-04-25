@@ -216,7 +216,7 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
                     f_tc, c_tc = torchcrepe.predict(
                         y_tc, sr,
                         hop_length=hop_len,
-                        fmin=32.7, fmax=2093.0,
+                        fmin=50.0, fmax=800.0,
                         model='full',
                         decoder=torchcrepe.decode.viterbi,
                         return_periodicity=True,
@@ -648,33 +648,8 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
 
   ==================================================================""")
 
-    print(f"""  [*] DETAIL
-  +--------------------------------------------------------------+
-  |  XTTS PARAMS  {{{xtts_str}}}
-  |  [{N}]    voice number
-  |  [0]    seed               = 0  (none)
-  |  [{p['trim_start']}]  trim_start         = {p['trim_start']} ms
-  |  [{p['trim_end']}]  trim_end           = {p['trim_end']} ms
-  |  [{p['fade_in']}]  fade_in            = {p['fade_in']} ms
-  |  [{p['fade_out']}]  fade_out           = {p['fade_out']} ms
-  |  [{p['temperature']}]  temperature        = {p['temperature']}
-  |  [{p['top_k']:.0f}]   top_k              = {p['top_k']:.0f}
-  |  [{p['top_p']}]  top_p              = {p['top_p']}
-  |  [{p['repetition_penalty']}]  repetition_penalty = {p['repetition_penalty']}  (anti-begaiement)
-  |  [{p['length_penalty']}]  length_penalty     = {p['length_penalty']}  (duree phrase)
-  +--------------------------------------------------------------+
-  |  AUDIO PARAMS  [{audio_str}]
-  |  [{p['speed']}]  speed        = {p['speed']}  (rubberband)
-  |  [{p['volume']:+d}]   volume       = {p['volume']:+d} dB
-  |  [{p['eq_low']:+d}]   eq_low       = {p['eq_low']:+d} dB  (80-300 Hz)
-  |  [{p['eq_mid']:+d}]   eq_mid       = {p['eq_mid']:+d} dB  (300-3000 Hz)
-  |  [{p['eq_high']:+d}]   eq_high      = {p['eq_high']:+d} dB  (3000-8000 Hz)
-  |  [{p['highpass']:.0f}]   highpass     = {p['highpass']:.0f} Hz
-  |  [{p['lowpass']:.0f}]  lowpass      = {p['lowpass']:.0f} Hz
-  |  [{p['noise_reduction']}]  noise redu.  = {p['noise_reduction']}
-  |  [{p['compression']}]  compression  = {p['compression']}
-  |  [{p['deesser']}]  de-esser     = {p['deesser']}
-  +--------------------------------------------------------------+""")
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -779,10 +754,18 @@ def main():
             audio_vals = [p['speed'], p['volume'],
                           p['eq_low'], p['eq_mid'], p['eq_high'],
                           p['highpass'], p['lowpass'],
-                          p['noise_reduction'], p['compression'], p['deesser']]
+                          p['noise_reduction'], p['compression'], p['deesser'],
+                          p['reverb'], p['noise_gate'], p['pan'], p['limiter']]
+            xtts_arr_full = [idx, seed,
+                        p['trim_start'], p['trim_end'],
+                        p['fade_in'], p['fade_out'],
+                        p['temperature'], p['top_k'], p['top_p'],
+                        p['repetition_penalty'], p['length_penalty'],
+                        p['gpt_cond_len'], p['gpt_cond_chunk_len'], p['sound_norm_refs']]
+            xtts_str_full = ', '.join(fmt(v) for v in xtts_arr_full)
             audio_str = f"{idx}, {lang}, " + ', '.join(fmt(v) for v in audio_vals)
-            print(f"\n  # Voice {idx} [{lang}]  {s['voice_type']:<22} {s['f0_median']:.0f} Hz  {os.path.basename(wav)}")
-            print(f"  {{{xtts_str}}}")
+            print(f"\n  # Voice {idx} [{lang}]  {s['voice_type']:<22} {s['f0_median']:.0f} Hz")
+            print(f"  {{{xtts_str_full}}}")
             print(f"  [{audio_str}]")
         print()
 
