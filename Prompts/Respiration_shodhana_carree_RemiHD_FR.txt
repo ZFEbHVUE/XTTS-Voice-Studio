@@ -1,19 +1,12 @@
-  #  python ~/XTTS/Python_Scripting/guided_meditation_generator_v20.py ~/XTTS/Prompts/Respiration_shodhana_carree_RemiHD_FR.txt ~/XTTS/Output_Song_files/Respiration_shodhana_carree_RemiHD_FR.wav ~/XTTS/Voices_Cloning/RemiHD_FR.wav ~/XTTS/Punctual_sounds/four_Gongs_16seconde.mp3
-  
   ambient_volume=-10 
   music_1=16s,+5
 
-  # Voix1 en FR (10dB)
-  # python ~/XTTS/Python_Scripting/voice_analyser.py --precise ~/XTTS/Voices_Cloning/RemiHD_FR.wav FR
-  #
-  # ── XTTS params  {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p}
-  # ── seed=0 → no seed  (replace with a number for reproducibility)
-  
-  {1, 0, 65, 275, 150, 300, 0.6, 40, 0.8}
+  # Voice [FR]  bass / deep male  92 Hz
+  # -- XTTS params  {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen}
+  {1, 42, 0, 275, 100, 250, 0.72, 55, 0.88, 4.5, 1, 51, 4, 0}
 
-  # ── Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
-  
-  [1, FR, 0.9, 10, -5, 1, -1, 55, 7000, 0.3, 0.5, 0.3]
+  # -- Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
+  [1, FR, 0.88, 6, -5, 1, -1, 75, 7000, 0.35, 0.35, 0.3, 0, 0, 0, 1]
 
 
 
