@@ -856,41 +856,58 @@ def extract_config(text):
 
 def parse_audio_files(args):
     """
-    Classify audio files based on their parent folder name (case-insensitive):
-      - Path contains "voices_cloning"  -> voice file
+    Classify audio files. Voice files are grouped by "--" separators:
+      - Path contains "voices_cloning"  -> voice file (grouped by --)
       - Path contains "ambient"         -> ambient track
       - Anything else                   -> punctual music file
+      - "--"                            -> separator between voice groups
 
-    Examples:
-      ~/XTTS/Voices_Cloning/Monique.wav          -> voice
-      ~/XTTS/Ambient_Musics/forest.wav           -> ambient
-      ~/XTTS/Punctual_Sounds/bell.wav            -> punctual music
-      ~/XTTS/Punctual_Sounds/metronome.wav       -> punctual music
+    voice_files is a list of lists: [[ref1, ref2], [ref3], ...]
+    Each inner list = one XTTS voice with potentially multiple references.
 
     Returns: (voice_files, ambient_file, punctual_music_files)
     """
-    voice_files  = []
+    voice_groups = [[]]   # list of lists — current group starts empty
     ambient_file = None
     music_files  = []
 
     for fpath in args:
+        if fpath == '--':
+            # Start a new voice group
+            if voice_groups[-1]:  # only if current group has files
+                voice_groups.append([])
+            continue
+
         if not os.path.exists(fpath):
             print(f"[!]  File not found: {fpath}")
             continue
 
         path_lower = fpath.lower()
 
-        if "voices_cloning" in path_lower:
-            voice_files.append(fpath)
-            print(f"   [*] Voice #{len(voice_files)}: {os.path.basename(fpath)}")
-
-        elif "ambient" in path_lower:
+        if "ambient" in path_lower:
             ambient_file = fpath
             print(f"   [*] Ambient file: {os.path.basename(fpath)}")
-
+        elif any(x in path_lower for x in ("voices_cloning", "voices_clonin")):
+            voice_groups[-1].append(fpath)
+            v_idx = len(voice_groups)
+            r_idx = len(voice_groups[-1])
+            print(f"   [*] Voice #{v_idx} ref #{r_idx}: {os.path.basename(fpath)}")
         else:
             music_files.append(fpath)
             print(f"   [*] Music #{len(music_files)}: {os.path.basename(fpath)}")
+
+    # Filter empty groups and flatten single-ref groups
+    voice_files = [g for g in voice_groups if g]
+
+    # If no -- separator was used, treat all voices as separate single-ref voices
+    # (backward compatible: each file = one voice)
+    if not any(fpath == '--' for fpath in args):
+        # Already grouped correctly (one file per group from old behavior)
+        pass
+
+    for i, group in enumerate(voice_files):
+        if len(group) > 1:
+            print(f"   [*] Voice #{i+1}: {len(group)} references (will be averaged)")
 
     return voice_files, ambient_file, music_files
 
@@ -914,6 +931,9 @@ def generate_sentence_audio(clean, voice_num, voice_files, tts_instances,
         return None
 
     speaker_wav = voice_files[voice_num - 1]
+    # speaker_wav can be a list (multiple references) or a single path
+    if isinstance(speaker_wav, list) and len(speaker_wav) == 1:
+        speaker_wav = speaker_wav[0]  # unwrap single-item list
     try:
         tts_instances[voice_num].tts_to_file(
             text=clean,
@@ -1163,7 +1183,11 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
     print("[*] Guided Meditation Generator - VERSION 23 - GPT_COND_LEN + REVERB + GATE + PAN + LIMITER")
     print(f"   [*] Available voices: {len(voice_files)}")
     for i, v in enumerate(voice_files, 1):
-        print(f"      Voice {i}: {os.path.basename(v)}")
+        if isinstance(v, list):
+            names = " + ".join(os.path.basename(f) for f in v)
+            print(f"      Voice {i}: [{names}]")
+        else:
+            print(f"      Voice {i}: {os.path.basename(v)}")
 
     # Extract per-voice XTTS params BEFORE text cleaning
     xtts_params_by_voice = extract_per_voice_params(text)
@@ -1516,17 +1540,30 @@ def main():
         sys.exit(1)
 
     import argparse as _ap
+
+    # Pre-filter --mp3-* from argv to avoid confusion with -- voice separator
+    _raw = sys.argv[1:]
+    _mp3_args, _other_args = [], []
+    _i = 0
+    while _i < len(_raw):
+        if _raw[_i] in ('--mp3-bitrate', '--mp3-mode') and _i+1 < len(_raw):
+            _mp3_args += [_raw[_i], _raw[_i+1]]
+            _i += 2
+        else:
+            _other_args.append(_raw[_i])
+            _i += 1
+
     _parser = _ap.ArgumentParser(add_help=False)
     _parser.add_argument('--mp3-bitrate', type=int, default=192,
                          choices=[128, 160, 192, 256, 320])
     _parser.add_argument('--mp3-mode', default='cbr', choices=['cbr', 'vbr'])
-    _known, _remaining = _parser.parse_known_args(sys.argv[1:])
+    _known, _ = _parser.parse_known_args(_mp3_args)
     mp3_bitrate = _known.mp3_bitrate
     mp3_mode    = _known.mp3_mode
 
-    input_file  = _remaining[0]
-    output_file = _remaining[1]
-    audio_files = _remaining[2:]
+    input_file  = _other_args[0]
+    output_file = _other_args[1]
+    audio_files = _other_args[2:]
 
     if not audio_files:
         print("[!] At least one voice file is required!")

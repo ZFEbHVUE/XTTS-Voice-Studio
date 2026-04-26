@@ -2,7 +2,7 @@
 
 A complete toolkit for voice cloning, guided meditation generation, song transcription, and audio processing — built around Coqui XTTS v2 with a Tkinter GUI that unifies every script under one roof.
 
-![Python](https://img.shields.io/badge/Python-3.10-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20WSL-lightgrey)
+![Python](https://img.shields.io/badge/Python-3.10-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-lightgrey)
 
 ---
 
@@ -13,28 +13,13 @@ XTTS Voice Studio is a personal production suite for:
 - **Cloning voices** from short audio samples (via XTTS v2)
 - **Generating guided meditations** with multi-voice narration, ambient music, punctual sound cues, and per-voice fine-tuning
 - **Transcribing songs or speech** into XTTS-compatible scripts with pause detection and optional pitch annotation
-- **Separating voices** by F0, removing background music (demucs), and cleaning audio (dereverberation)
+- **Separating vocals** from instrumental tracks
 - **Applying pitch correction** to cloned voices
-- **Converting video files** to audio in multiple formats
-
-The suite runs natively on Linux and under WSL (Windows Subsystem for Linux) with Ubuntu. Audio playback in the GUI player is not available under WSL due to audio stack limitations, but all generation and processing features work normally.
+- **Converting video files** to audio for further processing
 
 Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) or directly from the command line.
 
 ![XTTS Voice Studio GUI](docs/gui_main.png)
-
----
-
-## Features at a glance
-
-| Tab | Script | Purpose |
-|-----|--------|---------|
-| **[Gen] Generator** | `guided_meditation_generator_v23.py` | Multi-voice guided meditations — XTTS v2, ambient music, parallel overlay, reverb, noise gate, pan, limiter — output to WAV / MP3 / FLAC / OGG |
-| **[Ana] Analyser** | `voice_analyser.py` | Analyse a voice WAV and produce ready-to-paste `{}` and `[]` parameter blocks. F0 engine selectable: torchcrepe (GPU) or pyin (multicore CPU) |
-| **[Txt] Transcription** | `transcribeSong2txt_with_pause.py` or `video2txt.py` | Whisper transcription with pause markers and optional per-word pitch annotation — audio and video input |
-| **[Vox] Voice sep.** | `extract_voices.py` | Separate voices by F0, remove background music (demucs), dereverberate, replace silences — output to WAV / MP3 / FLAC / OGG |
-| **[Pit] Pitch** | `apply_pitch_to_clone.py` | Apply pitch correction to a cloned voice file |
-| **[Vid] Video->Audio** | `ffmpeg` | Extract audio from any video — output to MP3 / WAV / FLAC / OGG |
 
 ---
 
@@ -43,348 +28,290 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 ### Requirements
 
 - Python 3.10
-- Miniconda or Anaconda
-- CUDA 12.x + GPU (optional but recommended)
-- `ffmpeg` with `libmp3lame`
+- Miniconda or Anaconda (recommended)
+- CUDA 12.x + compatible GPU (optional but recommended)
+- `ffmpeg` and `rubberband-cli` (system packages)
 
-### Steps
+### Step 1 — Clone the repository
 
 ```bash
-# 1. Clone
+cd ~
 git clone https://github.com/ZFEbHVUE/XTTS-Voice-Studio.git
 cd XTTS-Voice-Studio
+```
 
-# 2. Create environment
+### Step 2 — Create the conda environment
+
+```bash
 conda create -n xtts python=3.10
 conda activate xtts
+```
 
-# 3. Core dependencies
-pip install TTS torch torchaudio
-pip install faster-whisper
-pip install librosa pydub numpy soundfile
-pip install pyrubberband
+### Step 3 — Install dependencies
 
-# 4. F0 engine and acoustic analysis (recommended)
-pip install torchcrepe       # GPU-accelerated F0 estimation (uses existing PyTorch)
-pip install praat-parselmouth  # Praat acoustic measurements (HNR, shimmer, jitter)
+```bash
+pip install TTS torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install faster-whisper librosa pydub numpy soundfile pyrubberband
+pip install torchcrepe demucs noisereduce nara-wpe deepfilternet
+pip install praat-parselmouth
 
-# 5. Voice separation backends (optional)
-pip install demucs            # music removal
-pip install noisereduce       # fast dereverberation (CPU)
-pip install nara-wpe          # precise reverb removal (CPU)
-pip install deepfilternet     # best quality dereverberation (GPU supported)
-
-# 6. System packages (Ubuntu/Debian)
 sudo apt install ffmpeg rubberband-cli
-
-# 7. Verify CUDA (optional)
-python -c "from faster_whisper import WhisperModel; m = WhisperModel('tiny', device='cuda', compute_type='float16'); print('CUDA OK')"
 ```
 
----
-
-## Directory structure
-
-```
-XTTS-Voice-Studio/
-├── Python_Scripting/
-│   ├── xtts_studio.py                      # Tkinter GUI (main entry point)
-│   ├── guided_meditation_generator_v23.py
-│   ├── voice_analyser.py
-│   ├── extract_voices.py
-│   ├── transcribeSong2txt_with_pause.py
-│   ├── video2txt.py
-│   └── apply_pitch_to_clone.py
-├── Prompts/                    # Text scripts for meditation generation
-├── Voices_Cloning/             # Voice samples for XTTS cloning (.wav, 6–60s)
-├── Ambient_Musics/             # Background ambient loops
-├── Punctual_sounds/            # One-shot audio cues (bells, chimes)
-├── MP3toTXT/                   # Audio/video sources for transcription
-├── Output_Song_files/          # Generated meditation files
-├── Song_to_TXT_with_Pauses/    # Transcribed text files
-└── README.md
-```
-
----
-
-## Usage
-
-### Launching the GUI
+### Step 4 — Launch the GUI
 
 ```bash
 conda activate xtts
 python ~/XTTS-Voice-Studio/Python_Scripting/xtts_studio.py
 ```
 
-All device selectors (Device: cpu/cuda) auto-detect CUDA at startup and pre-select it when available.
+The `XTTS_ROOT` is auto-detected from the script location — no hardcoded paths. You can clone the repo anywhere or rename the directory freely.
+
+---
+
+## Directory Structure
+
+```
+XTTS-Voice-Studio/
+├── Python_Scripting/
+│   ├── xtts_studio.py                      # Tkinter GUI (main entry point)
+│   ├── guided_meditation_generator_v23.py  # Meditation generator
+│   ├── voice_analyser.py                   # Acoustic analysis → XTTS params
+│   ├── extract_voices.py                   # Vocal separation
+│   ├── transcribeSong2txt_with_pause.py    # Audio transcription
+│   ├── video2txt.py                        # Video transcription
+│   └── apply_pitch_to_clone.py             # Pitch correction
+├── Prompts/                                # Text scripts for meditation generation
+├── Voices_Cloning/                         # Voice reference samples (.wav, 6–60s)
+├── Ambient_Musics/                         # Background ambient loops
+├── Punctual_sounds/                        # One-shot audio cues (bells, chimes)
+├── MP3toTXT/                               # Audio/video sources for transcription
+├── Output_Song_files/                      # Generated meditation WAVs
+├── Song_to_TXT_with_Pauses/               # Transcribed text files
+└── README.md
+```
 
 ---
 
 ## Guided Meditation Generator
 
-### Script syntax
+Produces long-form guided meditation audio files from a simple text script.
+
+### XTTS parameter block `{}` — 14 values (v23)
 
 ```
-# XTTS params (14 values — positions 12–14 can be omitted for v20/v21 compatibility)
 {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs}
+```
 
-# Audio params (16 values — positions 13–16 can be omitted)
+| Pos | Parameter | Default | Description |
+|-----|-----------|---------|-------------|
+| 1 | `N` | — | Voice number |
+| 2 | `seed` | 0 | Random seed (0 = none) |
+| 3 | `trim_start` | 0 | Trim from start of generated audio (ms) |
+| 4 | `trim_end` | 0 | Trim from end (ms) |
+| 5 | `fade_in` | 100 | Fade-in (ms) |
+| 6 | `fade_out` | 250 | Fade-out (ms) |
+| 7 | `temperature` | 0.72 | GPT sampling temperature |
+| 8 | `top_k` | 50 | GPT top-k |
+| 9 | `top_p` | 0.85 | GPT top-p |
+| 10 | `rep_pen` | 5.0 | Repetition penalty |
+| 11 | `len_pen` | 1.0 | Length penalty |
+| 12 | `gpt_cond_len` | 30 | Reference WAV seconds used for cloning (up to 60) |
+| 13 | `gpt_cond_chunk_len` | 4 | GPT conditioning chunk size |
+| 14 | `sound_norm_refs` | 0 | Normalise reference before cloning (0/1) |
+
+Fully backward-compatible — v20/v21/v22 scripts (9–13 values) run unchanged.
+
+### Audio parameter block `[]` — 16 values (v23)
+
+```
 [N, LANG, speed, vol, eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess, reverb, noise_gate, pan, limiter]
 ```
 
-**XTTS block `{}` — positions 12–14 (v23):**
+| Pos | Parameter | Default | Description |
+|-----|-----------|---------|-------------|
+| 1 | `N` | — | Voice number |
+| 2 | `LANG` | FR | Language code (FR, EN, ES, DE, IT, PT...) |
+| 3 | `speed` | 1.0 | Rubberband speed factor |
+| 4 | `vol` | 0 | Volume adjustment (dB) |
+| 5 | `eq_low` | -2 | Low EQ 80–300 Hz (dB) |
+| 6 | `eq_mid` | +3 | Mid EQ 300–3000 Hz (dB) |
+| 7 | `eq_high` | -4 | High EQ 3000–8000 Hz (dB) |
+| 8 | `hp` | 90 | Highpass filter (Hz) |
+| 9 | `lp` | 8000 | Lowpass filter (Hz) |
+| 10 | `NR` | 0.5 | Noise reduction strength (0–2) |
+| 11 | `comp` | 0.4 | Compression strength (0–1) |
+| 12 | `de-ess` | 0.3 | De-esser strength (0–1) |
+| 13 | `reverb` | 0 | Reverb wet level (0–1) |
+| 14 | `noise_gate` | 0 | Noise gate threshold (dB, 0=off, e.g. -40) |
+| 15 | `pan` | 0 | Stereo pan (-1.0 left / 0 centre / +1.0 right) |
+| 16 | `limiter` | 0 | Output limiter (0=off, 1=on) |
 
-| Position | Parameter | Default | Notes |
-|----------|-----------|---------|-------|
-| 12 | `gpt_cond_len` | 30 | Seconds of reference WAV used for cloning. Set to actual WAV duration, max 60. Higher = better fidelity. |
-| 13 | `gpt_cond_chunk_len` | 4 | GPT conditioning chunk size. Rarely needs changing. |
-| 14 | `sound_norm_refs` | 0 | Normalise reference WAV before cloning (0=off, 1=on). |
+Processing order: Trim → Filters → EQ → NR → De-esser → Compression → Noise gate → Reverb → Fades → Pan → Limiter
 
-**Audio block `[]` — positions 13–16 (v23):**
+### Per-voice config persistence
 
-| Position | Parameter | Default | Notes |
-|----------|-----------|---------|-------|
-| 13 | `reverb` | 0 | Wet level 0–1 via ffmpeg `aecho`. Adds spatial presence. |
-| 14 | `noise_gate` | 0 | Threshold dB via ffmpeg `agate` (e.g. -40). Removes breath noise. |
-| 15 | `pan` | 0 | Stereo pan: -1.0=left, 0=centre, +1.0=right. |
-| 16 | `limiter` | 0 | Output limiter (0=off, 1=on). Prevents clipping. |
-
-**Value 0 = keep default** for all parameters where 0 is invalid (temperature, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len).
-
-### Example script
+Short blocks inherit the last full config for that voice — only write what changes:
 
 ```
-ambient_volume=-18
-music_1=5s,-10
+# First full config — memorised for voice 1
+[1, FR, 0.9, 6, -5, 1, -2, 75, 8000, 0.35, 0.5, 0.5, 0, 0, 0, 1]
+Première phrase.
+[pause=2s]
 
-{1, 42, 110, 255, 150, 300, 0.65, 50, 0.85, 5.0, 1.0, 40, 4, 0}
-[1, FR, 0.85, +1, -5, +1, -1, 90, 9000, 0.3, 0.4, 0.2, 0, 0, 0, 1]
-Welcome to this guided meditation session.
-[pause=3s]
-Take a deep breath in through your nose.
-[pause=5s,start]
-[music=1]
-And slowly exhale through your mouth.
+# Only speed and volume change — rest inherited
+[1, FR, 0.8, 3]
+Deuxième phrase.
+[pause=2s]
+
+# Only language changes
+[1, EN]
+Third sentence in English.
+```
+
+Config resets at the start of each generation run.
+
+### Multi-reference voices
+
+Pass multiple reference WAV files per voice separated by spaces in the GUI. XTTS averages the speaker embeddings for a more robust clone.
+
+In the CLI, voice groups are separated by `--`:
+
+```bash
+generator.py script.txt output.wav \
+    ref1.wav ref2.wav \
+    -- \
+    hollie.wav \
+    --mp3-bitrate 192 --mp3-mode cbr
 ```
 
 ### Parallel voice overlay
 
-Two or more voices speaking simultaneously, each with independent text and parameters:
-
 ```
-# All voices start at the same time
-[parallel]
-{1, ...} [1, FR, 0.85, +1, ..., -0.3, 1]  The main narrator speaks.
-{2, ...} [2, FR, 0.90, -6, ..., +0.3, 1]  A second voice whispers underneath.
-[/parallel]
-
-# Staggered entry: voice 2 at 1s, voice 3 at 5s
 [parallel, offset=1s,5s]
-{1, ...} [1, FR, ...] First voice begins immediately.
-{2, ...} [2, FR, ...] Second voice enters after 1 second.
-{3, ...} [3, FR, ...] Third voice joins at 5 seconds.
+{1, 42, ...} [1, FR, ...] First voice begins immediately.
+{2, 42, ...} [2, FR, ...] Second voice enters after 1 second.
+{3, 42, ...} [3, FR, ...] Third voice joins at 5 seconds.
 [/parallel]
 ```
 
-- `offset=` values are **absolute start times** for voices 2, 3, 4, ... — voice 1 always starts at 0s
-- The block can be written on a single line or across multiple lines
-- No limit on the number of simultaneous voices
+Voice 1 always starts at 0s. `offset=` values are absolute start times for voices 2, 3, 4...
 
-### Pause syntax
+### Other syntax
 
 ```
-[pause=2s]           # fixed 2s silence
-[pause=4s,start]     # total (speech + silence) = 4s
-```
-
-### Output formats
-
-Format is auto-detected from the output file extension: `.wav`, `.mp3`, `.flac`, `.ogg`
-
-```bash
-python guided_meditation_generator_v23.py prompt.txt output.mp3 voice.wav \
-    --mp3-bitrate 256 --mp3-mode cbr
+[pause=2s]           # fixed silence
+[pause=4s,start]     # pad sentence+silence to 4s total
+[music=1]            # trigger punctual music cue #1
+ambient_volume=-18   # set ambient track volume (dB)
+music_1=5s,-10       # music cue 1: offset 5s, volume -10dB
 ```
 
 ---
 
 ## Voice Analyser
 
-Analyses a reference WAV and outputs ready-to-paste `{}` and `[]` blocks for `guided_meditation_generator_v23.py`. Derives all 14 XTTS params and all 16 audio params from acoustic analysis.
+Analyses one or more reference audio files and produces ready-to-paste `{N,...}` and `[N,...]` parameter blocks.
 
-```bash
-python voice_analyser.py --precise --f0-engine auto --start-num 1 voice.wav FR
+### Acoustic measurements
+
+| Measurement | Tool | Derived parameter |
+|-------------|------|------------------|
+| F0 median, std, jitter | YIN / torchcrepe / pyin | Voice type, hp/lp, speed, len_pen |
+| HNR | Praat | noise_reduction |
+| Shimmer APQ5 | Praat | compression |
+| Shimmer + jitter score | Praat | temperature, rep_pen |
+| Formants F1/F2 | Praat | highpass refinement |
+| Syllable tempo | Praat | speed refinement |
+| Voiced RMS | librosa | volume |
+| Sibilance | librosa | de-esser |
+| Duration | — | gpt_cond_len |
+
+### Per-voice F0 engine selector
+
+Each voice row in the Analyser tab has an independent engine selector:
+
+```
+V [1] [ voice.wav titi.wav ] [Browse] [FR▼] Seed:[42] ☐ Prec [none]   [X]
+V [2] [ hollie.wav         ] [Browse] [FR▼] Seed:[0 ] ☑ Prec [pyin▼]  [X]
 ```
 
-### F0 engine options
+- **Prec unchecked** → fast YIN, `none` label shown (read-only)
+- **Prec checked** → precise mode, choose `auto / crepe / pyin`
 
-| Engine | Backend | Speed | Best for |
-|--------|---------|-------|----------|
-| `auto` | torchcrepe if available, else pyin | Fast | Default — GPU when possible |
-| `crepe` | torchcrepe (GPU/CPU) | Fast on GPU | Expressive, singing voices |
-| `pyin` | librosa (multicore CPU) | Medium | Monotone, spoken voices |
+**Recommended by voice type:**
+- Bass/baritone → `pyin` (torchcrepe detects harmonics on low voices)
+- Soprano/high → `auto` or `crepe`
+- Meditation voice → `none` (fast, Praat does the real work)
 
-- **torchcrepe** uses CUDA automatically if available. Falls back to CPU on OOM. Processes in 30s chunks.
-- **pyin** uses all available CPU cores via `ProcessPoolExecutor`. Processes in 30s chunks.
-- Both engines give slightly different results — torchcrepe tends to be more generous on voiced_ratio; pyin is more precise on stable fundamentals.
+### Multi-reference averaging
 
-**Derived parameters include:**
-- `gpt_cond_len` — set to actual WAV duration (capped at 60s) for best cloning fidelity
-- `repetition_penalty` — from Praat shimmer+jitter combined score (expressive → 4.5, monotone → 7.0)
-- `temperature`, `top_k`, `top_p` — from Praat expressiveness score (shimmer × 0.6 + jitter × 0.4)
-- `NR` — from Praat HNR (HNR > 20dB → 0.15, HNR < 10dB → 0.50)
-- `compression` — from Praat shimmer (shimmer > 15% → 0.7, shimmer < 6% → 0.35)
-- `volume` — computed on voiced frames only (silences excluded) — prevents over-boosting on long files with many pauses. Capped at +8dB.
-- `trim_start` — set to 0 (empirically validated: XTTS handles its own start artifact)
-- `length_penalty` — from voiced_ratio (fast speaker → 0.9, slow/breathy → 1.1)
-- `noise_gate` — auto-suggested from SNR
-- Adaptive fades derived from voice dynamics
-- Breathiness detection via spectral flatness — adjusts NR and compression automatically
-- All Praat measurements limited to first 60s for speed — falls back to librosa if parselmouth not installed
+When multiple files are passed for the same voice, each is analysed separately and all numeric parameters are averaged into a single representative `{}[]` block:
+
+```bash
+# Analyse two references for voice 1, average the results
+voice_analyser.py --precise --f0-engine pyin --start-num 1 toto.wav titi.wav FR
+```
 
 ---
 
-## Voice Separation (`extract_voices.py`)
+## Video→Audio Tab
 
-### Modes
+Extracts audio from any video file:
 
-**1. Music removal (demucs)** — strips background music and noise, outputs a clean vocal stem with no cuts:
-
-```bash
-python extract_voices.py input.mp3 output.mp3 --remove-music --demucs-model htdemucs_ft
-```
-
-**2. Voice separation by F0** — classifies segments as female, male, or overlap:
-
-```bash
-python extract_voices.py input.wav output.wav \
-    --keep female --silence 1.0 --threshold 165 --overlap-range 200
-```
-
-**3. Dereverberation only** — clean a file without F0 filtering:
-
-```bash
-python extract_voices.py vocals.wav clean.wav \
-    --keep "vocals only" --dereverberate deepfilter
-```
-
-**4. Silence replacement in a single-voice file** — replace natural pauses with a fixed duration:
-
-```bash
-python extract_voices.py voice.wav output.wav \
-    --keep female --silence 1.0 --min-silence 0.30
-```
-
-### Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--keep` | `female` | `female`, `male`, `overlap`, `all`, `female,male`, `vocals only` |
-| `--silence` | `auto` | Gap between kept segments: `auto`=natural, `0`=none, `N`=fixed N seconds |
-| `--min-silence` | 0.15 | Minimum pause (s) to split segments. Use 0.3–0.5 for single-voice files |
-| `--threshold` | 165 | F0 boundary male/female in Hz |
-| `--overlap-range` | 200 | F0 range above which a segment is classified as overlap |
-| `--remove-music` | off | Run demucs to strip background music before processing |
-| `--demucs-model` | `htdemucs_ft` | `htdemucs` (fast), `htdemucs_ft` (best vocals), `mdx_extra` (dense music) |
-| `--dereverberate` | `none` | `noisereduce` (CPU), `wpe` (CPU), `deepfilter` (GPU supported) |
-| `--mp3-bitrate` | 192 | 128 / 160 / 192 / 256 / 320 kbps — only when output is `.mp3` |
-| `--mp3-mode` | `cbr` | `cbr` (constant) or `vbr` (variable) |
-| `--debug` | off | Print per-segment classification detail |
-
-**GPU**: auto-detected. Demucs and DeepFilterNet use CUDA when available; noisereduce and WPE are CPU-only.
+- **Formats**: WAV, MP3 (CBR/VBR), FLAC, OGG
+- **Channels**: stereo or mono
+- **Sample rates**: 16000, 22050, 44100, 48000 Hz
+- **XTTS preset**: forces WAV + mono + 22050 Hz (optimal for XTTS reference files)
 
 ---
 
-## Song / Video Transcription
+## Optimal reference audio for XTTS
 
-### Audio transcription
+| Property | Recommended |
+|----------|-------------|
+| Format | WAV (lossless) |
+| Channels | Mono |
+| Sample rate | 22050 Hz |
+| Duration | 20–60 seconds |
+| Content | Clean speech only — no music, no echo, no noise |
 
-```bash
-python transcribeSong2txt_with_pause.py audio.mp3 output.txt small 0.3 fr \
-    --device cuda --vad
-```
+Use the **XTTS preset** button in the Video→Audio tab to extract reference audio in the correct format directly from a video.
 
-### Video transcription
+---
 
-```bash
-python video2txt.py video.mp4 output.txt --model large-v3 --lang fr \
-    --pause 0.1 --device cuda
-```
+## TTS Backend Comparison
 
-`video2txt.py` extracts audio via ffmpeg (mono 16kHz WAV) then calls `transcribeSong2txt_with_pause.py`. The Stop button kills the entire process tree immediately (SIGKILL).
+| Model | French | Cloning | GPU | Verdict |
+|-------|--------|---------|-----|---------|
+| **XTTS v2** | ✅ native | ✅ excellent | 4GB+ | **Best for French** |
+| Chatterbox Multilingual | ✅ correct | ✅ good | 8GB+ | Acceptable, XTTS better |
+| F5-TTS | ❌ English accent | ✅ timbre | 8GB+ | Not usable for French |
+| IndexTTS2 | ❌ English accent | ✅ timbre | 8GB+ | Not usable for French |
 
-### Model selection by GPU VRAM
-
-| GPU VRAM | Recommended model | Notes |
-|----------|-------------------|-------|
-| ~4 GB (GTX 1650) | `small` | Max safe model |
-| ~8 GB | `medium` or `turbo` | |
-| 20 GB+ (RTX A4500) | `large-v3` | Best quality |
-
-**Features:**
-- Word-level timestamps for precise pause detection
-- Optional per-word pitch annotation (`[p:+2]`, `[p:-1]`, `[p:?]` for unvoiced)
-- Silero VAD pre-filter via `--vad`
-- Automatic CUDA → CPU fallback
-- Output is drop-in compatible with the Guided Meditation Generator
+XTTS v2 remains the best model for French voice cloning without fine-tuning.
 
 ---
 
 ## Troubleshooting
 
-**`faster-whisper` not installed**
-```bash
-pip install faster-whisper
-```
+**`No module named 'librosa'` or similar**
+Launch the GUI with `conda activate xtts` first.
 
-**`torchcrepe` not installed**
-```bash
-pip install torchcrepe
-```
+**`CUDA out of memory` with demucs**
+Switch from `mdx_extra` to `htdemucs_ft` or use `--device cpu`.
 
-**`praat-parselmouth` not installed**
-```bash
-pip install praat-parselmouth
-```
-Without it the analyser falls back to librosa estimates (less accurate for rep_pen, NR, compression).
+**torchcrepe returns F0=1900Hz or voiced=0% on bass/baritone voices**
+Use `pyin` engine instead — torchcrepe can detect harmonics rather than the fundamental on low voices.
 
-**`demucs` not installed**
-```bash
-pip install demucs
-```
+**`[!] File not found: --mp3-bitrate`**
+You are running an old version of the generator. Replace with the latest `guided_meditation_generator_v23.py`.
 
-**`deepfilternet` not installed**
-```bash
-pip install deepfilternet
-```
+**WPE dereverberation is very slow**
+WPE is inherently single-threaded. Use `deepfilter` for GPU-accelerated dereverberation of similar quality.
 
-**CUDA out of memory in voice analyser**
-torchcrepe automatically retries on CPU if CUDA OOM. For very long files (20min+), use `--f0-engine pyin` which uses multicore CPU without GPU memory constraints.
-
-**CUDA errors about missing `cudnn_ops_infer.so`**
-```bash
-pip install nvidia-cudnn-cu12 nvidia-cublas-cu12
-```
-
-**`scipy` UnicodeDecodeError with `mdx_extra` demucs model**
-```bash
-pip install --upgrade scipy
-# or prefix command with: LC_ALL=C python ...
-```
-
-**MP3 output fails**
-```bash
-ffmpeg -codecs | grep mp3lame   # verify libmp3lame is available
-```
-
-**`0 segments detected` in voice separation**
-The RMS threshold adapts automatically. If noisereduce produced NaN values on an already-clean file, re-run without `--dereverberate`. For single-voice files where silences are not detected, increase `--min-silence` to 0.3–0.5.
-
-**Audio player silent under WSL**
-`ffplay` has no direct access to the Windows audio stack under WSL. Open the generated file directly in Windows Explorer instead.
-
-**XTTS asks for terms of service on first run**
-Answer `y` at the prompt, or pre-accept by editing `~/.local/share/tts/`.
+**GUI opens in wrong directory on Browse**
+Make sure you launch `xtts_studio.py` from its own directory (or use the correct path). `XTTS_ROOT` is auto-detected from the script location.
 
 ---
 
@@ -392,18 +319,16 @@ Answer `y` at the prompt, or pre-accept by editing `~/.local/share/tts/`.
 
 - **XTTS v2** by [Coqui](https://github.com/coqui-ai/TTS)
 - **faster-whisper** by [SYSTRAN](https://github.com/SYSTRAN/faster-whisper)
-- **torchcrepe** by [maxrmorrison](https://github.com/maxrmorrison/torchcrepe)
-- **librosa** for F0 analysis
-- **pydub** and **Rubberband** for audio processing
-- **demucs** by [Facebook Research](https://github.com/facebookresearch/demucs)
-- **DeepFilterNet** by [Hendrik Schröter](https://github.com/Rikorose/DeepFilterNet)
-- Guided meditation concept and multi-voice orchestration: personal project
+- **demucs** by [Meta Research](https://github.com/facebookresearch/demucs)
+- **parselmouth / Praat** for acoustic analysis
+- **torchcrepe** for GPU F0 estimation
+- **librosa**, **pydub**, **rubberband** for audio processing
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 

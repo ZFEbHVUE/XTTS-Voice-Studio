@@ -324,13 +324,61 @@ def tab_generator(nb):
 
     v_script  = tk.StringVar()
     v_output  = tk.StringVar()
-    v_voices  = tk.StringVar()
     v_ambient = tk.StringVar()
     v_music   = tk.StringVar()
 
     add_row(f, "Script (.txt)",  v_script,  0, [("Text","*.txt"),("All","*.*")], initialdir=DIR_PROMPTS)
     add_row(f, "Output (wav/mp3)", v_output, 1, [("WAV","*.wav"),("MP3","*.mp3"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")], save=True, initialdir=DIR_OUTPUT)
-    add_row(f, "Voices (1+)",     v_voices,  2, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], multi=True, initialdir=DIR_VOICES)
+
+    # ── Voices — one row per voice, each with multi-ref support ──────────────
+    voices_frame = tk.LabelFrame(f, text="Voices", padx=4, pady=2)
+    voices_frame.grid(row=2, column=0, columnspan=3, sticky='ew', padx=6, pady=3)
+    voices_frame.grid_columnconfigure(1, weight=1)
+    voice_rows_gen = []
+
+    btn_add_voice = tk.Button(voices_frame, text="+ Add voice",
+                              bg='#2d6a2d', fg='white')
+    btn_add_voice.pack(anchor='w', padx=4, pady=2)
+
+    def add_gen_voice_row(num):
+        v_num  = tk.IntVar(value=num)
+        v_refs = tk.StringVar()
+        row_f  = tk.Frame(voices_frame)
+        row_f.pack(fill='x', padx=2, pady=1, before=btn_add_voice)
+        row_f.grid_columnconfigure(1, weight=1)
+
+        tk.Label(row_f, text=f"Voice [{num}]", width=9, anchor='w').pack(side='left')
+
+        entry = tk.Entry(row_f, textvariable=v_refs)
+        entry.pack(side='left', fill='x', expand=True, padx=3)
+
+        def browse_refs(v=v_refs):
+            files = filedialog.askopenfilenames(
+                filetypes=[("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")],
+                initialdir=DIR_VOICES)
+            if files:
+                existing = v.get().strip()
+                new_files = " ".join(files)
+                v.set((existing + " " + new_files).strip() if existing else new_files)
+
+        tk.Button(row_f, text="Browse", width=8, command=browse_refs).pack(side='left', padx=2)
+
+        entry_tuple = (v_num, v_refs, row_f)
+
+        def remove(e=entry_tuple):
+            e[2].destroy()
+            voice_rows_gen.remove(e)
+
+        tk.Button(row_f, text="X", width=2, fg='red', command=remove).pack(side='left', padx=1)
+        voice_rows_gen.append(entry_tuple)
+
+    add_gen_voice_row(1)
+
+    def add_gen_voice():
+        add_gen_voice_row(len(voice_rows_gen) + 1)
+
+    btn_add_voice.config(command=add_gen_voice)
+
     add_row(f, "Ambient",       v_ambient, 3, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_AMBIENT)
     add_row(f, "Punctual music (1+)", v_music, 4, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], multi=True, initialdir=DIR_PUNCTUAL)
 
@@ -667,12 +715,23 @@ def tab_generator(nb):
         # Sauvegarder automatiquement avant de lancer
         if editor.get('1.0', 'end-1c').strip():
             sauvegarder_prompt()
-        if not v_script.get() or not v_output.get() or not v_voices.get():
-            log(console, "ERR Script, sortie et voix obligatoires."); return
+
+        # Collect voices — separate rows with "--" so generator knows voice boundaries
+        voice_args = []
+        valid_rows = [(vn, vr, vf) for vn, vr, vf in voice_rows_gen if vr.get().strip()]
+        for i, (_vnum, _vrefs, _vframe) in enumerate(valid_rows):
+            refs = _vrefs.get().strip()
+            files = [rf.strip() for rf in refs.split() if rf.strip() and rf.strip() != '+']
+            voice_args += files
+            if i < len(valid_rows) - 1:
+                voice_args.append('--')  # separator between voices
+
+        if not v_script.get() or not v_output.get() or not voice_args:
+            log(console, "[ERR] Script, output and at least one voice required."); return
         cmd = [sys.executable,
                os.path.join(SCRIPTS_DIR, 'guided_meditation_generator_v23.py'),
                v_script.get(), v_output.get()]
-        cmd += v_voices.get().split()
+        cmd += voice_args
         if v_ambient.get(): cmd += v_ambient.get().split()
         if v_music.get():   cmd += v_music.get().split()
         cmd += ['--mp3-bitrate', v_gen_mp3_bitrate.get(), '--mp3-mode', v_gen_mp3_mode.get()]
@@ -712,8 +771,18 @@ def tab_analyser(nb):
         tk.Label(row_f, text="V", width=2).pack(side='left')
         tk.Spinbox(row_f, from_=1, to=20, textvariable=v_num, width=3).pack(side='left', padx=1)
         tk.Entry(row_f, textvariable=v_path).pack(side='left', fill='x', expand=True, padx=3)
+
+        def browse_multi_refs(vp=v_path):
+            files = filedialog.askopenfilenames(
+                filetypes=[("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")],
+                initialdir=DIR_VOICES)
+            if files:
+                existing = vp.get().strip()
+                new_files = " ".join(files)
+                vp.set((existing + " " + new_files).strip() if existing else new_files)
+
         tk.Button(row_f, text="Browse", width=8,
-            command=lambda vp=v_path: browse_file(vp, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_VOICES)).pack(side='left', padx=1)
+            command=browse_multi_refs).pack(side='left', padx=1)
 
         ttk.Combobox(row_f, textvariable=v_lang, values=LANGS,
                      width=6, state='readonly').pack(side='left', padx=1)
@@ -781,7 +850,10 @@ def tab_analyser(nb):
             cmd += ['--start-num', str(vnum)]
             if vseed != 0:
                 cmd += ['--seed', str(vseed)]
-            cmd += [vpath, vlang]
+            # support multiple space-separated reference files per voice
+            ref_files = [f for f in vpath.split() if f.strip()]
+            cmd += ref_files
+            cmd += [vlang]
             cmds.append(cmd)
 
         # Run commands sequentially in a thread

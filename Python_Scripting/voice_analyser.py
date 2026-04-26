@@ -750,37 +750,85 @@ def main():
         print(__doc__)
         sys.exit(0)
 
-    # Parse pairs: voice.wav [LANG] voice2.wav [LANG2] ...
-    # If an arg looks like a language code -> attach to previous wav
-    voice_list = []   # list of (wav_path, language)
+    # Parse: all WAV files before a language code = one multi-ref voice
+    # voice.wav voice2.wav FR voice3.wav EN
+    # → voice 1 = [voice.wav, voice2.wav] in FR
+    # → voice 2 = [voice3.wav] in EN
+    voice_list = []   # list of ([wav_paths...], language)
+    current_wavs = []
+    current_lang = 'FR'
     i = 0
     while i < len(args):
         token = args[i]
-        # Is it a language code?
         if token.lower() in VALID_LANGUAGES:
-            if voice_list:
-                wav, _ = voice_list[-1]
-                voice_list[-1] = (wav, token.upper())
-            i += 1
+            # Language code — finalise current group
+            current_lang = token.upper()
+            if current_wavs:
+                voice_list.append((current_wavs, current_lang))
+                current_wavs = []
+                current_lang = 'FR'
         else:
-            # Treat as a WAV path, default language FR
-            voice_list.append((token, 'FR'))
-            i += 1
+            current_wavs.append(token)
+        i += 1
+    # Finalise last group
+    if current_wavs:
+        voice_list.append((current_wavs, current_lang))
 
     results = []
 
-    for idx, (wav_file, lang) in enumerate(voice_list, start_num):
-        if not os.path.exists(wav_file):
-            print(f"[!] File not found: {wav_file}")
+    for idx, (wav_files, lang) in enumerate(voice_list, start_num):
+        # Filter existing files
+        valid_wavs = [w for w in wav_files if os.path.exists(w)]
+        missing    = [w for w in wav_files if not os.path.exists(w)]
+        for m in missing:
+            print(f"[!] File not found: {m}")
+        if not valid_wavs:
             continue
+
         try:
-            params, stats = analyse_voice(wav_file, fast=fast, f0_engine=f0_engine)
-            seed = get_seed(idx - start_num)
-            display_results(params, stats, voice_num=idx,
-                            wav_file=wav_file, language=lang, seed=seed)
-            results.append((wav_file, lang, params, stats, seed))
+            if len(valid_wavs) == 1:
+                # Single reference — analyse normally
+                params, stats = analyse_voice(valid_wavs[0], fast=fast, f0_engine=f0_engine)
+                seed = get_seed(idx - start_num)
+                display_results(params, stats, voice_num=idx,
+                                wav_file=valid_wavs[0], language=lang, seed=seed)
+                results.append((valid_wavs[0], lang, params, stats, seed))
+            else:
+                # Multiple references — analyse each and average params
+                print(f"\n[*] Voice #{idx}: {len(valid_wavs)} references — averaging parameters")
+                all_params = []
+                all_stats  = []
+                for wav_file in valid_wavs:
+                    print(f"   [*] Analysing {os.path.basename(wav_file)}...")
+                    p, s = analyse_voice(wav_file, fast=fast, f0_engine=f0_engine)
+                    all_params.append(p)
+                    all_stats.append(s)
+
+                # Average numeric params
+                import copy
+                avg_params = copy.deepcopy(all_params[0])
+                avg_stats  = copy.deepcopy(all_stats[0])
+                numeric_keys_p = [k for k, v in avg_params.items() if isinstance(v, (int, float))]
+                numeric_keys_s = [k for k, v in avg_stats.items()  if isinstance(v, (int, float))]
+                for k in numeric_keys_p:
+                    avg_params[k] = sum(p[k] for p in all_params) / len(all_params)
+                for k in numeric_keys_s:
+                    avg_stats[k]  = sum(s[k] for s in all_stats)  / len(all_stats)
+
+                # Round integer params
+                for k in ('trim_start','trim_end','fade_in','fade_out','top_k',
+                          'highpass','lowpass','gpt_cond_len','gpt_cond_chunk_len'):
+                    if k in avg_params:
+                        avg_params[k] = int(round(avg_params[k]))
+
+                seed = get_seed(idx - start_num)
+                print(f"\n[*] Averaged parameters for voice #{idx} ({len(valid_wavs)} refs):")
+                display_results(avg_params, avg_stats, voice_num=idx,
+                                wav_file=valid_wavs[0], language=lang, seed=seed)
+                results.append((valid_wavs[0], lang, avg_params, avg_stats, seed))
+
         except Exception as e:
-            print(f"[!] Error analysing {wav_file}: {e}")
+            print(f"[!] Error analysing voice #{idx}: {e}")
             import traceback
             traceback.print_exc()
 
