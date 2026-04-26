@@ -1,19 +1,12 @@
-  #  python ~/XTTS/Python_Scripting/guided_meditation_generator_v20.py ~/XTTS/Prompts/Respiration_shodhana_carree_VivienneHD_FR.txt ~/XTTS/Output_Song_files/Respiration_shodhana_carree_VivienneHD_FR.wav ~/XTTS/Voices_Cloning/VivienneHD_FR.wav ~/XTTS/Punctual_sounds/four_Gongs_16seconde.mp3
-  
   ambient_volume=-10 
   music_1=16s,+5  
 
-  # Voix1 en FR (7dB)
-  # python ~/XTTS/Python_Scripting/voice_analyser.py --precise ~/XTTS/Voices_Cloning/VivienneHD_FR.wav FR
-  #
-  # ── XTTS params  {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p}
-  # ── seed=0 → no seed  (replace with a number for reproducibility)
-  
-  {1, 0, 65, 320, 150, 300, 0.55, 30, 0.75}
-  
-  # ── Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
-  
-  [1, FR, 0.9, 7, -5, 1, -2, 75, 8000, 0.3, 0.5, 0.7]
+  # Voice [FR]  tenor / mezzo-soprano  205 Hz
+  # -- XTTS params  {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen}
+  {1, 42, 0, 320, 100, 250, 0.68, 50, 0.85, 5, 1, 45, 4, 0}
+
+  # -- Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
+  [1, FR, 0.88, 3, -5, 1, -2, 95, 8000, 0.25, 0.35, 0.7, 0, 0, 0, 1]
 
 
 
