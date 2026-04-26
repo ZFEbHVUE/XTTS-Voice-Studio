@@ -37,7 +37,7 @@
 # Premier cycle 8 temps
 # Voix1 (0dB)
 
-  [1,FR,0.85,0]
+  [1,FR,0.88,0]
   
   boucher la narine droite.
   [pause=1s]
