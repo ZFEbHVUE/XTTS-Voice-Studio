@@ -931,6 +931,7 @@ def generate_sentence_audio(clean, voice_num, voice_files, tts_instances,
             speed=1.0      # speed applied later via rubberband
         )
         audio = AudioSegment.from_wav(temp_file)
+
         audio = process_audio(audio, config, xtts_params)
         audio = apply_speed_rubberband(audio, config['speed'])
         audio = audio + config['volume']
@@ -1514,9 +1515,18 @@ def main():
             print(f"  {k}: {v}")
         sys.exit(1)
 
-    input_file  = sys.argv[1]
-    output_file = sys.argv[2]
-    audio_files = sys.argv[3:]
+    import argparse as _ap
+    _parser = _ap.ArgumentParser(add_help=False)
+    _parser.add_argument('--mp3-bitrate', type=int, default=192,
+                         choices=[128, 160, 192, 256, 320])
+    _parser.add_argument('--mp3-mode', default='cbr', choices=['cbr', 'vbr'])
+    _known, _remaining = _parser.parse_known_args(sys.argv[1:])
+    mp3_bitrate = _known.mp3_bitrate
+    mp3_mode    = _known.mp3_mode
+
+    input_file  = _remaining[0]
+    output_file = _remaining[1]
+    audio_files = _remaining[2:]
 
     if not audio_files:
         print("[!] At least one voice file is required!")

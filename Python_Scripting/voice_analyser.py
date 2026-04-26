@@ -298,6 +298,9 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     praat_hnr     = None
     praat_shimmer = None
     praat_jitter  = None
+    praat_apq5    = None
+    praat_f1      = None
+    praat_f2      = None
 
     if _HAS_PARSELMOUTH:
         try:
@@ -315,11 +318,38 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
                 [_snd, _pp], 'Get shimmer (local)', 0, 0, 0.0001, 0.02, 1.3, 1.6)
             praat_jitter  = parselmouth.praat.call(
                 _pp, 'Get jitter (local)', 0, 0, 0.0001, 0.02, 1.3)
-            step(f"Praat   HNR={praat_hnr:.1f}dB  shimmer={praat_shimmer*100:.1f}%  jitter={praat_jitter*100:.2f}%", t0)
+            # APQ5 — more accurate for compression than local shimmer
+            praat_apq5 = parselmouth.praat.call(
+                [_snd, _pp], 'Get shimmer (apq5)', 0, 0, 0.0001, 0.02, 1.3, 1.6)
+            # Formants F1/F2 — for EQ and hp/lp targeting
+            try:
+                _fmt  = parselmouth.praat.call(_snd, 'To Formant (burg)', 0, 5, 5500, 0.025, 50)
+                praat_f1 = parselmouth.praat.call(_fmt, 'Get mean', 1, 0, 0, 'Hertz')
+                praat_f2 = parselmouth.praat.call(_fmt, 'Get mean', 2, 0, 0, 'Hertz')
+            except Exception:
+                praat_f1, praat_f2 = None, None
+            step(f"Praat   HNR={praat_hnr:.1f}dB  shimmer={praat_shimmer*100:.1f}%  jitter={praat_jitter*100:.2f}%  APQ5={praat_apq5*100:.1f}%  F1={praat_f1:.0f}Hz  F2={praat_f2:.0f}Hz", t0)
         except Exception as e:
             print(f"   [!] Praat analysis failed: {e} — using librosa fallback")
     else:
         print("   [*] parselmouth not installed — using librosa estimates (pip install praat-parselmouth)")
+
+    # -- 2c. Tempo estimation (syllable rate) ---------------------------------
+    # Estimate syllable rate from voiced pulse count / voiced duration
+    # Used to derive speed parameter more accurately
+    praat_tempo = None
+    if _HAS_PARSELMOUTH:
+        try:
+            _y60  = y[:int(min(60, duration) * sr)]
+            _snd2 = parselmouth.Sound(_y60.astype('float64'), sr)
+            _pp2  = parselmouth.praat.call(_snd2, 'To PointProcess (periodic, cc)', 75, 600)
+            _n_periods = parselmouth.praat.call(_pp2, 'Get number of periods', 0, 0, 0.0001, 0.02, 1.3)
+            _voiced_dur = _n_periods / max(f0_median, 80)  # voiced duration in seconds
+            if _voiced_dur > 0:
+                praat_tempo = _n_periods / _voiced_dur / 4  # ~4 pulses per syllable
+                print(f"   [*] Syllable rate: {praat_tempo:.2f} syl/s")
+        except Exception:
+            pass
 
     # Voice type classification
     if f0_median < 110:
@@ -336,6 +366,12 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
         highpass, lowpass = 90, 9000
 
     print(f"   Voice type: {voice_type}")
+
+    # Refine highpass using formant F1 if available
+    if praat_f1 is not None:
+        hp_formant = max(50, int(praat_f1 * 0.15))  # 15% of F1
+        highpass   = max(highpass, min(hp_formant, highpass + 20))
+        print(f"   [*] F1={praat_f1:.0f}Hz F2={praat_f2:.0f}Hz -> hp refined to {highpass}Hz")
 
     # -- 3. Spectral analysis -> EQ -----------------------------------------
     step("Spectral analysis (EQ, sibilance, breathiness)")
@@ -443,13 +479,15 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     peak            = float(np.max(np.abs(y)))
     crest_factor_db = 20.0 * np.log10(peak / (rms_global + 1e-10))
 
-    if praat_shimmer is not None:
-        # Shimmer-based compression (more accurate than crest factor)
-        if   praat_shimmer > 0.15: compression = 0.7
-        elif praat_shimmer > 0.10: compression = 0.6
-        elif praat_shimmer > 0.06: compression = 0.5
-        else:                      compression = 0.35
-        print(f"   [*] Shimmer={praat_shimmer*100:.1f}% -> comp={compression}")
+    # Use APQ5 for compression if available (more accurate), else shimmer
+    _comp_metric = praat_apq5 if praat_apq5 is not None else praat_shimmer
+    if _comp_metric is not None:
+        if   _comp_metric > 0.15: compression = 0.7
+        elif _comp_metric > 0.10: compression = 0.6
+        elif _comp_metric > 0.06: compression = 0.5
+        else:                     compression = 0.35
+        _metric_name = "APQ5" if praat_apq5 is not None else "Shimmer"
+        print(f"   [*] {_metric_name}={_comp_metric*100:.1f}% -> comp={compression}")
     else:
         if   crest_factor_db > 22: compression = 0.7
         elif crest_factor_db > 16: compression = 0.5
@@ -466,6 +504,13 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     if   voiced_ratio > 0.65: speed = 0.85
     elif voiced_ratio > 0.45: speed = 0.90
     else:                     speed = 0.93
+
+    # Refine speed with syllable tempo if available
+    if praat_tempo is not None:
+        if   praat_tempo > 6.0: speed = max(0.85, speed - 0.02)
+        elif praat_tempo < 2.5: speed = min(1.05, speed + 0.05)
+        elif praat_tempo < 3.5: speed = min(1.00, speed + 0.02)
+        print(f"   [*] Tempo={praat_tempo:.2f}syl/s -> speed={speed}")
 
     # -- 9. XTTS params ----------------------------------------------------
     # Use Praat shimmer+jitter when available (more accurate than F0 jitter)
