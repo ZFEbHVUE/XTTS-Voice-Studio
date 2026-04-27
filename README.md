@@ -16,6 +16,7 @@ XTTS Voice Studio is a personal production suite for:
 - **Separating vocals** from instrumental tracks
 - **Applying pitch correction** to cloned voices
 - **Converting video files** to audio for further processing
+- **Validating XTTS parameters** empirically by generating and comparing multiple audio variations
 
 Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) or directly from the command line.
 
@@ -77,6 +78,7 @@ XTTS-Voice-Studio/
 │   ├── xtts_studio.py                      # Tkinter GUI (main entry point)
 │   ├── guided_meditation_generator_v23.py  # Meditation generator
 │   ├── voice_analyser.py                   # Acoustic analysis → XTTS params
+│   ├── voice_validator.py                  # Empirical parameter validation
 │   ├── extract_voices.py                   # Vocal separation
 │   ├── transcribeSong2txt_with_pause.py    # Audio transcription
 │   ├── video2txt.py                        # Video transcription
@@ -93,9 +95,65 @@ XTTS-Voice-Studio/
 
 ---
 
-## Guided Meditation Generator
+## GUI Tabs
 
-Produces long-form guided meditation audio files from a simple text script.
+### [Gen] Generator
+
+Generates guided meditation audio from a text script.
+
+- Per-voice rows with multi-reference browse (space-separated WAV files)
+- `+ Add voice` button — new rows appear above the button
+- MP3 output options (bitrate, CBR/VBR)
+- Ambient music and punctual sound cue inputs
+
+### [Ana] Analyser
+
+Analyses voice reference files and produces ready-to-paste XTTS parameter blocks.
+
+- Per-voice rows with multi-file browse (space-separated files averaged)
+- Per-voice F0 engine selector: `none` (fast YIN) / `auto` / `crepe` / `pyin`
+- Prec checkbox — when checked, shows F0 engine combobox; when unchecked, shows `none` label
+- FINAL SUMMARY — complete 14-value `{}` and 16-value `[]` blocks ready to paste
+
+### [Txt] Transcription
+
+Transcribes audio or video files to XTTS-ready text with pause markers.
+
+- faster-whisper backend (2–4× faster than openai-whisper)
+- Optional VAD pre-filter, pitch annotation, CUDA/CPU auto-detection
+- Separate Video and Audio file browsers
+
+### [Vox] Voice sep.
+
+Separates vocal stems from mixed audio.
+
+- demucs music removal (htdemucs, htdemucs_ft, mdx_extra)
+- Dereverberation: none / noisereduce / wpe / deepfilter
+- F0-based separation (female / male / overlap / vocals only)
+- Multi-format output (WAV/MP3/FLAC/OGG)
+
+### [Pit] Pitch
+
+Applies pitch correction to cloned voice audio.
+
+### [Vid] Video->Audio
+
+Extracts audio from any video file.
+
+- Output formats: WAV, MP3 (CBR/VBR), FLAC, OGG
+- Channels: stereo or mono
+- Sample rates: 16000, 22050, 44100, 48000 Hz
+- **XTTS preset** button: forces WAV + mono + 22050 Hz (optimal for XTTS references)
+
+### [Val] Validator
+
+Empirically validates XTTS parameters by generating multiple variations and combining them into a single audio file for A/B listening.
+
+See the [Validator](#validator) section below for full details.
+
+---
+
+## Guided Meditation Generator
 
 ### XTTS parameter block `{}` — 14 values (v23)
 
@@ -106,7 +164,7 @@ Produces long-form guided meditation audio files from a simple text script.
 | Pos | Parameter | Default | Description |
 |-----|-----------|---------|-------------|
 | 1 | `N` | — | Voice number |
-| 2 | `seed` | 0 | Random seed (0 = none) |
+| 2 | `seed` | 0 | Random seed (0 = none). **The seed interacts with the voice embedding — test several values per voice reference.** |
 | 3 | `trim_start` | 0 | Trim from start of generated audio (ms) |
 | 4 | `trim_end` | 0 | Trim from end (ms) |
 | 5 | `fade_in` | 100 | Fade-in (ms) |
@@ -116,11 +174,11 @@ Produces long-form guided meditation audio files from a simple text script.
 | 9 | `top_p` | 0.85 | GPT top-p |
 | 10 | `rep_pen` | 5.0 | Repetition penalty |
 | 11 | `len_pen` | 1.0 | Length penalty |
-| 12 | `gpt_cond_len` | 30 | Reference WAV seconds used for cloning (up to 60) |
+| 12 | `gpt_cond_len` | 30 | Reference WAV seconds used for cloning (up to 60). Set to actual WAV duration. |
 | 13 | `gpt_cond_chunk_len` | 4 | GPT conditioning chunk size |
 | 14 | `sound_norm_refs` | 0 | Normalise reference before cloning (0/1) |
 
-Fully backward-compatible — v20/v21/v22 scripts (9–13 values) run unchanged.
+Fully backward-compatible — v20/v21/v22 scripts run unchanged.
 
 ### Audio parameter block `[]` — 16 values (v23)
 
@@ -131,20 +189,20 @@ Fully backward-compatible — v20/v21/v22 scripts (9–13 values) run unchanged.
 | Pos | Parameter | Default | Description |
 |-----|-----------|---------|-------------|
 | 1 | `N` | — | Voice number |
-| 2 | `LANG` | FR | Language code (FR, EN, ES, DE, IT, PT...) |
-| 3 | `speed` | 1.0 | Rubberband speed factor |
+| 2 | `LANG` | FR | Language code (FR, EN, ES, DE, IT, PT, PL, TR, RU, NL, CS, AR, ZH-CN, HU, KO, JA, HI) |
+| 3 | `speed` | 1.0 | Rubberband speed factor (0.5–2.0) |
 | 4 | `vol` | 0 | Volume adjustment (dB) |
-| 5 | `eq_low` | -2 | Low EQ 80–300 Hz (dB) |
-| 6 | `eq_mid` | +3 | Mid EQ 300–3000 Hz (dB) |
-| 7 | `eq_high` | -4 | High EQ 3000–8000 Hz (dB) |
-| 8 | `hp` | 90 | Highpass filter (Hz) |
-| 9 | `lp` | 8000 | Lowpass filter (Hz) |
-| 10 | `NR` | 0.5 | Noise reduction strength (0–2) |
-| 11 | `comp` | 0.4 | Compression strength (0–1) |
-| 12 | `de-ess` | 0.3 | De-esser strength (0–1) |
-| 13 | `reverb` | 0 | Reverb wet level (0–1) |
-| 14 | `noise_gate` | 0 | Noise gate threshold (dB, 0=off, e.g. -40) |
-| 15 | `pan` | 0 | Stereo pan (-1.0 left / 0 centre / +1.0 right) |
+| 5 | `eq_low` | 0 | Low EQ 80–300 Hz (dB) |
+| 6 | `eq_mid` | 0 | Mid EQ 300–3000 Hz (dB) |
+| 7 | `eq_high` | 0 | High EQ 3000–8000 Hz (dB) |
+| 8 | `hp` | 0 | Highpass filter (Hz, 0=off) |
+| 9 | `lp` | 0 | Lowpass filter (Hz, 0=off) |
+| 10 | `NR` | 0 | Noise reduction strength (0=off, 0.5=moderate, 2=aggressive) |
+| 11 | `comp` | 0 | Compression strength (0=off, 0.5=moderate) |
+| 12 | `de-ess` | 0 | De-esser strength (0=off, 0.5=moderate) |
+| 13 | `reverb` | 0 | Reverb wet level (0=off, 0.3=subtle) |
+| 14 | `noise_gate` | 0 | Noise gate threshold (dB, 0=off, e.g. -40=gentle) |
+| 15 | `pan` | 0 | Stereo pan (-1.0=left, 0=centre, +1.0=right) |
 | 16 | `limiter` | 0 | Output limiter (0=off, 1=on) |
 
 Processing order: Trim → Filters → EQ → NR → De-esser → Compression → Noise gate → Reverb → Fades → Pan → Limiter
@@ -155,12 +213,12 @@ Short blocks inherit the last full config for that voice — only write what cha
 
 ```
 # First full config — memorised for voice 1
-[1, FR, 0.9, 6, -5, 1, -2, 75, 8000, 0.35, 0.5, 0.5, 0, 0, 0, 1]
+[1, FR, 0.9, 6, -5, 1, -2, 95, 8000, 0.35, 0.35, 0.5, 0, 0, 0, 1]
 Première phrase.
 [pause=2s]
 
-# Only speed and volume change — rest inherited
-[1, FR, 0.8, 3]
+# Only speed changes — rest inherited
+[1, FR, 0.8]
 Deuxième phrase.
 [pause=2s]
 
@@ -173,17 +231,17 @@ Config resets at the start of each generation run.
 
 ### Multi-reference voices
 
-Pass multiple reference WAV files per voice separated by spaces in the GUI. XTTS averages the speaker embeddings for a more robust clone.
-
-In the CLI, voice groups are separated by `--`:
+Pass multiple reference WAV files per voice in the GUI (space-separated). XTTS averages the speaker embeddings for a more robust clone. In the CLI, voice groups are separated by `--`:
 
 ```bash
 generator.py script.txt output.wav \
-    ref1.wav ref2.wav \
+    ref1.wav ref2.wav ref3.wav \
     -- \
     hollie.wav \
     --mp3-bitrate 192 --mp3-mode cbr
 ```
+
+**Using multiple references significantly improves cloning quality** — XTTS has more context to reconstruct the voice faithfully.
 
 ### Parallel voice overlay
 
@@ -217,7 +275,7 @@ Analyses one or more reference audio files and produces ready-to-paste `{N,...}`
 
 | Measurement | Tool | Derived parameter |
 |-------------|------|------------------|
-| F0 median, std, jitter | YIN / torchcrepe / pyin | Voice type, hp/lp, speed, len_pen |
+| F0 median, jitter | YIN / torchcrepe / pyin | Voice type, hp/lp, len_pen |
 | HNR | Praat | noise_reduction |
 | Shimmer APQ5 | Praat | compression |
 | Shimmer + jitter score | Praat | temperature, rep_pen |
@@ -227,42 +285,116 @@ Analyses one or more reference audio files and produces ready-to-paste `{N,...}`
 | Sibilance | librosa | de-esser |
 | Duration | — | gpt_cond_len |
 
-### Per-voice F0 engine selector
+### F0 engine selection
 
-Each voice row in the Analyser tab has an independent engine selector:
+Each voice row has its own F0 engine selector:
 
-```
-V [1] [ voice.wav titi.wav ] [Browse] [FR▼] Seed:[42] ☐ Prec [none]   [X]
-V [2] [ hollie.wav         ] [Browse] [FR▼] Seed:[0 ] ☑ Prec [pyin▼]  [X]
-```
-
-- **Prec unchecked** → fast YIN, `none` label shown (read-only)
+- **Prec unchecked** → fast YIN, `none` label (read-only)
 - **Prec checked** → precise mode, choose `auto / crepe / pyin`
 
-**Recommended by voice type:**
-- Bass/baritone → `pyin` (torchcrepe detects harmonics on low voices)
-- Soprano/high → `auto` or `crepe`
-- Meditation voice → `none` (fast, Praat does the real work)
+Recommended:
+- Bass/baritone voices → `pyin` (torchcrepe detects harmonics on low voices)
+- Soprano/high voices → `auto` or `crepe`
+- Meditation voices → `none` (fast, Praat does the real work)
 
 ### Multi-reference averaging
 
-When multiple files are passed for the same voice, each is analysed separately and all numeric parameters are averaged into a single representative `{}[]` block:
+When multiple files are passed for the same voice, each is analysed separately and all numeric parameters are averaged into a single `{}[]` block:
 
 ```bash
-# Analyse two references for voice 1, average the results
-voice_analyser.py --precise --f0-engine pyin --start-num 1 toto.wav titi.wav FR
+voice_analyser.py --precise --f0-engine pyin --start-num 1 ref1.wav ref2.wav ref3.wav FR
 ```
 
 ---
 
-## Video→Audio Tab
+## Validator
 
-Extracts audio from any video file:
+The Validator generates multiple audio variations with different parameter values, concatenates them into a single WAV file (each preceded by a spoken label), and lets you listen and choose the best value.
 
-- **Formats**: WAV, MP3 (CBR/VBR), FLAC, OGG
-- **Channels**: stereo or mono
-- **Sample rates**: 16000, 22050, 44100, 48000 Hz
-- **XTTS preset**: forces WAV + mono + 22050 Hz (optimal for XTTS reference files)
+### How to use
+
+1. Select your voice reference file(s)
+2. Choose language and fill mode (Default / Zero)
+3. Click **Fill** to auto-populate the XTTS and Audio blocks — or paste directly from voice_analyser
+4. Add one or more parameters to test with `+ Add parameter`
+5. When you select a parameter, the Values field auto-fills with the current value from the blocks
+6. Edit the values to test (space-separated)
+7. Click **Generate** → listen to the output WAV in the Player
+
+### Parameter types
+
+**XTTS params** (`seed`, `temp`, `top_k`, `top_p`, `rep_pen`, `len_pen`, `gpt_cond_len`):
+Each combination requires a full XTTS generation — slower but necessary since these change the GPT output.
+
+**Audio params** (`speed`, `vol`, `eq_low`, `eq_mid`, `eq_high`, `hp`, `lp`, `NR`, `comp`, `de-ess`, `reverb`, `noise_gate`, `pan`):
+XTTS generates **once**, then each filter value is applied in milliseconds. Very fast for audio calibration.
+
+### Cartesian product
+
+Add multiple parameters to test all combinations:
+
+```
+[ seed  ] [ 0  42  100  ]     → 3 values
+[ lp    ] [ 7000  9000  ]     → 2 values
+                               Total: 6 combinations
+```
+
+The validator generates all 6 combinations (seed=0/lp=7000, seed=0/lp=9000, seed=42/lp=7000, etc.)
+
+### Fill modes
+
+- **Default** → fills `{}` and `[]` with standard XTTS defaults
+- **Zero** → fills with zeros where valid (minimum values used where 0 would be invalid: temp=0.01, top_k=1, rep_pen=1.0, gpt_cond_len=6)
+
+### Important note on seed
+
+**The seed interacts with the voice embedding in an unpredictable way.** A seed that works perfectly for one voice reference may produce an accent or degraded quality with another. Always test several seeds (0, 7, 13, 42, 100, 200) for each new voice reference file. Use seed=0 for random generation.
+
+### CLI usage
+
+```bash
+# Test seeds
+python voice_validator.py Elo.wav Elo2.wav FR \
+    --param seed --values 0 7 13 42 100 \
+    --xtts-block "{1, 0, 0, 200, 100, 250, 0.72, 55, 0.88, 4.5, 1, 60, 4, 0}" \
+    --audio-block "[1, FR, 0.9, 6, -5, 1, -2, 95, 8000, 0.35, 0.35, 0.5, 0, 0, 0, 1]" \
+    --output validation_seed.wav
+
+# Test audio params (fast — single XTTS generation)
+python voice_validator.py Elo.wav FR \
+    --param hp --values 60 80 95 120 \
+    --param lp --values 7000 8000 9000 \
+    --output validation_hp_lp.wav
+```
+
+---
+
+## Voice Separation
+
+```bash
+extract_voices.py input.mp3 output.wav \
+    --keep "vocals only" \
+    --remove-music --demucs-model htdemucs_ft \
+    --dereverberate deepfilter \
+    --device cuda \
+    --silence auto --min-silence 0.3
+```
+
+| Option | Values | Description |
+|--------|--------|-------------|
+| `--keep` | `vocals only`, `female`, `male`, `all` | Stems to keep |
+| `--demucs-model` | `htdemucs`, `htdemucs_ft`, `mdx_extra` | Model (htdemucs_ft = best quality/VRAM balance) |
+| `--dereverberate` | `none`, `noisereduce`, `wpe`, `deepfilter` | Dereverberation |
+| `--device` | `cuda`, `cpu` | Processing device |
+
+**Dereverberation comparison:**
+
+| Engine | Speed | Quality | Notes |
+|--------|-------|---------|-------|
+| `none` | ★★★ | — | No processing |
+| `noisereduce` | ★★★ | ★★ | Good for static noise |
+| `wpe` | ★ | ★★ | Single-threaded, very slow |
+| `deepfilter` | ★★★ | ★★★ | GPU recommended |
 
 ---
 
@@ -278,9 +410,21 @@ Extracts audio from any video file:
 
 Use the **XTTS preset** button in the Video→Audio tab to extract reference audio in the correct format directly from a video.
 
+**Using multiple reference files** (2–3 clips of the same voice) significantly improves cloning quality — XTTS averages the embeddings for a more complete voice representation.
+
 ---
 
-## TTS Backend Comparison
+## Recommended workflow
+
+1. **Extract reference audio** → Video→Audio tab with XTTS preset (WAV, mono, 22050 Hz)
+2. **Clean the reference** → Vox tab with demucs + deepfilter if needed
+3. **Analyse the voice** → Analyser tab, add multiple reference files, choose `pyin` for low voices
+4. **Validate key parameters** → Validator tab, test `seed` first (most impactful), then audio params
+5. **Generate the meditation** → Generator tab, paste the validated `{}` and `[]` blocks
+
+---
+
+## TTS Backend Comparison (tested April 2026)
 
 | Model | French | Cloning | GPU | Verdict |
 |-------|--------|---------|-----|---------|
@@ -301,17 +445,20 @@ Launch the GUI with `conda activate xtts` first.
 **`CUDA out of memory` with demucs**
 Switch from `mdx_extra` to `htdemucs_ft` or use `--device cpu`.
 
-**torchcrepe returns F0=1900Hz or voiced=0% on bass/baritone voices**
-Use `pyin` engine instead — torchcrepe can detect harmonics rather than the fundamental on low voices.
+**Voice has an English accent or sounds wrong with a single reference**
+Try multiple reference files (2–3 clips). Also test different seeds with the Validator — seed=42 may produce poor results for some voices.
+
+**torchcrepe returns F0=1900Hz or voiced=0% on bass voices**
+Use `pyin` engine — torchcrepe can detect harmonics instead of the fundamental on low voices.
 
 **`[!] File not found: --mp3-bitrate`**
 You are running an old version of the generator. Replace with the latest `guided_meditation_generator_v23.py`.
 
 **WPE dereverberation is very slow**
-WPE is inherently single-threaded. Use `deepfilter` for GPU-accelerated dereverberation of similar quality.
+WPE is inherently single-threaded and sequential. Use `deepfilter` instead.
 
-**GUI opens in wrong directory on Browse**
-Make sure you launch `xtts_studio.py` from its own directory (or use the correct path). `XTTS_ROOT` is auto-detected from the script location.
+**GUI opens Browse in wrong directory**
+Launch `xtts_studio.py` with the correct path — `XTTS_ROOT` is auto-detected from the script location.
 
 ---
 

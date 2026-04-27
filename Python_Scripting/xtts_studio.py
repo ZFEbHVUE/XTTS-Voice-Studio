@@ -740,6 +740,8 @@ def tab_generator(nb):
     make_btn(f, ">  Run", lancer, 9)
 
 
+LANGS = ['FR','EN','ES','DE','IT','PT','PL','TR','RU','NL','CS','AR','ZH-CN','HU','KO','JA','HI']
+
 # ── Tab: Analyser ───────────────────────────────────────────────────────────
 
 def tab_analyser(nb):
@@ -748,7 +750,6 @@ def tab_analyser(nb):
     f.grid_columnconfigure(0, weight=1)
     f.grid_rowconfigure(2, weight=1)
 
-    LANGS = ['FR','EN','ES','DE','IT','PT','PL','TR','RU','NL','CS','AR','ZH-CN','HU','KO','JA','HI']
     voice_rows = []
 
     # Voice list frame
@@ -1263,6 +1264,248 @@ def tab_convert(nb):
     make_btn(f, ">  Convert", lancer, 4)
 
 
+
+# ── Tab: Validator ──────────────────────────────────────────────────────────
+
+def tab_validator(nb):
+    f = tk.Frame(nb)
+    nb.add(f, text="[Val] Validator")
+
+    v_val_voices  = tk.StringVar()
+    v_val_lang    = tk.StringVar(value='FR')
+    v_val_param   = tk.StringVar(value='seed')
+    v_val_values  = tk.StringVar(value='0 7 13 42 100 200')
+    v_val_text    = tk.StringVar(value="Bonjour, ceci est un test de validation de la voix.")
+    v_val_output  = tk.StringVar()
+    v_val_xtts    = tk.StringVar()   # {} block from voice_analyser
+    v_val_audio   = tk.StringVar()   # [] block from voice_analyser
+
+    row = 0
+    # Voice refs
+    tk.Label(f, text="Voice ref(s)", anchor='w', width=18).grid(row=row, column=0, sticky='w', padx=6, pady=3)
+    frm_v = tk.Frame(f); frm_v.grid(row=row, column=1, sticky='ew', padx=4)
+    f.grid_columnconfigure(1, weight=1)
+    frm_v.grid_columnconfigure(0, weight=1)
+    tk.Entry(frm_v, textvariable=v_val_voices).grid(row=0, column=0, sticky='ew')
+    def browse_val_voices():
+        files = filedialog.askopenfilenames(
+            filetypes=[("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")],
+            initialdir=DIR_VOICES)
+        if files:
+            existing = v_val_voices.get().strip()
+            new_files = " ".join(files)
+            v_val_voices.set((existing + " " + new_files).strip() if existing else new_files)
+    tk.Button(frm_v, text="Browse", width=8, command=browse_val_voices).grid(row=0, column=1, padx=2)
+
+    row += 1
+    tk.Label(f, text="Language", anchor='w', width=18).grid(row=row, column=0, sticky='w', padx=6, pady=3)
+    frm_lang = tk.Frame(f)
+    frm_lang.grid(row=row, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_lang, textvariable=v_val_lang, values=LANGS, width=8, state='readonly').pack(side='left')
+
+    v_fill_mode = tk.StringVar(value='default')
+    tk.Radiobutton(frm_lang, text="Default", variable=v_fill_mode, value='default').pack(side='left', padx=(10,2))
+    tk.Radiobutton(frm_lang, text="Zero",    variable=v_fill_mode, value='zero').pack(side='left', padx=2)
+
+    def _fill_blocks():
+        lang = v_val_lang.get()
+        mode = v_fill_mode.get()
+        if mode == 'default':
+            xtts_str  = "{1, 42, 0, 0, 100, 250, 0.72, 50, 0.85, 5.0, 1.0, 30, 4, 0}"
+            audio_str = f"[1, {lang}, 1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]"
+        else:  # zero
+            xtts_str  = "{1, 0, 0, 0, 0, 0, 0.01, 1, 0.01, 1.0, 1.0, 6, 4, 0}"
+            audio_str = f"[1, {lang}, 1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]"
+        v_val_xtts.set(xtts_str)
+        v_val_audio.set(audio_str)
+
+    tk.Button(frm_lang, text="Fill", width=5, command=_fill_blocks).pack(side='left', padx=6)
+
+    row += 1
+    tk.Label(f, text="XTTS params {}", anchor='w', width=18).grid(row=row, column=0, sticky='w', padx=6, pady=3)
+    tk.Label(f, text="{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs}",
+             fg='gray', font=('Arial',8)).grid(row=row, column=1, sticky='w', padx=4)
+    row += 1
+    tk.Entry(f, textvariable=v_val_xtts).grid(row=row, column=1, sticky='ew', padx=4)
+
+    row += 1
+    tk.Label(f, text="Audio params []", anchor='w', width=18).grid(row=row, column=0, sticky='w', padx=6, pady=3)
+    tk.Label(f, text="[N, LANG, speed, vol, eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess, reverb, noise_gate, pan, limiter]",
+             fg='gray', font=('Arial',8)).grid(row=row, column=1, sticky='w', padx=4)
+    row += 1
+    tk.Entry(f, textvariable=v_val_audio).grid(row=row, column=1, sticky='ew', padx=4)
+
+    ALL_PARAMS = ['seed','temp','top_k','top_p','rep_pen','len_pen','gpt_cond_len',
+                  'speed','vol','eq_low','eq_mid','eq_high','hp','lp','NR','comp','de-ess','reverb','noise_gate','pan']
+
+    row += 1
+    tk.Label(f, text="Parameters", anchor='w', width=18).grid(row=row, column=0, sticky='nw', padx=6, pady=3)
+    tk.Label(f, text="XTTS: seed temp top_k top_p rep_pen len_pen  |  Audio: speed vol eq_low eq_mid eq_high hp lp NR comp de-ess reverb noise_gate pan",
+             fg='gray', font=('Arial',8)).grid(row=row, column=1, sticky='w', padx=4)
+
+    # Dynamic param rows frame
+    params_frame = tk.Frame(f)
+    params_frame.grid(row=row, column=1, sticky='ew', padx=4, pady=(18,0))
+    params_frame.grid_columnconfigure(1, weight=1)
+    param_rows = []  # list of (StringVar_param, StringVar_values, Frame)
+
+    lbl_total = tk.Label(f, text="Total: 1 combination", fg='gray', font=('Arial',8))
+
+    VAL_DEFAULTS = {
+        'seed': 42, 'temp': 0.72, 'top_k': 50, 'top_p': 0.85,
+        'rep_pen': 5.0, 'len_pen': 1.0, 'gpt_cond_len': 30,
+        'speed': 1.0, 'vol': 0, 'eq_low': 0, 'eq_mid': 0, 'eq_high': 0,
+        'hp': 0, 'lp': 0, 'NR': 0, 'comp': 0, 'de-ess': 0,
+        'reverb': 0, 'noise_gate': 0, 'pan': 0,
+    }
+
+    def _parse_blocks():
+        import re as _re
+        params = VAL_DEFAULTS.copy()
+        xtts = v_val_xtts.get().strip()
+        audio = v_val_audio.get().strip()
+        if xtts:
+            try:
+                nums = [float(x) for x in _re.findall(r'[-+]?\d+(?:\.\d+)?', xtts)]
+                keys = ['seed','trim_start','trim_end','fade_in','fade_out',
+                        'temp','top_k','top_p','rep_pen','len_pen',
+                        'gpt_cond_len','gpt_cond_chunk_len','sound_norm_refs']
+                for i, k in enumerate(keys):
+                    if i+1 < len(nums): params[k] = nums[i+1]
+            except Exception: pass
+        if audio:
+            try:
+                all_nums = [float(x) for x in _re.findall(r'[-+]?\d+(?:\.\d+)?', audio)]
+                numeric_vals = all_nums[1:]  # skip N
+                keys = ['speed','vol','eq_low','eq_mid','eq_high',
+                        'hp','lp','NR','comp','de-ess','reverb','noise_gate','pan']
+                for i, k in enumerate(keys):
+                    if i < len(numeric_vals): params[k] = numeric_vals[i]
+            except Exception: pass
+        return params
+
+    def _update_total():
+        total = 1
+        for vp, vv, _ in param_rows:
+            vals = [x for x in vv.get().split() if x.strip()]
+            if vals:
+                total *= len(vals)
+        lbl_total.config(text=f"Total: {total} combination{'s' if total>1 else ''}")
+
+    def _refresh_comboboxes():
+        """Update each combobox to exclude params used in other rows."""
+        for entry in param_rows:
+            vp, vv, row_f = entry
+            current = vp.get()
+            used_elsewhere = [r[0].get() for r in param_rows if r is not entry]
+            available = [p for p in ALL_PARAMS if p not in used_elsewhere]
+            # Find the combobox widget in this row
+            for child in row_f.winfo_children():
+                if isinstance(child, ttk.Combobox):
+                    child['values'] = available
+                    break
+
+    def _add_param_row(param=None, values_str=None):
+        # Pick first unused param if none specified
+        if param is None:
+            used = [r[0].get() for r in param_rows]
+            available = [p for p in ALL_PARAMS if p not in used]
+            param = available[0] if available else ALL_PARAMS[0]
+
+        vp = tk.StringVar(value=param)
+        vv = tk.StringVar(value=values_str or '')
+
+        row_f = tk.Frame(params_frame)
+        row_f.pack(fill='x', pady=1, before=btn_add_p)
+        row_f.grid_columnconfigure(1, weight=1)
+
+        cb = ttk.Combobox(row_f, textvariable=vp, values=ALL_PARAMS, width=12, state='readonly')
+        cb.pack(side='left', padx=2)
+
+        entry = tk.Entry(row_f, textvariable=vv, width=30)
+        entry.pack(side='left', fill='x', expand=True, padx=4)
+        vv.trace_add('write', lambda *a: _update_total())
+
+        entry_tuple = (vp, vv, row_f)
+
+        def _on_select(event=None, _vp=vp, _vv=vv):
+            p = _vp.get()
+            params = _parse_blocks()
+            val = params.get(p, VAL_DEFAULTS.get(p, 0))
+            val_str = str(int(val)) if isinstance(val, float) and val == int(val) else str(val)
+            _vv.set(val_str)
+            _update_total()
+            _refresh_comboboxes()
+
+        cb.bind('<<ComboboxSelected>>', _on_select)
+
+        def remove(e=entry_tuple):
+            e[2].destroy()
+            param_rows.remove(e)
+            _update_total()
+            _refresh_comboboxes()
+
+        tk.Button(row_f, text="X", width=2, fg='red', command=remove).pack(side='left', padx=1)
+        param_rows.append(entry_tuple)
+        _update_total()
+        _refresh_comboboxes()
+
+    btn_add_p = tk.Button(params_frame, text="+ Add parameter", command=lambda: _add_param_row(),
+                          bg='#2d6a2d', fg='white')
+    btn_add_p.pack(anchor='w', pady=2)
+
+    _add_param_row(param='seed')
+
+    lbl_total.grid(row=row, column=2, sticky='w', padx=4)
+
+    row += 1
+    tk.Label(f, text="Text", anchor='w', width=18).grid(row=row, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_val_text).grid(row=row, column=1, sticky='ew', padx=4)
+
+    row += 1
+    tk.Label(f, text="Output (wav)", anchor='w', width=18).grid(row=row, column=0, sticky='w', padx=6, pady=3)
+    frm_o = tk.Frame(f); frm_o.grid(row=row, column=1, sticky='ew', padx=4)
+    frm_o.grid_columnconfigure(0, weight=1)
+    tk.Entry(frm_o, textvariable=v_val_output).grid(row=0, column=0, sticky='ew')
+    tk.Button(frm_o, text="Browse", width=8,
+        command=lambda: browse_file(v_val_output, [("WAV","*.wav")], save=True, initialdir=DIR_OUTPUT)
+    ).grid(row=0, column=1, padx=2)
+
+    row += 1
+    console = add_console(f, row)
+
+    def lancer(btn, stop_btn=None):
+        refs = [r for r in v_val_voices.get().split() if r.strip()]
+        if not refs:
+            log(console, "[ERR] At least one voice reference required."); return
+        output = v_val_output.get().strip()
+
+        # Collect param rows
+        valid_rows = [(vp.get(), vv.get().strip()) for vp, vv, _ in param_rows if vv.get().strip()]
+        if not valid_rows:
+            log(console, "[ERR] At least one parameter with values required."); return
+
+        if not output:
+            params_str = '_'.join(p for p, v in valid_rows)
+            output = os.path.join(DIR_OUTPUT, f"validation_{params_str}.wav")
+            v_val_output.set(output)
+
+        cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'voice_validator.py')]
+        cmd += refs
+        cmd += [v_val_lang.get()]
+        # Pass each param row as --param name --values v1 v2 v3
+        for param_name, values_str in valid_rows:
+            cmd += ['--param', param_name, '--values'] + values_str.split()
+        cmd += ['--text', v_val_text.get()]
+        cmd += ['--output', output]
+        if v_val_xtts.get().strip():
+            cmd += ['--xtts-block', v_val_xtts.get().strip()]
+        if v_val_audio.get().strip():
+            cmd += ['--audio-block', v_val_audio.get().strip()]
+        run_cmd(cmd, console, btn, stop_btn)
+
+    make_btn(f, ">  Generate", lancer, row + 1)
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -1307,6 +1550,7 @@ def main():
     tab_extract(nb)
     tab_pitch(nb)
     tab_convert(nb)
+    tab_validator(nb)
 
     def on_close():
         _stop_player()       # stop audio player if running

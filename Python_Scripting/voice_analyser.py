@@ -344,10 +344,17 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
             _snd2 = parselmouth.Sound(_y60.astype('float64'), sr)
             _pp2  = parselmouth.praat.call(_snd2, 'To PointProcess (periodic, cc)', 75, 600)
             _n_periods = parselmouth.praat.call(_pp2, 'Get number of periods', 0, 0, 0.0001, 0.02, 1.3)
-            _voiced_dur = _n_periods / max(f0_median, 80)  # voiced duration in seconds
-            if _voiced_dur > 0:
-                praat_tempo = _n_periods / _voiced_dur / 4  # ~4 pulses per syllable
-                print(f"   [*] Syllable rate: {praat_tempo:.2f} syl/s")
+            # Use actual voiced duration = total duration × voiced_ratio
+            _voiced_dur = min(60, duration) * max(voiced_ratio, 0.1)
+            if _voiced_dur > 0 and _n_periods > 0:
+                # ~4 glottal pulses per syllable on average for speech
+                _tempo = _n_periods / _voiced_dur / 4
+                # Sanity check: speech is 2-8 syl/s, reject outliers
+                if 1.5 <= _tempo <= 9.0:
+                    praat_tempo = _tempo
+                    print(f"   [*] Syllable rate: {praat_tempo:.2f} syl/s")
+                else:
+                    print(f"   [*] Syllable rate: {_tempo:.2f} syl/s (out of range, ignored)")
         except Exception:
             pass
 
@@ -685,7 +692,7 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
   ==================================================================
 
   # Voice {N} [{lang}]  {s['voice_type']}  {int(s['f0_median'])} Hz
-  # -- XTTS params  {{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen}}
+  # -- XTTS params  {{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs}}
   {{{xtts_str}}}
 
   # -- Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
