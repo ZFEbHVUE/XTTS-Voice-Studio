@@ -18,9 +18,9 @@ Usage:
   Supported: FR EN ES DE IT PT PL TR RU NL CS AR ZH-CN HU KO JA HI
 
 Examples:
-  python voice_analyser.py VivienneHD.wav FR
-  python voice_analyser.py Holly.wav EN John.wav EN
-  python voice_analyser.py --precise Rémy.wav FR
+  python voice_analyser.py VivienneHD_FR.wav FR
+  python voice_analyser.py HollyUK_EN.wav EN EthanUK_EN.wav EN
+  python voice_analyser.py --precise RemyHD_FR.wav FR
 
 Estimated duration (30s file, standard CPU):
   Default mode  : 3-10s  (yin algorithm)
