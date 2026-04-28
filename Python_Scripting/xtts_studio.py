@@ -1305,16 +1305,15 @@ def tab_validator(nb):
 
     v_fill_mode = tk.StringVar(value='default')
     tk.Radiobutton(frm_lang, text="Default", variable=v_fill_mode, value='default').pack(side='left', padx=(10,2))
-    tk.Radiobutton(frm_lang, text="Zero",    variable=v_fill_mode, value='zero').pack(side='left', padx=2)
+    tk.Radiobutton(frm_lang, text="Raw",     variable=v_fill_mode, value='raw').pack(side='left', padx=2)
 
     def _fill_blocks():
         lang = v_val_lang.get()
         mode = v_fill_mode.get()
+        xtts_str = "{1, 0, 0, 0, 100, 250, 0.72, 50, 0.85, 5.0, 1.0, 30, 4, 0}"
         if mode == 'default':
-            xtts_str  = "{1, 42, 0, 0, 100, 250, 0.72, 50, 0.85, 5.0, 1.0, 30, 4, 0}"
             audio_str = f"[1, {lang}, 1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]"
-        else:  # zero
-            xtts_str  = "{1, 0, 0, 0, 0, 0, 0.01, 1, 0.01, 1.0, 1.0, 6, 4, 0}"
+        else:  # raw — no audio processing
             audio_str = f"[1, {lang}, 1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]"
         v_val_xtts.set(xtts_str)
         v_val_audio.set(audio_str)
