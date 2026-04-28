@@ -11,16 +11,16 @@ Usage:
 
 Examples:
     # Test different seeds
-    python voice_validator.py voice1.wav FR --param seed --values 0 7 13 42 100 200
+    python voice_validator.py Elo3.wav FR --param seed --values 0 7 13 42 100 200
 
     # Test different temperatures
-    python voice_validator.py voice1.wav FR --param temp --values 0.5 0.65 0.72 0.85 1.0
+    python voice_validator.py Elo3.wav FR --param temp --values 0.5 0.65 0.72 0.85 1.0
 
     # Test different rep_pen values
-    python voice_validator.py voice1.wav FR --param rep_pen --values 3.0 4.5 6.0 8.0 10.0
+    python voice_validator.py Elo3.wav FR --param rep_pen --values 3.0 4.5 6.0 8.0 10.0
 
     # Test multiple refs (space-separated)
-    python voice_validator.py voice1.wav voice2.wav voice3.wav FR --param seed --values 0 7 42
+    python voice_validator.py Elo.wav Elo2.wav Elo3.wav FR --param seed --values 0 7 42
 """
 
 import argparse
@@ -199,26 +199,10 @@ def main():
         if param_key not in DEFAULT_PARAMS:
             print(f"[ERR] Unknown parameter '{p}'.")
             sys.exit(1)
-        param_value_pairs.append((param_key, [float(v) for v in vals]))
+        param_value_pairs.append((param_key, vals))  # store raw, resolve after base_params
 
     # Cartesian product of all param combinations
-    import itertools
-    all_combos = list(itertools.product(*[vals for _, vals in param_value_pairs]))
-    param_keys = [p for p, _ in param_value_pairs]
-
-    output_file = args.output or f"validation_{'_'.join(param_keys)}.wav"
-
-    print(f"\n{'='*60}")
-    print(f"  XTTS Voice Validator")
-    print(f"{'='*60}")
-    print(f"  Voice refs : {[os.path.basename(r) for r in voice_refs] if isinstance(voice_refs, list) else os.path.basename(voice_refs)}")
-    print(f"  Language   : {lang}")
-    for p, vals in param_value_pairs:
-        print(f"  {p:<12}: {vals}")
-    print(f"  Combinations: {len(all_combos)}")
-    print(f"  Text       : {args.text}")
-    print(f"  Output     : {output_file}")
-    print(f"{'='*60}\n")
+    output_file = args.output or f"validation_{'_'.join(p for p, _ in param_value_pairs)}.wav"
 
     # Parse XTTS {} block if provided
     base_params = DEFAULT_PARAMS.copy()
@@ -256,6 +240,26 @@ def main():
             print(f"[*] Audio block parsed: {len(nums)} values, lang={lang}")
         except Exception as e:
             print(f"[!] Could not parse audio block: {e}")
+
+    # Resolve _base sentinel and convert values to float
+    param_value_pairs = [(pk, [base_params.get(pk, DEFAULT_PARAMS.get(pk, 0))] if vals == ['_base']
+                          else [float(v) for v in vals])
+                         for pk, vals in param_value_pairs]
+    param_keys  = [p for p, _ in param_value_pairs]
+    import itertools
+    all_combos  = list(itertools.product(*[vals for _, vals in param_value_pairs]))
+
+    print(f"\n{'='*60}")
+    print(f"  XTTS Voice Validator")
+    print(f"{'='*60}")
+    print(f"  Voice refs : {[os.path.basename(r) for r in voice_refs] if isinstance(voice_refs, list) else os.path.basename(voice_refs)}")
+    print(f"  Language   : {lang}")
+    for p, vals in param_value_pairs:
+        print(f"  {p:<12}: {vals}")
+    print(f"  Combinations: {len(all_combos)}")
+    print(f"  Text       : {args.text}")
+    print(f"  Output     : {output_file}")
+    print(f"{'='*60}\n")
 
     # Show base params
     _bp_str = '  '.join(f'{p}={base_params.get(p, "N/A")}' for p in param_keys)

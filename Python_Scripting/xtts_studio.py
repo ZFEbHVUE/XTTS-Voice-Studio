@@ -1480,10 +1480,13 @@ def tab_validator(nb):
             log(console, "[ERR] At least one voice reference required."); return
         output = v_val_output.get().strip()
 
-        # Collect param rows
+        # Collect param rows — rows with empty values generate a single base variation
         valid_rows = [(vp.get(), vv.get().strip()) for vp, vv, _ in param_rows if vv.get().strip()]
         if not valid_rows:
-            log(console, "[ERR] At least one parameter with values required."); return
+            # No values specified — generate a single variation with base params
+            valid_rows = [(param_rows[0][0].get(), '_base')] if param_rows else []
+            if not valid_rows:
+                log(console, "[ERR] At least one parameter row required."); return
 
         if not output:
             params_str = '_'.join(p for p, v in valid_rows)
