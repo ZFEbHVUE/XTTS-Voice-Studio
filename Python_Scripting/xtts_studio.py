@@ -1516,7 +1516,7 @@ def main():
     root = tk.Tk()
     _root = root
     root.title("XTTS Voice Studio")
-    root.geometry("800x640")
+    root.geometry("800x780")
     root.resizable(True, True)
 
     style = ttk.Style()
