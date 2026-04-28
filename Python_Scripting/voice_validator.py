@@ -11,16 +11,16 @@ Usage:
 
 Examples:
     # Test different seeds
-    python voice_validator.py Elo3.wav FR --param seed --values 0 7 13 42 100 200
+    python voice_validator.py voice1.wav FR --param seed --values 0 7 13 42 100 200
 
     # Test different temperatures
-    python voice_validator.py Elo3.wav FR --param temp --values 0.5 0.65 0.72 0.85 1.0
+    python voice_validator.py voice1.wav FR --param temp --values 0.5 0.65 0.72 0.85 1.0
 
     # Test different rep_pen values
-    python voice_validator.py Elo3.wav FR --param rep_pen --values 3.0 4.5 6.0 8.0 10.0
+    python voice_validator.py voice1.wav FR --param rep_pen --values 3.0 4.5 6.0 8.0 10.0
 
     # Test multiple refs (space-separated)
-    python voice_validator.py Elo.wav Elo2.wav Elo3.wav FR --param seed --values 0 7 42
+    python voice_validator.py voice1.wav voice2.wav voice3.wav FR --param seed --values 0 7 42
 """
 
 import argparse
