@@ -108,7 +108,7 @@ def _pyin_worker(args):
     return f0c[:frames_main], vc[:frames_main]
 
 
-def analyse_voice(wav_file, fast=True, f0_engine="auto"):
+def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
     """
     Analyse an XTTS reference WAV file.
 
@@ -172,9 +172,11 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
         f0_raw      = f0_raw[:min_len]
         rms_f0      = rms_f0[:min_len]
         energy_gate = rms_f0 > (rms_f0.max() * 0.08)
+        # Correction: YIN energy gate includes some unvoiced consonants
+        # Apply additional frequency sanity check: typical speech F0 range 70-400Hz
         voiced_flag = (energy_gate &
-                       (f0_raw > librosa.note_to_hz('C2')) &
-                       (f0_raw < librosa.note_to_hz('C6')))
+                       (f0_raw > 70) &
+                       (f0_raw < 400))
         f0 = np.where(voiced_flag, f0_raw, np.nan)
     else:
         # F0 engine selection: auto / crepe / pyin
@@ -302,7 +304,7 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     praat_f1      = None
     praat_f2      = None
 
-    if _HAS_PARSELMOUTH:
+    if _HAS_PARSELMOUTH and use_praat:
         try:
             step("Praat analysis (HNR, shimmer, jitter)")
             _y60   = y[:int(min(60, duration) * sr)]  # max 60s
@@ -338,7 +340,7 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     # Estimate syllable rate from voiced pulse count / voiced duration
     # Used to derive speed parameter more accurately
     praat_tempo = None
-    if _HAS_PARSELMOUTH:
+    if _HAS_PARSELMOUTH and use_praat:
         try:
             _y60  = y[:int(min(60, duration) * sr)]
             _snd2 = parselmouth.Sound(_y60.astype('float64'), sr)
@@ -347,8 +349,8 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
             # Use actual voiced duration = total duration × voiced_ratio
             _voiced_dur = min(60, duration) * max(voiced_ratio, 0.1)
             if _voiced_dur > 0 and _n_periods > 0:
-                # ~4 glottal pulses per syllable on average for speech
-                _tempo = _n_periods / _voiced_dur / 4
+                # ~3.2 glottal pulses per syllable average for French speech
+                _tempo = _n_periods / _voiced_dur / 3.2
                 # Sanity check: speech is 2-8 syl/s, reject outliers
                 if 1.5 <= _tempo <= 9.0:
                     praat_tempo = _tempo
@@ -526,7 +528,8 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
 
     if praat_shimmer is not None and praat_jitter is not None:
         # Combined expressiveness score from Praat
-        expr_score = (praat_shimmer * 0.6) + (min(praat_jitter, 0.05) * 0.4 / 0.05)
+        # Jitter cap raised to 0.08 (5% was too restrictive for expressive voices)
+        expr_score = (praat_shimmer * 0.6) + (min(praat_jitter, 0.08) * 0.4 / 0.08)
         if   expr_score < 0.06:
             temperature, top_k, top_p = 0.55, 30, 0.75
             repetition_penalty        = 7.0
@@ -559,11 +562,11 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
             repetition_penalty        = 5.0
 
     # length_penalty: based on voiced_ratio (speech density)
-    # Dense speech (high voiced_ratio) -> slightly push the model toward longer output
-    # Sparse speech (lots of pauses)   -> neutral / slight shortening tendency
-    if   voiced_ratio > 0.65: length_penalty = 0.9   # fast / dense speaker
-    elif voiced_ratio > 0.45: length_penalty = 1.0   # neutral
-    else:                     length_penalty = 1.1   # slow / breathy speaker
+    # Dense speech (high voiced_ratio) -> model matches density -> neutral
+    # Sparse speech (slow speaker, many pauses) -> model tends to be shorter -> push up
+    if   voiced_ratio > 0.65: length_penalty = 1.0   # dense / fast speaker -> neutral
+    elif voiced_ratio > 0.45: length_penalty = 1.05  # moderate -> slight push
+    else:                     length_penalty = 1.1   # slow / breathy -> encourage length
 
     # gpt_cond_len: use as much of the reference WAV as available, up to 60s
     # Longer reference = better voice fidelity. Cap at 60s (XTTS limit).
@@ -578,7 +581,12 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
     # -- 10b. New audio params (v23) -----------------------------------------
     reverb     = 0.0    # user decides; 0=off by default
     # noise_gate: auto-suggest a gentle gate for noisy voices, else off
-    noise_gate = int(-50 + (noise_reduction * 10)) if snr < 28 else 0
+    # noise_gate: suggest a gate threshold based on SNR quality
+    # Only activate for noisy voices (snr < 28dB), scale -40 to -25dB range
+    if snr < 28:
+        noise_gate = int(np.clip(-45 + ((1.0 - noise_reduction) * 20), -40, -25))
+    else:
+        noise_gate = 0
     pan        = 0.0    # center by default
     limiter    = 1      # always on -- prevents clipping after all processing
 
@@ -647,7 +655,8 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto"):
 # Display results
 # -----------------------------------------------------------------------------
 
-def display_results(params, stats, voice_num=1, wav_file=None, language='FR', seed=0):
+def display_results(params, stats, voice_num=1, wav_file=None, language='FR', seed=0,
+                    fast=True, f0_engine='auto', use_praat=True):
     p    = params
     s    = stats
     N    = voice_num
@@ -688,10 +697,15 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
      Breathiness    : {s['breathiness']:.3f}  (spectral flatness -- 0=tonal, 1=noisy)
 """)
 
+    # Build analysis options string
+    _f0_mode = 'none' if fast else f0_engine
+    _analysis = f"{'Praat' if use_praat else 'Librosa'} + {_f0_mode}"
+
     print(f"""  [*] READY TO PASTE  (voice #{N} / {lang})
   ==================================================================
 
   # Voice {N} [{lang}]  {s['voice_type']}  {int(s['f0_median'])} Hz
+  # Analysis: {_analysis} | seed={seed}
   # -- XTTS params  {{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs}}
   {{{xtts_str}}}
 
@@ -720,6 +734,10 @@ def main():
     precise  = '--precise' in args
     args     = [a for a in args if a not in ('--precise', '--fast')]
     fast     = not precise
+
+    # --no-praat : disable Praat analysis, use librosa only
+    use_praat = '--no-praat' not in args
+    args      = [a for a in args if a != '--no-praat']
 
     # --f0-engine auto|crepe|pyin
     f0_engine = 'auto'
@@ -795,10 +813,11 @@ def main():
         try:
             if len(valid_wavs) == 1:
                 # Single reference — analyse normally
-                params, stats = analyse_voice(valid_wavs[0], fast=fast, f0_engine=f0_engine)
+                params, stats = analyse_voice(valid_wavs[0], fast=fast, f0_engine=f0_engine, use_praat=use_praat)
                 seed = get_seed(idx - start_num)
                 display_results(params, stats, voice_num=idx,
-                                wav_file=valid_wavs[0], language=lang, seed=seed)
+                                wav_file=valid_wavs[0], language=lang, seed=seed,
+                                fast=fast, f0_engine=f0_engine, use_praat=use_praat)
                 results.append((valid_wavs[0], lang, params, stats, seed))
             else:
                 # Multiple references — analyse each and average params
@@ -807,7 +826,7 @@ def main():
                 all_stats  = []
                 for wav_file in valid_wavs:
                     print(f"   [*] Analysing {os.path.basename(wav_file)}...")
-                    p, s = analyse_voice(wav_file, fast=fast, f0_engine=f0_engine)
+                    p, s = analyse_voice(wav_file, fast=fast, f0_engine=f0_engine, use_praat=use_praat)
                     all_params.append(p)
                     all_stats.append(s)
 
@@ -831,7 +850,8 @@ def main():
                 seed = get_seed(idx - start_num)
                 print(f"\n[*] Averaged parameters for voice #{idx} ({len(valid_wavs)} refs):")
                 display_results(avg_params, avg_stats, voice_num=idx,
-                                wav_file=valid_wavs[0], language=lang, seed=seed)
+                                wav_file=valid_wavs[0], language=lang, seed=seed,
+                                fast=fast, f0_engine=f0_engine, use_praat=use_praat)
                 results.append((valid_wavs[0], lang, avg_params, avg_stats, seed))
 
         except Exception as e:
@@ -841,21 +861,13 @@ def main():
 
     # Multi-voice summary
     if len(results) > 1:
+        _f0_mode = 'none' if fast else f0_engine
+        _analysis = f"{'Praat' if use_praat else 'Librosa'} + {_f0_mode}"
         print(f"\n{'='*62}")
         print(f"  [*] MULTI-VOICE SUMMARY -- ready to paste")
+        print(f"  [*] Analysis: {_analysis}")
         print(f"{'='*62}")
         for idx, (wav, lang, p, s, seed) in enumerate(results, start_num):
-            xtts_arr = [idx, seed,
-                        p['trim_start'], p['trim_end'],
-                        p['fade_in'], p['fade_out'],
-                        p['temperature'], p['top_k'], p['top_p'],
-                        p['repetition_penalty'], p['length_penalty']]
-            xtts_str  = ', '.join(fmt(v) for v in xtts_arr)
-            audio_vals = [p['speed'], p['volume'],
-                          p['eq_low'], p['eq_mid'], p['eq_high'],
-                          p['highpass'], p['lowpass'],
-                          p['noise_reduction'], p['compression'], p['deesser'],
-                          p['reverb'], p['noise_gate'], p['pan'], p['limiter']]
             xtts_arr_full = [idx, seed,
                         p['trim_start'], p['trim_end'],
                         p['fade_in'], p['fade_out'],
@@ -863,8 +875,14 @@ def main():
                         p['repetition_penalty'], p['length_penalty'],
                         p['gpt_cond_len'], p['gpt_cond_chunk_len'], p['sound_norm_refs']]
             xtts_str_full = ', '.join(fmt(v) for v in xtts_arr_full)
+            audio_vals = [p['speed'], p['volume'],
+                          p['eq_low'], p['eq_mid'], p['eq_high'],
+                          p['highpass'], p['lowpass'],
+                          p['noise_reduction'], p['compression'], p['deesser'],
+                          p['reverb'], p['noise_gate'], p['pan'], p['limiter']]
             audio_str = f"{idx}, {lang}, " + ', '.join(fmt(v) for v in audio_vals)
             print(f"\n  # Voice {idx} [{lang}]  {s['voice_type']:<22} {s['f0_median']:.0f} Hz")
+            print(f"  # Analysis: {_analysis} | seed={seed}")
             print(f"  {{{xtts_str_full}}}")
             print(f"  [{audio_str}]")
         print()

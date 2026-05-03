@@ -211,7 +211,7 @@ def _make_readonly(widget):
             pass
     widget.bind('<ButtonRelease-1>', on_select)
 
-def run_cmd(cmd, console, btn, stop_btn=None):
+def run_cmd(cmd, console, btn, stop_btn=None, line_callback=None):
     import time as _t, re as _re
     proc_holder = [None]
     timer_on = [False]
@@ -238,7 +238,8 @@ def run_cmd(cmd, console, btn, stop_btn=None):
             env['PYTHONUNBUFFERED'] = '1'
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env)
+                text=True, bufsize=1, env=env,
+                start_new_session=False)  # keep in same session for killpg
             proc_holder[0] = proc
             for line in proc.stdout:
                 txt = line.rstrip()
@@ -254,7 +255,10 @@ def run_cmd(cmd, console, btn, stop_btn=None):
                     # Strip the marker from the line; if nothing else remains,
                     # don't print an empty line.
                     txt = _rf.sub(r'\[PROGRESS=\d+/\d+\]', '', txt).strip()
-                if txt: log(console, txt)
+                if txt:
+                    log(console, txt)
+                    if line_callback:
+                        _root.after(0, lambda t=txt: line_callback(t))
             proc.wait()
             if proc.returncode == 0:   log(console, "\n[OK] Done.")
             elif proc.returncode==-15: log(console, "\n[STOP] Stopped.")
@@ -763,8 +767,9 @@ def tab_analyser(nb):
         v_lang    = tk.StringVar(value='FR')
         v_num     = tk.IntVar(value=num)
         v_seed    = tk.IntVar(value=0)
-        v_precise = tk.BooleanVar(value=False)
-        v_f0      = tk.StringVar(value='auto')
+        v_precise  = tk.BooleanVar(value=False)
+        v_f0       = tk.StringVar(value='auto')
+        v_analysis = tk.StringVar(value='Praat')
 
         row_f = tk.Frame(voices_frame)
         row_f.pack(fill='x', padx=4, pady=2)
@@ -798,7 +803,12 @@ def tab_analyser(nb):
         lbl_none = tk.Label(row_f, text='none', relief='sunken',
                             bg='#d9d9d9', fg='#888')
 
-        entry = (v_path, v_lang, v_num, v_seed, v_precise, row_f, v_f0)
+        cb_analysis = ttk.Combobox(row_f, textvariable=v_analysis,
+                                   values=['Praat', 'Librosa'],
+                                   width=7, state='readonly')
+        cb_analysis.pack(side='left', padx=2)
+
+        entry = (v_path, v_lang, v_num, v_seed, v_precise, row_f, v_f0, v_analysis)
 
         def remove(e=entry):
             e[5].destroy()
@@ -829,25 +839,25 @@ def tab_analyser(nb):
     tk.Button(ctrl_frame, text="+ Add voice",
         command=lambda: add_voice_row(),
         bg='#444', fg='white', width=14).pack(side='left', padx=4)
-    tk.Label(ctrl_frame, text="Prec = precise mode  |  F0: auto/crepe/pyin per voice",
+    tk.Label(ctrl_frame, text="Prec = precise mode  |  F0: auto/crepe/pyin  |  Analysis: Praat / Librosa",
              fg='gray', font=('Arial',8)).pack(side='left', padx=6)
 
     console = add_console(f, 2)
 
     def lancer(btn, stop_btn=None):
-        valids = [(vp.get(), vl.get(), vn.get(), vs.get(), vpr.get(), vf0.get())
-                  for vp, vl, vn, vs, vpr, _, vf0 in voice_rows if vp.get().strip()]
+        valids = [(vp.get(), vl.get(), vn.get(), vs.get(), vpr.get(), vf0.get(), van.get())
+                  for vp, vl, vn, vs, vpr, _, vf0, van in voice_rows if vp.get().strip()]
         if not valids:
             log(console, "[ERR] Add at least one voice."); return
 
-        # One call per voice (individual precise mode)
-        
         cmds = []
-        for vpath, vlang, vnum, vseed, vprec, vf0eng in valids:
+        for vpath, vlang, vnum, vseed, vprec, vf0eng, vanalysis in valids:
             cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'voice_analyser.py')]
             if vprec:
                 cmd.append('--precise')
                 cmd += ['--f0-engine', vf0eng]
+            if vanalysis == 'Librosa':
+                cmd.append('--no-praat')
             cmd += ['--start-num', str(vnum)]
             if vseed != 0:
                 cmd += ['--seed', str(vseed)]
@@ -1013,112 +1023,169 @@ def tab_extract(nb):
     nb.add(f, text="[Vox] Voice sep.")
     f.grid_columnconfigure(1, weight=1)
 
-    v_input   = tk.StringVar()
-    v_output  = tk.StringVar()
-    v_keep    = tk.StringVar(value='female')
-    v_silence = tk.StringVar(value='auto')
-    v_thr     = tk.StringVar(value='165')
-    v_deverb  = tk.StringVar(value='none')
-    v_debug   = tk.BooleanVar(value=False)
-
-    add_row(f, "Audio source",   v_input,  0, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_VOICES)
-    add_row(f, "Output (wav/mp3)", v_output, 1, [("WAV","*.wav"),("MP3","*.mp3"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")], save=True, initialdir=DIR_OUTPUT)
-
-    tk.Label(f, text="Keep", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
-    ttk.Combobox(f, textvariable=v_keep, width=14, state='readonly',
-        values=['female','male','overlap','all','female,male','vocals only']
-    ).grid(row=2, column=1, sticky='w', padx=4)
-
-    tk.Label(f, text="Silence (s/auto/0)", anchor='w', width=20).grid(row=3, column=0, sticky='w', padx=6, pady=3)
-    tk.Entry(f, textvariable=v_silence, width=8).grid(row=3, column=1, sticky='w', padx=4)
-
-    tk.Label(f, text="F0 threshold (Hz)", anchor='w', width=20).grid(row=4, column=0, sticky='w', padx=6, pady=3)
-    tk.Entry(f, textvariable=v_thr, width=8).grid(row=4, column=1, sticky='w', padx=4)
-
-    v_ovrange   = tk.StringVar(value='200')
+    v_input      = tk.StringVar()
+    v_output     = tk.StringVar()
+    v_keep       = tk.StringVar(value='female')
+    v_silence    = tk.StringVar(value='auto')
+    v_thr        = tk.StringVar(value='165')
+    v_deverb     = tk.StringVar(value='none')
+    v_debug      = tk.BooleanVar(value=False)
+    v_split      = tk.BooleanVar(value=False)
+    v_ovrange    = tk.StringVar(value='200')
     v_minsilence = tk.StringVar(value='0.30')
-    tk.Label(f, text="Overlap range (Hz)", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
-    tk.Entry(f, textvariable=v_ovrange, width=8).grid(row=5, column=1, sticky='w', padx=4)
-
-    tk.Label(f, text="Min silence (s)", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
-    tk.Entry(f, textvariable=v_minsilence, width=8).grid(row=6, column=1, sticky='w', padx=4)
-
-    tk.Label(f, text="Dereverberation", anchor='w', width=20).grid(row=7, column=0, sticky='w', padx=6, pady=3)
-    ttk.Combobox(f, textvariable=v_deverb, width=14, state='readonly',
-        values=['none','noisereduce','wpe','deepfilter']
-    ).grid(row=7, column=1, sticky='w', padx=4)
-
-    tk.Checkbutton(f, text="Debug mode", variable=v_debug).grid(
-        row=8, column=1, sticky='w', padx=4, pady=3)
-
+    v_mindur     = tk.StringVar(value='0.2')
     v_remove_music = tk.BooleanVar(value=False)
     v_demucs_model = tk.StringVar(value='htdemucs_ft')
     v_mp3_bitrate  = tk.StringVar(value='192')
     v_mp3_mode     = tk.StringVar(value='cbr')
+    v_method       = tk.StringVar(value='f0')
 
-    # ── Device selector (default: auto-detect) ───────────────────────────
+    # row 0 : source
+    add_row(f, "Audio/Video source", v_input, 0,
+            [("Audio/Video","*.wav *.mp3 *.flac *.ogg *.mp4 *.mkv *.avi *.mov *.webm *.m4a"),("All","*.*")],
+            initialdir=DIR_VOICES)
+    # row 1 : output
+    add_row(f, "Output (wav/mp3)", v_output, 1,
+            [("WAV","*.wav"),("MP3","*.mp3"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")],
+            save=True, initialdir=DIR_OUTPUT)
+
+    # row 2 : Keep + Split
+    tk.Label(f, text="Keep", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
+    frm_keep = tk.Frame(f)
+    frm_keep.grid(row=2, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_keep, textvariable=v_keep, width=14, state='readonly',
+        values=['female','male','overlap','all','female,male','vocals only']).pack(side='left')
+    tk.Checkbutton(frm_keep, text="Split F+M  (genere _female + _male)",
+                   variable=v_split).pack(side='left', padx=10)
+
+    # row 3 : Silence
+    tk.Label(f, text="Silence (s/auto/0)", anchor='w', width=20).grid(row=3, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_silence, width=8).grid(row=3, column=1, sticky='w', padx=4)
+
+    # row 4 : F0 threshold
+    tk.Label(f, text="F0 threshold (Hz)", anchor='w', width=20).grid(row=4, column=0, sticky='w', padx=6, pady=3)
+    frm_thr = tk.Frame(f)
+    frm_thr.grid(row=4, column=1, sticky='w', padx=4)
+    tk.Entry(frm_thr, textvariable=v_thr, width=8).pack(side='left')
+    tk.Label(frm_thr, text="  (femme >= seuil, homme < seuil)", fg='grey').pack(side='left')
+
+    # row 5 : Overlap range
+    tk.Label(f, text="Overlap range (Hz)", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
+    frm_ov = tk.Frame(f)
+    frm_ov.grid(row=5, column=1, sticky='w', padx=4)
+    tk.Entry(frm_ov, textvariable=v_ovrange, width=8).pack(side='left')
+    tk.Label(frm_ov, text="  (augmenter si voix H classees overlap)", fg='grey').pack(side='left')
+
+    # row 6 : Min silence
+    tk.Label(f, text="Min silence (s)", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_minsilence, width=8).grid(row=6, column=1, sticky='w', padx=4)
+
+    # row 7 : Min dur segment
+    tk.Label(f, text="Min dur segment (s)", anchor='w', width=20).grid(row=7, column=0, sticky='w', padx=6, pady=3)
+    frm_mindur = tk.Frame(f)
+    frm_mindur.grid(row=7, column=1, sticky='w', padx=4)
+    tk.Entry(frm_mindur, textvariable=v_mindur, width=8).pack(side='left')
+    tk.Label(frm_mindur, text="  (0.5-1.0 pour ignorer les bribes)", fg='grey').pack(side='left')
+
+    # row 8 : Dereverberation
+    tk.Label(f, text="Dereverberation", anchor='w', width=20).grid(row=8, column=0, sticky='w', padx=6, pady=3)
+    ttk.Combobox(f, textvariable=v_deverb, width=14, state='readonly',
+        values=['none','noisereduce','wpe','deepfilter']).grid(row=8, column=1, sticky='w', padx=4)
+
+    # row 9 : Debug
+    frm_checks = tk.Frame(f)
+    frm_checks.grid(row=9, column=0, columnspan=3, sticky='w', padx=6, pady=2)
+    tk.Checkbutton(frm_checks, text="Debug mode", variable=v_debug).pack(side='left', padx=6)
+
+    # row 10 : Device
     try:
         import torch as _torch_vox
         _vox_default = "cuda" if _torch_vox.cuda.is_available() else "cpu"
     except Exception:
         _vox_default = "cpu"
     v_vox_device = tk.StringVar(value=_vox_default)
-    tk.Label(f, text="Device", anchor='w', width=20).grid(row=9, column=0, sticky='w', padx=6, pady=3)
+    tk.Label(f, text="Device", anchor='w', width=20).grid(row=10, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_vox_device, width=8, state='readonly',
-        values=['cpu', 'cuda']).grid(row=9, column=1, sticky='w', padx=4)
+        values=['cpu', 'cuda']).grid(row=10, column=1, sticky='w', padx=4)
 
+    # row 11 : Remove music
     def on_remove_music_toggle(*args):
         if v_remove_music.get():
             v_keep.set('vocals only')
         else:
             if v_keep.get() == 'vocals only':
                 v_keep.set('female')
-
     v_remove_music.trace_add('write', on_remove_music_toggle)
 
     tk.Checkbutton(f, text="Remove background music (demucs)",
-                   variable=v_remove_music).grid(
-        row=10, column=0, columnspan=2, sticky='w', padx=6, pady=2)
+                   variable=v_remove_music).grid(row=11, column=0, columnspan=2, sticky='w', padx=6, pady=2)
 
-    tk.Label(f, text="Demucs model", anchor='w', width=20).grid(
-        row=11, column=0, sticky='w', padx=6, pady=3)
+    # row 12 : Demucs model
+    tk.Label(f, text="Demucs model", anchor='w', width=20).grid(row=12, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_demucs_model, width=16, state='readonly',
-        values=['htdemucs', 'htdemucs_ft', 'mdx_extra']
-    ).grid(row=11, column=1, sticky='w', padx=4)
+        values=['htdemucs', 'htdemucs_ft', 'mdx_extra']).grid(row=12, column=1, sticky='w', padx=4)
 
-    # ── MP3 output options ───────────────────────────────────────────────
-    tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=12, column=0, sticky='w', padx=6, pady=3)
+    # row 13 : MP3 bitrate
+    tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=13, column=0, sticky='w', padx=6, pady=3)
     frm_mp3 = tk.Frame(f)
-    frm_mp3.grid(row=12, column=1, sticky='w', padx=4)
+    frm_mp3.grid(row=13, column=1, sticky='w', padx=4)
     ttk.Combobox(frm_mp3, textvariable=v_mp3_bitrate, width=6, state='readonly',
         values=['128','160','192','256','320']).pack(side='left')
     ttk.Combobox(frm_mp3, textvariable=v_mp3_mode, width=5, state='readonly',
         values=['cbr','vbr']).pack(side='left', padx=6)
     tk.Label(frm_mp3, text="(only used if output is .mp3)", fg='grey').pack(side='left')
 
-    console = add_console(f, 14)
+    # row 14 : Methode
+    tk.Label(f, text="Methode", anchor='w', width=20).grid(row=14, column=0, sticky='w', padx=6, pady=3)
+    frm_method = tk.Frame(f)
+    frm_method.grid(row=14, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_method, textvariable=v_method, width=12, state='readonly',
+        values=['f0', 'sepformer', 'pyannote']).pack(side='left')
+    tk.Label(frm_method,
+             text="  f0=rapide  |  sepformer=separation reelle  |  pyannote=diarisation",
+             fg='grey').pack(side='left')
 
-    def lancer(btn, stop_btn=None):
-        if not v_input.get() or not v_output.get():
-            log(console, "[ERR] Source and output required."); return
+    # row 15 : console
+    console = add_console(f, 15)
+
+    def _build_cmd(with_output=True):
         cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'extract_voices.py'),
-               v_input.get(), v_output.get(),
-               '--keep', v_keep.get(),
-               '--silence', v_silence.get(),
-               '--threshold', v_thr.get(),
-               '--overlap-range', v_ovrange.get(),
-               '--min-silence', v_minsilence.get(),
-               '--dereverberate', v_deverb.get()]
+               v_input.get()]
+        if with_output:
+            cmd.append(v_output.get())
+        cmd += ['--keep',          v_keep.get(),
+                '--silence',       v_silence.get(),
+                '--threshold',     v_thr.get(),
+                '--overlap-range', v_ovrange.get(),
+                '--min-silence',   v_minsilence.get(),
+                '--min-dur',       v_mindur.get(),
+                '--dereverberate', v_deverb.get(),
+                '--method',        v_method.get()]
         if v_debug.get():
             cmd.append('--debug')
         cmd += ['--device', v_vox_device.get()]
         cmd += ['--mp3-bitrate', v_mp3_bitrate.get(), '--mp3-mode', v_mp3_mode.get()]
         if v_remove_music.get():
             cmd += ['--remove-music', '--demucs-model', v_demucs_model.get()]
+        return cmd
 
+    def lancer(btn, stop_btn=None):
+        if not v_input.get() or not v_output.get():
+            log(console, "[ERR] Source and output required."); return
+        cmd = _build_cmd(with_output=True)
+        if v_split.get():
+            cmd.append('--split-output')
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Separate", lancer, 13)
+    def analyser(btn, stop_btn=None):
+        if not v_input.get():
+            log(console, "[ERR] Source required."); return
+        cmd = _build_cmd(with_output=False) + ['--analyze']
+        run_cmd(cmd, console, btn, stop_btn)
+
+    btn_sep, stop_sep = make_btn(f, ">  Separate", lancer,   16)
+    btn_ana, stop_ana = make_btn(f, "[?] Analyze", analyser, 17)
+    btn_ana.config(bg='#7d5a2d')
 
 
 # ── Tab: Pitch ──────────────────────────────────────────────────────────────
@@ -1310,10 +1377,12 @@ def tab_validator(nb):
     def _fill_blocks():
         lang = v_val_lang.get()
         mode = v_fill_mode.get()
-        xtts_str = "{1, 0, 0, 0, 100, 250, 0.72, 50, 0.85, 5.0, 1.0, 30, 4, 0}"
         if mode == 'default':
-            audio_str = f"[1, {lang}, 1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]"
-        else:  # raw — no audio processing
+            # Generator defaults
+            xtts_str  = "{1, 0, 0, 0, 100, 250, 0.65, 50, 0.85, 5.0, 1.0, 30, 4, 0}"
+            audio_str = f"[1, {lang}, 0.9, 3, -2, 3, -4, 90, 8000, 0.5, 0.4, 0.3, 0, 0, 0, 0]"
+        else:  # raw — native XTTS defaults, no audio processing
+            xtts_str  = "{1, 0, 0, 0, 0, 0, 0.75, 50, 0.85, 10.0, 1.0, 30, 4, 0}"
             audio_str = f"[1, {lang}, 1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]"
         v_val_xtts.set(xtts_str)
         v_val_audio.set(audio_str)
@@ -1508,6 +1577,145 @@ def tab_validator(nb):
 
     make_btn(f, ">  Generate", lancer, row + 1)
 
+
+# ── Tab: Comparator ──────────────────────────────────────────────────────────
+
+def tab_comparator(nb):
+    f = tk.Frame(nb)
+    nb.add(f, text="[Cmp] Comparator")
+    f.grid_columnconfigure(1, weight=1)
+
+    v_cmp_ref      = tk.StringVar()
+    v_cmp_lang     = tk.StringVar(value='FR')
+    v_cmp_xtts     = tk.StringVar()
+    v_cmp_audio    = tk.StringVar()
+    v_cmp_text     = tk.StringVar(value="Bonjour, voici un court test de comparaison de voix.")
+    v_cmp_output   = tk.StringVar()
+    v_cmp_opt_out  = tk.StringVar()
+
+    row = 0
+    # Reference file — used for both comparison AND XTTS cloning
+    tk.Label(f, text="Reference voice", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)
+    tk.Label(f, text="used for comparison AND as XTTS voice reference",
+             fg="gray", font=("Arial",8)).grid(row=row, column=1, sticky="w", padx=4)
+    row += 1
+    frm_r = tk.Frame(f); frm_r.grid(row=row, column=1, sticky="ew", padx=4)
+    frm_r.grid_columnconfigure(0, weight=1)
+    tk.Entry(frm_r, textvariable=v_cmp_ref).grid(row=0, column=0, sticky="ew")
+    tk.Button(frm_r, text="Browse", width=8,
+        command=lambda: browse_file(v_cmp_ref, [("Audio","*.wav *.mp3 *.flac"),("All","*.*")], initialdir=DIR_VOICES)
+    ).grid(row=0, column=1, padx=2)
+
+    row += 1
+    tk.Label(f, text="Language", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)
+    ttk.Combobox(f, textvariable=v_cmp_lang, values=LANGS, width=8, state="readonly").grid(row=row, column=1, sticky="w", padx=4)
+
+    row += 1
+    tk.Label(f, text="XTTS params {}", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)
+    tk.Label(f, text="{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs}",
+             fg="gray", font=("Arial",8)).grid(row=row, column=1, sticky="w", padx=4)
+    row += 1
+    tk.Entry(f, textvariable=v_cmp_xtts).grid(row=row, column=1, sticky="ew", padx=4)
+
+    row += 1
+    tk.Label(f, text="Audio params []", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)
+    tk.Label(f, text="[N, LANG, speed, vol, eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess, reverb, noise_gate, pan, limiter]",
+             fg="gray", font=("Arial",8)).grid(row=row, column=1, sticky="w", padx=4)
+    row += 1
+    tk.Entry(f, textvariable=v_cmp_audio).grid(row=row, column=1, sticky="ew", padx=4)
+
+    row += 1
+    tk.Label(f, text="Test text", anchor="w", width=18).grid(row=row, column=0, sticky="nw", padx=6, pady=3)
+    tk.Label(f, text="supports [pause=1s] syntax", fg="gray", font=("Arial",8)).grid(row=row, column=1, sticky="w", padx=4)
+    row += 1
+    cmp_editor_frame = tk.Frame(f)
+    cmp_editor_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=6, pady=2)
+    cmp_editor_frame.grid_columnconfigure(0, weight=1)
+    cmp_editor = scrolledtext.ScrolledText(cmp_editor_frame, height=5, font=("Courier", 9), wrap="word", undo=True)
+    cmp_editor.pack(fill="both", expand=True)
+    cmp_editor.insert("1.0", "Bonjour, voici un court test de comparaison de voix.\n[pause=1s]\nLa voix doit être naturelle et fluide.")
+
+    row += 1
+    tk.Label(f, text="Clone output", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)
+    frm_o = tk.Frame(f); frm_o.grid(row=row, column=1, sticky="ew", padx=4)
+    frm_o.grid_columnconfigure(0, weight=1)
+    tk.Entry(frm_o, textvariable=v_cmp_output).grid(row=0, column=0, sticky="ew")
+    tk.Button(frm_o, text="Browse", width=8,
+        command=lambda: browse_file(v_cmp_output, [("WAV","*.wav")], save=True, initialdir=DIR_OUTPUT)
+    ).grid(row=0, column=1, padx=2)
+
+    row += 1
+    tk.Label(f, text="Optimised output", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)
+    frm_p = tk.Frame(f); frm_p.grid(row=row, column=1, sticky="ew", padx=4)
+    frm_p.grid_columnconfigure(0, weight=1)
+    tk.Entry(frm_p, textvariable=v_cmp_opt_out).grid(row=0, column=0, sticky="ew")
+    tk.Button(frm_p, text="Browse", width=8,
+        command=lambda: browse_file(v_cmp_opt_out, [("WAV","*.wav")], save=True, initialdir=DIR_OUTPUT)
+    ).grid(row=0, column=1, padx=2)
+
+    row += 1
+    frm_iter = tk.Frame(f)
+    frm_iter.grid(row=row, column=0, columnspan=2, sticky='w', padx=6, pady=4)
+    tk.Label(frm_iter, text="Iterations", width=10, anchor='w').pack(side='left')
+    v_cmp_iter = tk.StringVar(value='1')
+    tk.Spinbox(frm_iter, from_=1, to=20, textvariable=v_cmp_iter, width=4).pack(side='left', padx=4)
+    tk.Label(frm_iter, text="  Stop if score Δ <", anchor='w').pack(side='left', padx=(12,2))
+    v_cmp_conv = tk.StringVar(value='0.5')
+    tk.Entry(frm_iter, textvariable=v_cmp_conv, width=5).pack(side='left')
+    tk.Label(frm_iter, text="or [] unchanged", fg='gray', font=('Arial',8)).pack(side='left', padx=6)
+
+    row += 1
+    console = add_console(f, row)
+
+    def lancer(btn, stop_btn=None):
+        ref = v_cmp_ref.get().strip()
+        if not ref:
+            log(console, "[ERR] Reference voice file required."); return
+        if not v_cmp_xtts.get().strip() or not v_cmp_audio.get().strip():
+            log(console, "[ERR] XTTS and Audio blocks required."); return
+
+        output = v_cmp_output.get().strip() or os.path.join(DIR_OUTPUT, "comparator_clone.wav")
+        opt_output = v_cmp_opt_out.get().strip() or os.path.join(DIR_OUTPUT, "comparator_optimised.wav")
+        v_cmp_output.set(output)
+        v_cmp_opt_out.set(opt_output)
+
+        refs = ref.split()
+        n_iter = int(v_cmp_iter.get() or 1)
+        conv_thr = float(v_cmp_conv.get() or 0.5)
+
+        # Write text to temp file
+        import tempfile as _tf
+        _tfile = _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+        _tfile.write(cmp_editor.get("1.0", "end-1c"))
+        _tfile.close()
+
+        def build_cmd(audio_block_str, out_clone, out_opt, max_iter, conv):
+            cmd = [sys.executable, os.path.join(SCRIPTS_DIR, "voice_comparator.py")]
+            cmd += [ref]
+            cmd += refs
+            cmd += [v_cmp_lang.get()]
+            cmd += ["--xtts-block", v_cmp_xtts.get().strip()]
+            cmd += ["--audio-block", audio_block_str]
+            cmd += ["--text-file", _tfile.name]
+            cmd += ["--output", out_clone]
+            cmd += ["--output-optimised", out_opt]
+            cmd += ["--iterations", str(max_iter)]
+            cmd += ["--conv-threshold", str(conv)]
+            return cmd
+
+        def _on_line(txt):
+            # Update Audio params [] field when Next [] is detected
+            if 'Next []' in txt and '[1,' in txt:
+                # Extract the data block [1, FR, ...] — last [ in the line
+                idx = txt.rfind('[1,')
+                if idx >= 0:
+                    v_cmp_audio.set(txt[idx:])
+
+        cmd = build_cmd(v_cmp_audio.get().strip(), output, opt_output, n_iter, conv_thr)
+        run_cmd(cmd, console, btn, stop_btn, line_callback=_on_line)
+
+    make_btn(f, ">  Compare & Optimise", lancer, row + 1)
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -1553,6 +1761,7 @@ def main():
     tab_pitch(nb)
     tab_convert(nb)
     tab_validator(nb)
+    tab_comparator(nb)
 
     def on_close():
         _stop_player()       # stop audio player if running
