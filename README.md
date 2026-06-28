@@ -80,10 +80,14 @@ XTTS-Voice-Studio/
 │   ├── xtts_studio.py                      # Tkinter GUI (main entry point)
 │   ├── guided_meditation_generator_v23.py  # Meditation generator
 │   ├── voice_analyser.py                   # Acoustic analysis → XTTS params
-│   ├── voice_validator.py                  # Empirical parameter validation
-│   ├── voice_comparator.py                 # Identity (ECAPA) + LS EQ optimisation
+│   ├── voice_validator.py                  # Param sweep + accent/identity scoring
+│   ├── voice_comparator.py                 # Closed-loop EQ/vol fit (LTAS, least squares)
 │   ├── speaker_identity.py                 # ECAPA-TDNN speaker embedding / cosine
+│   ├── pron_score.py                       # French accent scoring via faster-whisper
 │   ├── ltas_match.py                       # LTAS least-squares EQ fit (exact RBJ responses)
+│   ├── xtts_clone.py                        # Low-level XTTS gen honouring all cloning knobs
+│   ├── xtts_optimize.py                     # Coordinate-descent search of sampling params
+│   ├── curate_reference.py                  # Curate a clean reference by ECAPA coherence
 │   ├── extract_voices.py                   # Vocal separation by gender
 │   ├── transcribeSong2txt_with_pause.py    # Audio transcription
 │   └── video2txt.py                        # Video transcription
@@ -141,21 +145,22 @@ Extracts audio from any video file with format, channel and sample rate options.
 
 ### [Val] Validator
 
-Empirically validates XTTS parameters by generating multiple variations and combining them into a single audio file for A/B listening.
+Sweeps XTTS/audio parameters, generates a variation per value for A/B listening, and **scores** each variation to rank them and produce the winning `{}` block.
 
 - Multi-parameter rows with dynamic combobox filtering (used params excluded from other rows)
 - Cartesian product of all parameter combinations
 - Auto-fill Values field from XTTS/Audio blocks when selecting a parameter
 - **Default** / **Raw** fill buttons
 - Single XTTS generation for audio params (fast), N generations for XTTS params
+- **Scoring** (when a `{}` param is swept): accent (faster-whisper → `french`/WER) + identity (ECAPA cosine vs reference) per variant, a ranked table, and the best `{}` to paste into the Comparator. `--no-score` to disable.
 
 ### [Cmp] Comparator
 
-Optimises a clone in two principled stages instead of spectral-band heuristics.
+Takes a **frozen** `{}` block (seed/temp chosen in the Validator) and fits only the post-processing tone, in a closed loop against the reference.
 
-- **Stage 1 — identity (seed search):** generates the clone for several seeds and keeps the one whose **ECAPA-TDNN** speaker embedding is closest (cosine) to the reference. Text-independent — this is what "same voice" actually measures. Automates the manual seed hunt.
-- **Stage 2 — tone (least squares):** fits the generator's exact 3-band peaking EQ + volume so the clone's long-term average spectrum (LTAS) matches the reference, by bounded least squares on the real RBJ filter responses.
-- Reports an identity cosine per seed and the in-band LTAS residual (dB) before/after.
+- Generates the clone once on the reference text, then iteratively fits the generator's exact 3-band peaking EQ + volume so the clone's long-term average spectrum (LTAS) matches the reference (bounded least squares on the real RBJ responses).
+- Each pass renders the full chain (hp/lp/NR/comp/limiter), re-measures, and adds the LS correction — closing the loop on the post-chain colouring.
+- No seed search, no accent/identity scoring (that is the Validator's job).
 - `[]` Audio params field updates automatically with the fitted block.
 
 ---
@@ -184,6 +189,21 @@ Optimises a clone in two principled stages instead of spectral-band heuristics.
 | 12 | `gpt_cond_len` | 30 | Reference WAV seconds used for cloning (up to 60) |
 | 13 | `gpt_cond_chunk_len` | 4 | GPT conditioning chunk size |
 | 14 | `sound_norm_refs` | 0 | Normalise reference before cloning (0/1) |
+
+> **⚠ Important — XTTS cloning knobs and `tts_to_file`.** In TTS 0.22.0, the
+> high-level `tts_to_file()` path (`Xtts.synthesize`) **overrides**
+> `gpt_cond_len`, `gpt_cond_chunk_len`, `max_ref_len` and `sound_norm_refs` with
+> the `XttsConfig` defaults (**12 / 4 / 10 / False**) *after* applying your
+> kwargs — so passing them has no effect, and `max_ref_len` is never exposed.
+> The speaker embedding therefore only ever uses the first **10 s** of reference
+> and the GPT conditioning only **12 s**, however much clean reference you give.
+>
+> To make them bite, generate via the low-level path (`get_conditioning_latents`
+> + `inference`) — implemented in **`xtts_clone.py`**. The **Comparator already
+> uses it** (and exposes `--max-ref-len`, default 30 s). The Generator still goes
+> through `tts_to_file`; until it is switched over (set the four values on
+> `model.config` before generating, or use `xtts_clone`), its final renders use
+> the crippled 12 s / 10 s conditioning regardless of the `{}` block.
 
 ### Audio parameter block `[]` — 16 values
 
@@ -287,93 +307,122 @@ priors (the `{}` block + safe `hp`/`lp`); the Comparator owns the tonal match.
 
 ## Validator
 
-Generates multiple audio variations with different parameter values, concatenates them with spoken labels, and lets you listen and choose.
+Sweeps parameters, generates one variation per value (concatenated with spoken
+labels for A/B listening), and **scores** each variation so you can pick — and
+hand off — the winning `{}` block objectively, not just by ear.
 
 ### Workflow
 
-1. Paste `{}` and `[]` blocks from voice_analyser (or use Default/Raw fill)
+1. Paste `{}` and `[]` blocks from the Analyser (or use Default/Raw fill)
 2. Select a parameter — Values field auto-fills with the current value
 3. Edit values around the current value to test
 4. Add more parameters with `+ Add parameter` — cartesian product is generated
-5. Listen to the output WAV — each variation is preceded by a spoken label
+5. Listen to the output WAV (each variation has a spoken label) **and** read the ranked score table
+6. Paste the printed winning `{}` block into the Comparator
 
-### Parameter types
+### Scoring (the upgrade)
 
-- **Audio params** (`hp`, `lp`, `eq_*`, `NR`, `comp`...) → single XTTS generation + N filter applications (fast)
-- **XTTS params** (`seed`, `temp`, `rep_pen`...) → N separate XTTS generations (slower)
+When a generation (`{}`) param is swept, each variant is scored on two axes —
+the same signals used to judge a clone:
+
+- **Accent / pronunciation** — faster-whisper transcription → a `french` score in [0,1] from the detected language (heard as English → heavy penalty), `avg_logprob` (low = mispronounced), and WER vs the known text. This is the axis that catches the foreign-accent problem.
+- **Identity / timbre** — ECAPA-TDNN cosine vs the reference.
+
+The variants are ranked (`--prioritise accent` by default; `identity` or
+`balanced` available), and the best `{}` block is printed ready to paste. Audio-
+only sweeps (`eq_*`, `hp`…) are not scored — every variant is the same clone.
+
+> The scores are ASR/embedding proxies, not calibrated meters — keep your ear as
+> the final judge. But they *move* with accent and timbre, so they rank reliably.
 
 ### Important note on seed
 
-The seed interacts with the voice embedding unpredictably. A seed that works perfectly for one reference may produce accent degradation with another. Always test several seeds (0, 7, 13, 42, 100, 200) for each voice. Use seed=0 for random generation.
+The seed interacts with the voice embedding unpredictably. A seed that works for
+one reference can degrade the accent on another. Sweep several (0, 7, 13, 42, 100,
+200) and let the `french` score rank them. `seed=0` = random.
+
+### Generation path
+
+The Validator generates via `xtts_clone.py`, so swept cloning knobs
+(`gpt_cond_len`, `max_ref_len`, `sound_norm_refs`) actually take effect — and the
+winning `{}` is produced under the same conditioning the Comparator will use.
+`--max-ref-len` (default 30 s) controls the speaker-embedding reference length.
 
 ---
 
 ## Comparator
 
-Optimises a clone in two principled stages. Post-processing can only colour the
-tone of a clone — it cannot change *who* the clone sounds like. So identity and
-tone are handled separately, with the right tool for each.
+Takes a **frozen** `{}` block (seed, temp, rep_pen… already chosen in the
+Validator) and fits only the post-processing tone, in a closed loop against the
+reference. Post-processing can colour the tone but cannot change *who* the clone
+sounds like — that was decided upstream — so the Comparator does one thing well.
 
-### Stage 1 — identity (seed search via ECAPA-TDNN)
+### How it works
 
-The voice identity (timbre, accent) is decided by XTTS at generation time, set by
-the interaction between the reference embedding and the seed. The comparator
-generates the clone for each candidate seed and scores it against the reference
-with **ECAPA-TDNN speaker-verification cosine similarity** (SpeechBrain
-`spkrec-ecapa-voxceleb`). This metric is text-independent — it answers "same
-speaker?" regardless of what was said. The best seed is kept automatically,
-replacing the manual `0 7 13 42 100 200` hunt.
+1. Generates the clone **once** on the reference text (via `xtts_clone.py`, honouring the cloning knobs).
+2. Renders the full post chain (hp/lp/NR/comp/limiter) with the current `[]`.
+3. Measures the rendered clone's LTAS (dB, log-frequency) against the reference.
+4. Fits the generator's **exact** 3-band peaking EQ (FFmpeg `equalizer` RBJ responses: low f0=200/BW=200, mid 1500/2000, high 5000/3000) + volume by bounded least squares (`scipy.optimize.least_squares`, ±6 dB, speech-band weighted), `hp`/`lp` from the LTAS roll-off.
+5. Adds the correction and repeats (`--iterations`, default 3) until the largest change falls below `--conv-threshold` dB (default 0.5) — closing the loop on the post-chain colouring, not just the raw clone.
 
-| Cosine | Interpretation |
-|--------|----------------|
-| > 0.75 | same speaker |
-| 0.55–0.75 | close |
-| < 0.55 | different — reference likely too short/noisy, or wrong language |
-
-ECAPA runs on CPU by default (a few short clips score in ~1 s) so all VRAM stays
-with XTTS — relevant on 4 GB cards.
-
-### Stage 2 — tone (least-squares LTAS EQ fit)
-
-On the winning clone, the generator's exact 3-band peaking EQ + volume are fit by
-**bounded least squares** so the clone's long-term average spectrum (LTAS)
-matches the reference:
-
-1. Compute the LTAS (dB, log-frequency) of reference and clone, peak-normalised (shape only — level handled separately by `vol` from the RMS gap).
-2. Target correction `D(f) = LTAS_ref(f) − LTAS_clone(f)`.
-3. Model the EQ as the **exact** FFmpeg `equalizer` RBJ peaking responses (low f0=200/BW=200, mid f0=1500/BW=2000, high f0=5000/BW=3000) plus a nuisance offset.
-4. Solve `min ‖EQ(g) − D‖²` over the 80 Hz–8 kHz speech band with gains bounded to ±6 dB (`scipy.optimize.least_squares`, perceptually weighted).
-5. `hp`/`lp` derived from the LTAS roll-off at the extremes.
-
-Because the modelled responses are the real filters the generator applies, the
-fit corrects the actual EQ rather than an approximation. The reported residual is
-the weighted in-band RMS error (dB) before vs after — a meaningful, homogeneous
-number, unlike the old composite score that summed dB + Hz + percentages.
-
-### Why this matters
-
-The old comparator iteratively nudged EQ to match spectral-band *percentages* of
-two **different** utterances (reference text ≠ clone text), so it chased phonetic
-differences, not voice differences — and its score mixed incommensurable units.
-It could never improve identity because EQ is post-processing. The rework targets
-identity directly (ECAPA) and solves tone as a well-posed least-squares problem.
+Level (`vol`) comes from the RMS gap; EQ shape from the LS fit on peak-normalised
+LTAS. The reported residual is the weighted in-band RMS error (dB) before vs after
+— a homogeneous, meaningful number.
 
 ### Tips
 
-- For the sharpest tonal match, generate the clone on the **reference's own transcript** (`--text-file`) so the LTAS compares like-for-like phonetics. Over 20–60 s of speech the LTAS still approximates the speaker envelope on arbitrary text, but matched text is cleaner.
-- The `{}` XTTS params other than `seed` (temp, rep_pen…) are not searched here — use the Validator for those, or the Analyser for sensible priors.
-- More / cleaner reference audio raises the achievable cosine more than any post-processing.
+- For the sharpest tonal match, run on the **reference's own transcript** (`--text-file`) so the LTAS compares like-for-like phonetics.
+- `eq_*` and `vol` in the input `[]` are overwritten by the fit; `NR`/`comp`/`de-ess`/`hp`/`lp` are kept from the block (Analyser priors).
+- The `{}` is never modified — fix seed/temp in the Validator first.
 
 ---
 
-## Recommended Workflow
+## Advanced — input curation & sampling search
 
-1. **Extract reference audio** → Video→Audio tab with XTTS preset (WAV, mono, 22050 Hz)
+Two optional tools that go beyond per-parameter tuning. Both reuse the same
+scorers (ECAPA identity, faster-whisper accent) — no new dependencies.
+
+### Reference curation (`curate_reference.py`)
+
+Optimises the **input** to cloning rather than the seed. It windows the
+reference, embeds each window with ECAPA, builds a robust (outlier-trimmed)
+centroid, scores each window's coherence, and concatenates the most consistent
+windows (up to a target duration) into a clean reference — dropping breaths,
+reverberant tails, noise, or a stray second voice that would dilute the speaker
+embedding.
+
+```bash
+python curate_reference.py raw_ref.wav -o curated.wav --keep-seconds 45
+```
+
+Feed `curated.wav` to the Validator / Comparator / Generator.
+
+### Sampling optimiser (`xtts_optimize.py`)
+
+The automated form of the Validator. The sampling knobs (`temp`, `top_k`,
+`top_p`, `rep_pen`) don't describe the speaker, so they can't be predicted from
+the reference — they must be searched against an observable objective. This runs
+a coordinate-descent search maximising `w_accent·french + w_identity·identity`,
+~15–25 generations, deterministic per seed.
+
+```bash
+python xtts_optimize.py curated.wav FR --xtts-block "{1, 42, ...}" \
+    --seeds "0 42 100" --budget 25 --w-accent 0.6 --w-identity 0.4
+```
+
+It prints a ranked table and the winning `{}` block to paste into the Comparator.
+Use it instead of hand-sweeping in the Validator when you want the optimum rather
+than an A/B listen.
+
+---
+
+## Recommended Workflow1. **Extract reference audio** → Video→Audio tab with XTTS preset (WAV, mono, 22050 Hz)
 2. **Clean if needed** → Vox tab with demucs + deepfilter
-3. **Analyse** → Analyser tab, Praat mode, multiple reference files (gives `{}`/`[]` priors)
-4. **Find best seed + tone** → Comparator tab: ECAPA seed search picks the identity-best seed and least-squares fits the EQ in one run
-5. **Validate other XTTS params** → Validator tab, test `temp`, `rep_pen` if needed
-6. **Generate** → Generator tab with the final `{}` and `[]` blocks
+3. **Curate the reference** (optional) → `curate_reference.py` to keep only the most coherent segments
+4. **Analyse** → Analyser tab, Praat mode, multiple reference files (gives `{}`/`[]` priors)
+5. **Find best seed + params** → Validator tab (manual A/B + scores) **or** `xtts_optimize.py` (automated search) → winning `{}` block
+6. **Fit the tone** → Comparator tab: paste the frozen `{}`; closed-loop `eq`/`vol`/`hp`/`lp` by least squares
+7. **Generate** → Generator tab with the final `{}` and `[]` blocks
 
 ---
 
@@ -405,7 +454,12 @@ Using **multiple reference files** (2–3 clips) significantly improves cloning 
 ## Troubleshooting
 
 **Voice sounds like a Canadian/English accent on French text**
-Test different seeds with the Validator. A single reference file may also be insufficient — use 2–3 reference files and average them.
+This is the seed × reference interaction. Run the **Validator** sweeping `seed` —
+it scores each variant for French pronunciation (faster-whisper) and ranks them,
+so you pick a clean-accent seed (`--prioritise accent`, the default). If even the
+best seed is accented, the reference is the limit: use 2–3 cleaner reference
+files, widen the seed list, or lower `temp`. Timbre matching (ECAPA / the
+Comparator's EQ) will NOT fix accent.
 
 **torchcrepe returns aberrant F0 on bass voices**
 Use `pyin` engine — torchcrepe can detect harmonics instead of the fundamental on low voices.
