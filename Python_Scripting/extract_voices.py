@@ -148,8 +148,36 @@ def remove_music_demucs(input_file, demucs_model='htdemucs_ft', device='cpu'):
 
 # ── Audio save ───────────────────────────────────────────────────────────────
 
+_TEMPO = 1.0   # global time-stretch factor (pitch preserved); set from --tempo
+
+
+def _time_stretch(y, sr, rate):
+    """Time-stretch preserving pitch/timbre. rate>1 faster, rate<1 slower."""
+    if rate is None or rate <= 0 or abs(rate - 1.0) < 1e-3:
+        return y
+    y = np.asarray(y)
+    try:
+        import pyrubberband as prb
+        if y.ndim == 1:
+            return prb.time_stretch(y, sr, rate)
+        chans = [prb.time_stretch(np.ascontiguousarray(y[:, c]), sr, rate)
+                 for c in range(y.shape[1])]
+        n = min(len(c) for c in chans)
+        return np.stack([c[:n] for c in chans], axis=1)
+    except Exception:
+        import librosa
+        if y.ndim == 1:
+            return librosa.effects.time_stretch(y.astype(np.float32), rate=rate)
+        chans = [librosa.effects.time_stretch(np.ascontiguousarray(y[:, c]).astype(np.float32), rate=rate)
+                 for c in range(y.shape[1])]
+        n = min(len(c) for c in chans)
+        return np.stack([c[:n] for c in chans], axis=1)
+
+
 def save_audio(y, sr, output_file, mp3_bitrate=192, mp3_mode='cbr'):
     """Save numpy array to file. Format auto-detected from extension."""
+    if _TEMPO and abs(_TEMPO - 1.0) > 1e-3:
+        y = _time_stretch(y, sr, _TEMPO)
     ext = os.path.splitext(output_file)[1].lower()
 
     if ext == '.wav':
@@ -1133,7 +1161,14 @@ if __name__ == "__main__":
     p.add_argument("--remove-music", action="store_true")
     p.add_argument("--demucs-model", default="htdemucs_ft",
                    choices=["htdemucs", "htdemucs_ft", "mdx_extra"])
+    p.add_argument("--tempo", type=float, default=1.0,
+                   help="Time-stretch factor, pitch preserved (e.g. 0.85 slower, "
+                        "1.25 faster; 1.0 = unchanged)")
     args = p.parse_args()
+
+    _TEMPO = float(args.tempo)
+    if abs(_TEMPO - 1.0) > 1e-3:
+        print(f"[*] Tempo ×{_TEMPO} (pitch preserved) will be applied to outputs.")
 
     # Validate output requirement
     if not args.analyze and args.output is None:

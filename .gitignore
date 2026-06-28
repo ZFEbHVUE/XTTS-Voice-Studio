@@ -1,0 +1,6 @@
+*_old.py
+XTTS-Voice-Studio/
+__pycache__/
+*.pyc
+Output_Song_files/
+Voices_Cloning/*.wav

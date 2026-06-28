@@ -15,6 +15,21 @@ import os
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _root = None
 
+# ── Cross-tab hand-off ───────────────────────────────────────────────────────
+# HANDOFF holds the latest result blocks captured from a tool's stdout; TARGETS
+# maps names to the destination StringVars (registered by each tab as it builds).
+# A hand-off button copies HANDOFF -> the target field, so results flow
+# Analyser -> Validator -> Comparator without copy/paste.
+HANDOFF = {'xtts': '', 'audio': '', 'win_xtts': ''}
+TARGETS = {}
+
+def _handoff_set(target_name, value):
+    sv = TARGETS.get(target_name)
+    if sv is not None and value:
+        sv.set(value.strip())
+        return True
+    return False
+
 
 # Default directories
 
@@ -907,6 +922,10 @@ def tab_analyser(nb):
                             block = [s]
                         elif block and (s.startswith('{') or s.startswith('[')):
                             block.append(s)
+                            if s.startswith('{'):
+                                HANDOFF['xtts'] = s
+                            elif s.startswith('[1'):
+                                HANDOFF['audio'] = s
                     if block:
                         summary_lines.append('\n'.join(block))
 
@@ -945,6 +964,23 @@ def tab_analyser(nb):
         threading.Thread(target=_run_all, daemon=True).start()
 
     make_btn(f, "> Analyse", lancer, 3)
+
+    # Hand-off: push the analysed {} / [] into the Validator or Comparator fields
+    frm_ho = tk.Frame(f)
+    frm_ho.grid(row=4, column=0, columnspan=2, sticky='w', padx=6, pady=(0, 4))
+    tk.Label(frm_ho, text="Send result →", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
+    def _to_validator():
+        ok = _handoff_set('val_xtts', HANDOFF['xtts']) | _handoff_set('val_audio', HANDOFF['audio'])
+        log(console, "[→] Sent {}/[] to Validator" if ok else "[!] Run the analysis first.")
+    def _to_comparator():
+        ok = _handoff_set('cmp_xtts', HANDOFF['xtts']) | _handoff_set('cmp_audio', HANDOFF['audio'])
+        log(console, "[→] Sent {}/[] to Comparator" if ok else "[!] Run the analysis first.")
+    tk.Button(frm_ho, text="→ Validator", command=_to_validator).pack(side='left', padx=2)
+    def _to_optimize():
+        ok = _handoff_set('opt_xtts', HANDOFF['xtts'])
+        log(console, "[→] Sent {} to Optimiser" if ok else "[!] Run the analysis first.")
+    tk.Button(frm_ho, text="→ Optimise", command=_to_optimize).pack(side='left', padx=2)
+    tk.Button(frm_ho, text="→ Comparator", command=_to_comparator).pack(side='left', padx=2)
 
 
 # ── Tab: Transcription ──────────────────────────────────────────────────────
@@ -1108,6 +1144,11 @@ def tab_extract(nb):
     ttk.Combobox(f, textvariable=v_vox_device, width=8, state='readonly',
         values=['cpu', 'cuda']).grid(row=10, column=1, sticky='w', padx=4)
 
+    v_vox_tempo = tk.StringVar(value='1.0')
+    tk.Label(f, text="Tempo × (pitch kept)", anchor='w', width=20).grid(row=15, column=0, sticky='w', padx=6, pady=3)
+    ttk.Combobox(f, textvariable=v_vox_tempo, width=8,
+        values=['0.70','0.80','0.85','0.90','1.0','1.10','1.25','1.5']).grid(row=15, column=1, sticky='w', padx=4)
+
     # row 11 : Remove music
     def on_remove_music_toggle(*args):
         if v_remove_music.get():
@@ -1146,7 +1187,7 @@ def tab_extract(nb):
              fg='grey').pack(side='left')
 
     # row 15 : console
-    console = add_console(f, 15)
+    console = add_console(f, 16)
 
     def _build_cmd(with_output=True):
         cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'extract_voices.py'),
@@ -1164,6 +1205,8 @@ def tab_extract(nb):
         if v_debug.get():
             cmd.append('--debug')
         cmd += ['--device', v_vox_device.get()]
+        if v_vox_tempo.get().strip() not in ('', '1.0', '1'):
+            cmd += ['--tempo', v_vox_tempo.get().strip()]
         cmd += ['--mp3-bitrate', v_mp3_bitrate.get(), '--mp3-mode', v_mp3_mode.get()]
         if v_remove_music.get():
             cmd += ['--remove-music', '--demucs-model', v_demucs_model.get()]
@@ -1183,8 +1226,8 @@ def tab_extract(nb):
         cmd = _build_cmd(with_output=False) + ['--analyze']
         run_cmd(cmd, console, btn, stop_btn)
 
-    btn_sep, stop_sep = make_btn(f, ">  Separate", lancer,   16)
-    btn_ana, stop_ana = make_btn(f, "[?] Analyze", analyser, 17)
+    btn_sep, stop_sep = make_btn(f, ">  Separate", lancer,   17)
+    btn_ana, stop_ana = make_btn(f, "[?] Analyze", analyser, 18)
     btn_ana.config(bg='#7d5a2d')
 
 
@@ -1266,6 +1309,7 @@ def tab_convert(nb):
     v_vid_mp3_mode    = tk.StringVar(value='cbr')
     v_vid_channels    = tk.StringVar(value='stereo')
     v_vid_samplerate  = tk.StringVar(value='44100')
+    v_vid_tempo       = tk.StringVar(value='1.0')
 
     # Row 2: MP3 bitrate
     tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
@@ -1299,7 +1343,15 @@ def tab_convert(nb):
     tk.Button(frm_vid_audio, text="XTTS preset", bg='#1a6b9e', fg='white',
               command=_xtts_preset).pack(side='left', padx=10)
 
-    console = add_console(f, 5)
+    # Row 4: Tempo (pitch preserved) on its own line
+    tk.Label(f, text="Tempo ×", anchor='w', width=20).grid(row=4, column=0, sticky='w', padx=6, pady=3)
+    frm_vid_tempo = tk.Frame(f)
+    frm_vid_tempo.grid(row=4, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_vid_tempo, textvariable=v_vid_tempo, width=6,
+        values=['0.70','0.80','0.85','0.90','1.0','1.10','1.25','1.5']).pack(side='left')
+    tk.Label(frm_vid_tempo, text="(pitch preserved — slower < 1.0 < faster)", fg='grey').pack(side='left', padx=(6,0))
+
+    console = add_console(f, 6)
 
     def lancer(btn, stop_btn=None):
         if not v_input.get() or not v_output.get():
@@ -1310,6 +1362,23 @@ def tab_convert(nb):
 
         base_args = ['ffmpeg', '-y', '-i', v_input.get(), '-vn',
                      '-ac', ch, '-ar', sr]
+
+        # Tempo (time-stretch) preserving pitch/timbre, via ffmpeg atempo.
+        # atempo is valid for 0.5–2.0, so chain factors for anything outside.
+        try:
+            tempo = float(v_vid_tempo.get())
+        except ValueError:
+            tempo = 1.0
+        if abs(tempo - 1.0) > 1e-3 and tempo > 0:
+            t, parts = tempo, []
+            while t < 0.5:
+                parts.append(0.5); t /= 0.5
+            while t > 2.0:
+                parts.append(2.0); t /= 2.0
+            parts.append(t)
+            chain = ','.join(f'atempo={p:.4f}' for p in parts)
+            base_args += ['-filter:a', chain]
+            log(console, f"[*] Tempo ×{tempo} (pitch preserved): {chain}")
 
         if ext == '.mp3':
             br = v_vid_mp3_bitrate.get()
@@ -1328,7 +1397,7 @@ def tab_convert(nb):
             cmd = base_args + ['-sample_fmt', 's16', v_output.get()]
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Convert", lancer, 4)
+    make_btn(f, ">  Convert", lancer, 5)
 
 
 
@@ -1573,9 +1642,121 @@ def tab_validator(nb):
             cmd += ['--xtts-block', v_val_xtts.get().strip()]
         if v_val_audio.get().strip():
             cmd += ['--audio-block', v_val_audio.get().strip()]
-        run_cmd(cmd, console, btn, stop_btn)
+
+        def _val_on_line(txt):
+            # Capture the winning {} block printed after "Paste into the comparator"
+            s = txt.strip()
+            if s.startswith('{1,') or s.startswith('{1 '):
+                HANDOFF['win_xtts'] = s
+        run_cmd(cmd, console, btn, stop_btn, line_callback=_val_on_line)
 
     make_btn(f, ">  Generate", lancer, row + 1)
+
+    # Register as a target (Analyser -> Validator) and add hand-off to Comparator
+    TARGETS['val_xtts']  = v_val_xtts
+    TARGETS['val_audio'] = v_val_audio
+    frm_vho = tk.Frame(f)
+    frm_vho.grid(row=row + 2, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
+    tk.Label(frm_vho, text="Send winning {} →", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
+    def _val_to_cmp():
+        block = HANDOFF.get('win_xtts') or v_val_xtts.get().strip()
+        ok = _handoff_set('cmp_xtts', block)
+        log(console, "[→] Sent winning {} to Comparator" if ok else "[!] Run a sweep first.")
+    tk.Button(frm_vho, text="→ Comparator", command=_val_to_cmp).pack(side='left', padx=2)
+
+
+# ── Tab: Optimiser ────────────────────────────────────────────────────────────
+
+def tab_optimize(nb):
+    f = ttk.Frame(nb)
+    nb.add(f, text="[Opt] Optimiser")
+    f.grid_columnconfigure(1, weight=1)
+
+    v_opt_voices = tk.StringVar()
+    v_opt_lang   = tk.StringVar(value='FR')
+    v_opt_xtts   = tk.StringVar()
+    v_opt_text   = tk.StringVar(value="Bonjour, ceci est une phrase de test pour régler la voix avec soin.")
+    v_opt_seeds  = tk.StringVar(value='0 42 100 200')
+    v_opt_budget = tk.StringVar(value='25')
+    v_opt_wacc   = tk.StringVar(value='0.6')
+    v_opt_wid    = tk.StringVar(value='0.4')
+    v_opt_maxref = tk.StringVar(value='30')
+    v_opt_model  = tk.StringVar(value='small')
+
+    TARGETS['opt_xtts'] = v_opt_xtts   # Analyser -> Optimiser hand-off
+
+    add_row(f, "Voice ref(s)", v_opt_voices, 0,
+            [("Audio", "*.wav *.mp3 *.flac *.ogg"), ("All", "*.*")],
+            multi=True, initialdir=DIR_VOICES)
+
+    tk.Label(f, text="Language", anchor='w', width=20).grid(row=1, column=0, sticky='w', padx=6, pady=3)
+    ttk.Combobox(f, textvariable=v_opt_lang, values=LANGS, width=8, state='readonly').grid(row=1, column=1, sticky='w', padx=4)
+
+    tk.Label(f, text="XTTS params {}", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_opt_xtts).grid(row=2, column=1, sticky='ew', padx=4)
+
+    tk.Label(f, text="Test text", anchor='w', width=20).grid(row=3, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_opt_text).grid(row=3, column=1, sticky='ew', padx=4)
+
+    tk.Label(f, text="Seeds to screen", anchor='w', width=20).grid(row=4, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_opt_seeds).grid(row=4, column=1, sticky='ew', padx=4)
+
+    frm_n = tk.Frame(f); frm_n.grid(row=5, column=0, columnspan=3, sticky='w', padx=6, pady=3)
+    for lbl, var, w in [("Budget", v_opt_budget, 5), ("w_accent", v_opt_wacc, 5),
+                        ("w_identity", v_opt_wid, 5), ("max_ref_len", v_opt_maxref, 5)]:
+        tk.Label(frm_n, text=lbl).pack(side='left', padx=(6, 2))
+        tk.Entry(frm_n, textvariable=var, width=w).pack(side='left')
+    tk.Label(frm_n, text="whisper").pack(side='left', padx=(10, 2))
+    ttk.Combobox(frm_n, textvariable=v_opt_model, values=['tiny', 'base', 'small', 'medium'],
+                 width=8, state='readonly').pack(side='left')
+
+    try:
+        import torch as _t_opt
+        _opt_dev = "cuda" if _t_opt.cuda.is_available() else "cpu"
+    except Exception:
+        _opt_dev = "cpu"
+    v_opt_device = tk.StringVar(value=_opt_dev)
+    tk.Label(f, text="Device", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
+    ttk.Combobox(f, textvariable=v_opt_device, values=['cpu', 'cuda'], width=8, state='readonly').grid(row=6, column=1, sticky='w', padx=4)
+
+    console = add_console(f, 8)
+
+    def lancer(btn, stop_btn=None):
+        refs = [r for r in v_opt_voices.get().split() if r.strip()]
+        if not refs:
+            log(console, "[ERR] At least one voice reference required."); return
+        if not v_opt_xtts.get().strip():
+            log(console, "[ERR] XTTS {} block required (send it from the Analyser)."); return
+        cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'xtts_optimize.py')]
+        cmd += refs
+        cmd += [v_opt_lang.get()]
+        cmd += ['--xtts-block', v_opt_xtts.get().strip()]
+        cmd += ['--text', v_opt_text.get()]
+        if v_opt_seeds.get().strip():
+            cmd += ['--seeds', v_opt_seeds.get().strip()]
+        cmd += ['--budget', v_opt_budget.get().strip() or '25']
+        cmd += ['--w-accent', v_opt_wacc.get().strip() or '0.6']
+        cmd += ['--w-identity', v_opt_wid.get().strip() or '0.4']
+        cmd += ['--max-ref-len', v_opt_maxref.get().strip() or '30']
+        cmd += ['--whisper-model', v_opt_model.get()]
+        cmd += ['--device', v_opt_device.get()]
+
+        def _opt_on_line(txt):
+            s = txt.strip()
+            if s.startswith('{1,') or s.startswith('{1 '):
+                HANDOFF['win_xtts'] = s
+        run_cmd(cmd, console, btn, stop_btn, line_callback=_opt_on_line)
+
+    make_btn(f, ">  Optimise", lancer, 7)
+
+    frm_oho = tk.Frame(f)
+    frm_oho.grid(row=9, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
+    tk.Label(frm_oho, text="Send winning {} →", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
+    def _opt_to_cmp():
+        block = HANDOFF.get('win_xtts') or v_opt_xtts.get().strip()
+        ok = _handoff_set('cmp_xtts', block)
+        log(console, "[→] Sent winning {} to Comparator" if ok else "[!] Run the optimiser first.")
+    tk.Button(frm_oho, text="→ Comparator", command=_opt_to_cmp).pack(side='left', padx=2)
 
 
 # ── Tab: Comparator ──────────────────────────────────────────────────────────
@@ -1592,6 +1773,8 @@ def tab_comparator(nb):
     v_cmp_text     = tk.StringVar(value="Bonjour, voici un court test de comparaison de voix.")
     v_cmp_output   = tk.StringVar()
     v_cmp_opt_out  = tk.StringVar()
+    TARGETS['cmp_xtts']  = v_cmp_xtts
+    TARGETS['cmp_audio'] = v_cmp_audio
 
     row = 0
     # Reference file — used for both comparison AND XTTS cloning
@@ -1761,6 +1944,7 @@ def main():
     tab_pitch(nb)
     tab_convert(nb)
     tab_validator(nb)
+    tab_optimize(nb)
     tab_comparator(nb)
 
     def on_close():

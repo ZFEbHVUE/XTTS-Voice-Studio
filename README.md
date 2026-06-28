@@ -56,6 +56,7 @@ pip install TTS torch torchaudio --index-url https://download.pytorch.org/whl/cu
 pip install faster-whisper librosa pydub numpy soundfile pyrubberband scipy
 pip install torchcrepe demucs noisereduce nara-wpe deepfilternet
 pip install praat-parselmouth
+pip install speechbrain          # ECAPA-TDNN speaker identity (comparator)
 
 sudo apt install ffmpeg rubberboard-cli
 ```
@@ -80,7 +81,9 @@ XTTS-Voice-Studio/
 │   ├── guided_meditation_generator_v23.py  # Meditation generator
 │   ├── voice_analyser.py                   # Acoustic analysis → XTTS params
 │   ├── voice_validator.py                  # Empirical parameter validation
-│   ├── voice_comparator.py                 # Spectral comparison & auto-optimisation
+│   ├── voice_comparator.py                 # Identity (ECAPA) + LS EQ optimisation
+│   ├── speaker_identity.py                 # ECAPA-TDNN speaker embedding / cosine
+│   ├── ltas_match.py                       # LTAS least-squares EQ fit (exact RBJ responses)
 │   ├── extract_voices.py                   # Vocal separation by gender
 │   ├── transcribeSong2txt_with_pause.py    # Audio transcription
 │   └── video2txt.py                        # Video transcription
@@ -148,13 +151,12 @@ Empirically validates XTTS parameters by generating multiple variations and comb
 
 ### [Cmp] Comparator
 
-Compares a reference voice spectrally with a generated clone and automatically optimises the `[]` audio parameters via iterative feedback.
+Optimises a clone in two principled stages instead of spectral-band heuristics.
 
-- Reference voice used for both spectral comparison AND XTTS cloning
-- Configurable number of iterations (default 1) with convergence threshold
-- Optimises: `vol`, `eq_low`, `eq_mid`, `eq_high`, `hp`, `lp`, `comp` automatically
-- `[]` Audio params field updates in real-time after each iteration
-- Generates both a base clone and a final optimised clone
+- **Stage 1 — identity (seed search):** generates the clone for several seeds and keeps the one whose **ECAPA-TDNN** speaker embedding is closest (cosine) to the reference. Text-independent — this is what "same voice" actually measures. Automates the manual seed hunt.
+- **Stage 2 — tone (least squares):** fits the generator's exact 3-band peaking EQ + volume so the clone's long-term average spectrum (LTAS) matches the reference, by bounded least squares on the real RBJ filter responses.
+- Reports an identity cosine per seed and the in-band LTAS residual (dB) before/after.
+- `[]` Audio params field updates automatically with the fitted block.
 
 ---
 
@@ -271,8 +273,15 @@ voice_analyser.py --precise ref1.wav ref2.wav ref3.wav FR
 # Voice 1 [FR]  soprano / high voice  214 Hz
 # Analysis: Praat + pyin | seed=42
 {1, 42, 0, 200, 100, 250, 0.72, 55, 0.88, 4.5, 1, 60, 4, 0}
-[1, FR, 0.9, 6, -2, 1, -4, 95, 8000, 0.35, 0.35, 0.5, 0, 0, 0, 1]
+[1, FR, 0.9, 0, 0, 0, 0, 95, 8000, 0.3, 0.3, 0.3, 0, 0, 0, 1]
 ```
+
+`eq_low/eq_mid/eq_high` and `vol` are emitted as `0` **by design** — they are
+fitted empirically by the Comparator (least-squares LTAS match on the actual
+clone). Deriving EQ from the reference alone double-counts the spectral balance
+the clone already inherits through cloning. `NR`, `comp` and `de-ess` are gentle
+starting points (capped low); confirm by ear. The Analyser owns the generation
+priors (the `{}` block + safe `hp`/`lp`); the Comparator owns the tonal match.
 
 ---
 
@@ -301,34 +310,59 @@ The seed interacts with the voice embedding unpredictably. A seed that works per
 
 ## Comparator
 
-Compares a reference voice spectrally with a generated clone and automatically optimises the `[]` audio parameters via iterative feedback.
+Optimises a clone in two principled stages. Post-processing can only colour the
+tone of a clone — it cannot change *who* the clone sounds like. So identity and
+tone are handled separately, with the right tool for each.
 
-### How it works
+### Stage 1 — identity (seed search via ECAPA-TDNN)
 
-1. Generates a clone with the provided `{}` and `[]` blocks
-2. Analyses both files spectrally (RMS, crest factor, centroid, EQ bands)
-3. Computes corrections for `vol`, `eq_low`, `eq_mid`, `eq_high`, `hp`, `lp`, `comp`
-4. Updates `[]` and generates a new clone
-5. Repeats until convergence (score improvement < threshold or params unchanged)
-6. Saves the final optimised clone
+The voice identity (timbre, accent) is decided by XTTS at generation time, set by
+the interaction between the reference embedding and the seed. The comparator
+generates the clone for each candidate seed and scores it against the reference
+with **ECAPA-TDNN speaker-verification cosine similarity** (SpeechBrain
+`spkrec-ecapa-voxceleb`). This metric is text-independent — it answers "same
+speaker?" regardless of what was said. The best seed is kept automatically,
+replacing the manual `0 7 13 42 100 200` hunt.
 
-### What is optimised automatically
+| Cosine | Interpretation |
+|--------|----------------|
+| > 0.75 | same speaker |
+| 0.55–0.75 | close |
+| < 0.55 | different — reference likely too short/noisy, or wrong language |
 
-| Parameter | Criterion | Optimised |
-|-----------|-----------|-----------|
-| `vol` | RMS gap | ✅ |
-| `eq_low` | Low-band % gap | ✅ |
-| `eq_mid` | Mid-band % gap | ✅ |
-| `eq_high` | Spectral centroid gap | ✅ |
-| `hp` | Excess bass in clone | ✅ |
-| `lp` | Excess/lacking highs | ✅ |
-| `comp` | Crest factor gap | ✅ |
-| `speed` | ❌ texts differ | — |
-| `NR`, `de-ess`, `reverb` | ❌ not measurable | — |
+ECAPA runs on CPU by default (a few short clips score in ~1 s) so all VRAM stays
+with XTTS — relevant on 4 GB cards.
 
-### Important note
+### Stage 2 — tone (least-squares LTAS EQ fit)
 
-Use a **short test text** (3–5 sentences) for fast iterations — the comparator compares spectral characteristics, not duration. The `{}` XTTS params are not modified by the comparator; use the Validator for those.
+On the winning clone, the generator's exact 3-band peaking EQ + volume are fit by
+**bounded least squares** so the clone's long-term average spectrum (LTAS)
+matches the reference:
+
+1. Compute the LTAS (dB, log-frequency) of reference and clone, peak-normalised (shape only — level handled separately by `vol` from the RMS gap).
+2. Target correction `D(f) = LTAS_ref(f) − LTAS_clone(f)`.
+3. Model the EQ as the **exact** FFmpeg `equalizer` RBJ peaking responses (low f0=200/BW=200, mid f0=1500/BW=2000, high f0=5000/BW=3000) plus a nuisance offset.
+4. Solve `min ‖EQ(g) − D‖²` over the 80 Hz–8 kHz speech band with gains bounded to ±6 dB (`scipy.optimize.least_squares`, perceptually weighted).
+5. `hp`/`lp` derived from the LTAS roll-off at the extremes.
+
+Because the modelled responses are the real filters the generator applies, the
+fit corrects the actual EQ rather than an approximation. The reported residual is
+the weighted in-band RMS error (dB) before vs after — a meaningful, homogeneous
+number, unlike the old composite score that summed dB + Hz + percentages.
+
+### Why this matters
+
+The old comparator iteratively nudged EQ to match spectral-band *percentages* of
+two **different** utterances (reference text ≠ clone text), so it chased phonetic
+differences, not voice differences — and its score mixed incommensurable units.
+It could never improve identity because EQ is post-processing. The rework targets
+identity directly (ECAPA) and solves tone as a well-posed least-squares problem.
+
+### Tips
+
+- For the sharpest tonal match, generate the clone on the **reference's own transcript** (`--text-file`) so the LTAS compares like-for-like phonetics. Over 20–60 s of speech the LTAS still approximates the speaker envelope on arbitrary text, but matched text is cleaner.
+- The `{}` XTTS params other than `seed` (temp, rep_pen…) are not searched here — use the Validator for those, or the Analyser for sensible priors.
+- More / cleaner reference audio raises the achievable cosine more than any post-processing.
 
 ---
 
@@ -336,11 +370,10 @@ Use a **short test text** (3–5 sentences) for fast iterations — the comparat
 
 1. **Extract reference audio** → Video→Audio tab with XTTS preset (WAV, mono, 22050 Hz)
 2. **Clean if needed** → Vox tab with demucs + deepfilter
-3. **Analyse** → Analyser tab, Praat mode, multiple reference files
-4. **Validate seed** → Validator tab, test `seed` with values `0 7 13 42 100 200`
-5. **Validate XTTS params** → Validator tab, test `temp`, `rep_pen`
-6. **Auto-optimise audio** → Comparator tab, 3–5 iterations
-7. **Generate** → Generator tab with the final `{}` and `[]` blocks
+3. **Analyse** → Analyser tab, Praat mode, multiple reference files (gives `{}`/`[]` priors)
+4. **Find best seed + tone** → Comparator tab: ECAPA seed search picks the identity-best seed and least-squares fits the EQ in one run
+5. **Validate other XTTS params** → Validator tab, test `temp`, `rep_pen` if needed
+6. **Generate** → Generator tab with the final `{}` and `[]` blocks
 
 ---
 

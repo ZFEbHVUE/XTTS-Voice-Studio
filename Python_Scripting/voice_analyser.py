@@ -9,6 +9,17 @@ parameters for both bracket types:
   {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs}
   [N, LANG, speed, vol, eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess, reverb, noise_gate, pan, limiter]
 
+Role (open-loop priors): this tool derives GENERATION priors from the reference
+acoustics — the {} block (temp, rep_pen, top_k/p, len_pen, gpt_cond_len, fades,
+trims) plus safe hp/lp and gentle NR/comp/de-ess suggestions. It does NOT set the
+tonal EQ or the level: eq_low/eq_mid/eq_high and vol are emitted as 0 and fitted
+empirically by voice_comparator.py (closed-loop least-squares LTAS match on the
+actual clone). Deriving EQ from the reference alone double-counts the spectral
+balance the clone already inherits through cloning.
+
+Pipeline: voice_analyser (priors) -> voice_comparator (identity + tonal fit)
+          -> voice_validator (seed/temp confirmation) -> generator (final).
+
 Usage:
   python voice_analyser.py voice.wav LANG [voice2.wav LANG2 ...]
   python voice_analyser.py --precise voice.wav FR
@@ -397,25 +408,31 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
     ratio_high   = e_high / ref
     ratio_bm     = e_bm   / ref
 
-    # EQ lows (80-300 Hz)
-    if   ratio_low > 1.6: eq_low = -5
-    elif ratio_low > 1.2: eq_low = -3
-    elif ratio_low > 0.8: eq_low = -2
-    elif ratio_low > 0.5: eq_low = -1
-    else:                 eq_low = +1
+    # EQ is NOT emitted here. Deriving it from the reference's own spectral
+    # ratios double-counts: the clone already inherits the reference's spectral
+    # balance through cloning, so a reference-derived EQ corrects a tilt that is
+    # largely already present. EQ is fitted empirically by voice_comparator.py
+    # (least-squares LTAS match on the actual clone). The ratios below are kept
+    # only as an informational suggestion, never written to the [] block.
+    if   ratio_low > 1.6: eq_low_sugg = -5
+    elif ratio_low > 1.2: eq_low_sugg = -3
+    elif ratio_low > 0.8: eq_low_sugg = -2
+    elif ratio_low > 0.5: eq_low_sugg = -1
+    else:                 eq_low_sugg = +1
 
-    # EQ mids (presence band 800-3000 Hz) -- compare against body-mid (300-800 Hz)
-    # High ratio_bm means warm/boomy mid -> less boost needed on presence
-    if   ratio_bm > 1.5: eq_mid = +1
-    elif ratio_bm > 1.0: eq_mid = +2
-    else:                eq_mid = +3
+    if   ratio_bm > 1.5: eq_mid_sugg = +1
+    elif ratio_bm > 1.0: eq_mid_sugg = +2
+    else:                eq_mid_sugg = +3
 
-    # EQ highs (3000-8000 Hz)
-    if   ratio_high > 1.3: eq_high = -6
-    elif ratio_high > 1.0: eq_high = -5
-    elif ratio_high > 0.7: eq_high = -3
-    elif ratio_high > 0.4: eq_high = -2
-    else:                  eq_high = -1
+    if   ratio_high > 1.3: eq_high_sugg = -6
+    elif ratio_high > 1.0: eq_high_sugg = -5
+    elif ratio_high > 0.7: eq_high_sugg = -3
+    elif ratio_high > 0.4: eq_high_sugg = -2
+    else:                  eq_high_sugg = -1
+
+    eq_low = eq_mid = eq_high = 0   # left to the comparator's empirical LS fit
+    print(f"   [*] EQ suggestion (not emitted; comparator fits this): "
+          f"low={eq_low_sugg:+d} mid={eq_mid_sugg:+d} high={eq_high_sugg:+d}")
 
     # -- 6b. Breathiness -> spectral flatness -------------------------------
     # Spectral flatness near 1.0 = noise-like / breathy
@@ -438,10 +455,14 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
     e_ref2  = band_energy(S, freqs, 1000, 5000)
     sib_ratio = e_sibi / (e_ref2 if e_ref2 > 0 else 1e-9)
 
-    if   sib_ratio > 0.80: deesser = 0.7
-    elif sib_ratio > 0.55: deesser = 0.5
-    elif sib_ratio > 0.35: deesser = 0.3
-    else:                  deesser = 0.2
+    if   sib_ratio > 0.80: _deess = 0.7
+    elif sib_ratio > 0.55: _deess = 0.5
+    elif sib_ratio > 0.35: _deess = 0.3
+    else:                  _deess = 0.2
+    deesser_sugg = round(min(_deess, 0.3), 2)
+    deesser = 0   # emitted neutral — add by ear only if the clone is sibilant
+    if deesser_sugg > 0:
+        print(f"   [*] de-ess suggestion {deesser_sugg} (not emitted; add by ear)")
 
     # -- 5. Level -> volume boost -------------------------------------------
     rms_global  = float(np.sqrt(np.mean(y ** 2)))
@@ -456,8 +477,10 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
     else:
         rms_voiced_db = rms_db
     target_db   = -18.0   # meditation target level (leaves headroom for ambient mix)
-    volume      = int(np.clip(round(target_db - rms_voiced_db), -6, +8))
-    print(f"   [*] RMS global={rms_db:.1f}dBFS  voiced={rms_voiced_db:.1f}dBFS -> vol={volume:+d}dB")
+    volume_sugg = int(np.clip(round(target_db - rms_voiced_db), -6, +8))
+    volume      = 0   # level set empirically by the comparator (RMS match on the clone)
+    print(f"   [*] RMS global={rms_db:.1f}dBFS  voiced={rms_voiced_db:.1f}dBFS "
+          f"-> vol suggestion={volume_sugg:+d}dB (not emitted; comparator fits level)")
 
     # -- 6. Noise floor -> noise reduction ----------------------------------
     rms_sorted  = np.sort(rms)
@@ -483,6 +506,10 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
         noise_reduction = min(0.8, noise_reduction + 0.1)
         print(f"   [*] Breathy voice detected (flatness={breathiness:.3f}) "
               f"-> NR boosted to {noise_reduction:.2f}")
+    noise_reduction_sugg = round(min(noise_reduction, 0.3), 2)
+    noise_reduction = 0   # emitted neutral — add by ear only if the clone is noisy
+    if noise_reduction_sugg > 0:
+        print(f"   [*] NR suggestion {noise_reduction_sugg} (not emitted; add by ear)")
 
     # -- 7. Dynamics -> compression -----------------------------------------
     peak            = float(np.max(np.abs(y)))
@@ -506,20 +533,23 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
     # Breathy voice has uneven dynamics -> more compression needed
     if breathiness > 0.20:
         compression = min(0.8, compression + 0.1)
+    compression_sugg = round(min(compression, 0.3), 2)
+    compression = 0   # emitted neutral — add by ear only if the clone is too dynamic
+    if compression_sugg > 0:
+        print(f"   [*] comp suggestion {compression_sugg} (not emitted; add by ear)")
 
     step(f"Levels   RMS={rms_db:.1f}dBFS  SNR={snr:.0f}dB  crest={crest_factor_db:.0f}dB  sib={sib_ratio:.2f}", t0)
 
-    # -- 8. Speed -> rubberband ---------------------------------------------
-    if   voiced_ratio > 0.65: speed = 0.85
-    elif voiced_ratio > 0.45: speed = 0.90
-    else:                     speed = 0.93
-
-    # Refine speed with syllable tempo if available
+    # -- 8. Speed -> NOT baked ----------------------------------------------
+    # Speed is left at 1.0. XTTS already speaks at a natural rate; a tempo-
+    # derived slowdown only makes the clone sluggish. The measured syllable rate
+    # is reported as a suggestion — set speed by ear in the [] block if you
+    # actually want the clone faster/slower.
+    speed = 1.0
     if praat_tempo is not None:
-        if   praat_tempo > 6.0: speed = max(0.85, speed - 0.02)
-        elif praat_tempo < 2.5: speed = min(1.05, speed + 0.05)
-        elif praat_tempo < 3.5: speed = min(1.00, speed + 0.02)
-        print(f"   [*] Tempo={praat_tempo:.2f}syl/s -> speed={speed}")
+        hint = ("fast" if praat_tempo > 5.5 else "slow" if praat_tempo < 3.0 else "normal")
+        print(f"   [*] Syllable rate {praat_tempo:.2f}/s ({hint}) "
+              f"-> speed suggestion only (emitted as 1.0)")
 
     # -- 9. XTTS params ----------------------------------------------------
     # Use Praat shimmer+jitter when available (more accurate than F0 jitter)
@@ -710,6 +740,9 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
   {{{xtts_str}}}
 
   # -- Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
+  #    Neutral by design: speed=1.0, eq_*/vol=0 (fitted by voice_comparator.py),
+  #    NR/comp/de-ess=0. Only hp/lp are set (safe rumble/hiss guards). Measured
+  #    suggestions for these are printed above; add them by ear only if needed.
   [{audio_str}]
 
   ==================================================================""")

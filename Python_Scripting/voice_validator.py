@@ -72,34 +72,17 @@ AUDIO_PARAMS = {'speed','vol','eq_low','eq_mid','eq_high','hp','lp','NR','comp',
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def set_seed(tts_model, seed):
-    import torch, random, numpy as np
-    if seed and seed > 0:
-        torch.manual_seed(seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-
-def generate_one(tts, speaker_wav, language, text, params, output_path, gpt_cond_len=30):
-    """Generate a single sentence with given params."""
-    seed = int(params.get('seed', 0) or 0)
-    set_seed(tts, seed)
-
-    tts.tts_to_file(
-        text=text,
-        file_path=output_path,
-        language=language.lower().split('-')[0],
-        speaker_wav=speaker_wav,
-        temperature=float(params.get('temp', 0.72)),
-        length_penalty=float(params.get('len_pen', 1.0)),
-        repetition_penalty=float(params.get('rep_pen', 5.0)),
-        top_k=int(params.get('top_k', 50)),
-        top_p=float(params.get('top_p', 0.85)),
-        gpt_cond_len=int(params.get('gpt_cond_len', gpt_cond_len)),
-        speed=1.0,  # always 1.0 — rubberband applied below if needed
-    )
+def format_xtts_block(p):
+    """Build a 14-value {} block string from a params dict (to paste into the comparator)."""
+    def f(v):
+        v = float(v)
+        return str(int(v)) if v == int(v) else str(round(v, 3))
+    order = [1, p.get('seed', 0), p.get('trim_start', 0), p.get('trim_end', 0),
+             p.get('fade_in', 100), p.get('fade_out', 250), p.get('temp', 0.65),
+             p.get('top_k', 50), p.get('top_p', 0.85), p.get('rep_pen', 5.0),
+             p.get('len_pen', 1.0), p.get('gpt_cond_len', 30),
+             p.get('gpt_cond_chunk_len', 6), p.get('sound_norm_refs', 0)]
+    return '{' + ', '.join(f(v) for v in order) + '}'
 
 
 def speak_label(tts, speaker_wav, language, label, output_path):
@@ -163,6 +146,17 @@ def main():
                         help='Audio [] block from voice_analyser (e.g. "[1, FR, 0.9, 6, ...]")')
     parser.add_argument('--no-labels', action='store_true',
                         help='Do not prepend spoken labels to each variation')
+    parser.add_argument('--no-score', action='store_true',
+                        help='Disable accent/identity scoring of the variants')
+    parser.add_argument('--whisper-model', default='small',
+                        help='faster-whisper model for accent scoring (default: small)')
+    parser.add_argument('--whisper-device', default='cpu',
+                        help="Device for Whisper scoring (default: cpu — frees VRAM)")
+    parser.add_argument('--max-ref-len', type=int, default=30,
+                        help='Seconds of reference for the speaker embedding (XTTS default 10)')
+    parser.add_argument('--prioritise', default='accent',
+                        choices=['accent', 'identity', 'balanced'],
+                        help='Which score ranks the winning {} (default: accent)')
 
     args = parser.parse_args()
 
@@ -265,13 +259,37 @@ def main():
     _bp_str = '  '.join(f'{p}={base_params.get(p, "N/A")}' for p in param_keys)
     print(f"[*] Base params: {_bp_str}")
     import torch
-    from TTS.api import TTS
+    import xtts_clone as XC
     from pydub import AudioSegment
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[*] Loading XTTS on {device}...")
-    tts = TTS('tts_models/multilingual/multi-dataset/xtts_v2').to(device)
+    tts, model = XC.load_xtts(device)   # tts kept for spoken labels; model for generation
     print(f"[OK] TTS ready\n")
+
+    # Latents honour the cloning knobs (tts_to_file would ignore them); cached so
+    # they are recomputed only when a cloning param (gpt_cond_len/chunk/
+    # sound_norm_refs) is the one being swept.
+    _lat_cache = {}
+    def _latents_for(params):
+        key = (int(params.get('gpt_cond_len', args.gpt_cond_len)),
+               int(params.get('gpt_cond_chunk_len', 6)),
+               int(args.max_ref_len),
+               bool(int(params.get('sound_norm_refs', 0))))
+        if key not in _lat_cache:
+            _lat_cache[key] = XC.compute_latents(
+                model, speaker_wav, gpt_cond_len=key[0], gpt_cond_chunk_len=key[1],
+                max_ref_len=key[2], sound_norm_refs=key[3])
+        return _lat_cache[key]
+
+    def gen_variant(params, out_path):
+        XC.generate(model, args.text, lang, _latents_for(params), out_path,
+                    temperature=float(params.get('temp', 0.65)),
+                    length_penalty=float(params.get('len_pen', 1.0)),
+                    repetition_penalty=float(params.get('rep_pen', 5.0)),
+                    top_k=int(params.get('top_k', 50)),
+                    top_p=float(params.get('top_p', 0.85)),
+                    speed=1.0, seed=int(params.get('seed', 0) or 0))
 
     silence = AudioSegment.silent(duration=SILENCE_MS)
     label_pause = AudioSegment.silent(duration=LABEL_PAUSE)
@@ -339,11 +357,33 @@ def main():
     audio_only_params = AUDIO_PARAMS
     all_audio = all(p in audio_only_params for p in param_keys)
 
+    # Scoring makes sense only when generation actually changes between variants
+    # (i.e. a {} param is swept). For audio-only sweeps every variant is the same
+    # clone, so accent/identity would be identical — skip.
+    do_score = (not args.no_score) and (not all_audio)
+    pron = None; enc = None; ref_emb = None; scores = []
+    if do_score:
+        ref0 = voice_refs[0] if isinstance(voice_refs, list) else voice_refs
+        try:
+            from pron_score import PronScorer
+            print(f"[*] Loading faster-whisper '{args.whisper_model}' on {args.whisper_device} (accent)...")
+            pron = PronScorer(device=args.whisper_device, model=args.whisper_model)
+        except Exception as e:
+            print(f"[!] Accent scoring off ({e})")
+        try:
+            from speaker_identity import SpeakerEncoder
+            print("[*] Loading ECAPA-TDNN (identity)...")
+            enc = SpeakerEncoder(device='cpu' if device == 'cuda' else device)
+            ref_emb = enc.embed(ref0)
+        except Exception as e:
+            print(f"[!] Identity scoring off ({e})")
+        if pron is None and enc is None:
+            do_score = False
+
     if all_audio:
         print(f"[*] All audio params — generating base audio once\n")
         base_wav = os.path.join(tmpdir, 'base.wav')
-        generate_one(tts, speaker_wav, lang, args.text, base_params, base_wav,
-                     gpt_cond_len=int(args.gpt_cond_len))
+        gen_variant(base_params, base_wav)
         base_audio_raw = AudioSegment.from_wav(base_wav)
         print(f"[OK] Base audio: {len(base_audio_raw)/1000:.1f}s\n")
 
@@ -372,8 +412,22 @@ def main():
                 audio = apply_audio(base_audio_raw, params)
             else:
                 out_path = os.path.join(tmpdir, f'var_{i}.wav')
-                generate_one(tts, speaker_wav, lang, args.text, params, out_path,
-                             gpt_cond_len=int(args.gpt_cond_len))
+                gen_variant(params, out_path)
+                if device == 'cuda':
+                    try: torch.cuda.empty_cache()
+                    except Exception: pass
+                if do_score:
+                    rec = {'combo': list(zip(param_keys, combo)),
+                           'fr': None, 'detected': '', 'wer': None, 'cos': None}
+                    if pron is not None:
+                        pr = pron.score(out_path, lang=lang, target_text=args.text)
+                        rec['fr'] = pr['score']; rec['detected'] = pr['detected']; rec['wer'] = pr['wer']
+                    if enc is not None:
+                        rec['cos'] = enc.cosine(ref_emb, enc.embed(out_path))
+                    scores.append(rec)
+                    sc = (f"french={rec['fr']:.3f} " if rec['fr'] is not None else "") + \
+                         (f"identity={rec['cos']:.4f}" if rec['cos'] is not None else "")
+                    print(f"   [score] {sc}")
                 audio = AudioSegment.from_wav(out_path)
                 audio = apply_audio(audio, params)
 
@@ -383,6 +437,33 @@ def main():
         except Exception as e:
             print(f"   [ERR] {e}")
             import traceback; traceback.print_exc()
+
+    # ── Ranked scores + winning {} block to paste into the comparator ─────────
+    if scores:
+        def rankkey(r):
+            fr = r['fr'] if r['fr'] is not None else -1.0
+            co = r['cos'] if r['cos'] is not None else -1.0
+            if args.prioritise == 'identity': return (co, fr)
+            if args.prioritise == 'balanced': return (0.6 * fr + 0.4 * ((co + 1) / 2),)
+            return (fr, co)   # accent first
+        ranked = sorted(scores, key=rankkey, reverse=True)
+        print(f"\n{'='*60}\n  RANKING (by {args.prioritise})\n{'='*60}")
+        hdr = '  '.join(f"{k:>10}" for k in param_keys)
+        print(f"  {hdr}{'french':>10}{'wer':>7}{'identity':>11}")
+        for r in ranked:
+            vals = '  '.join(f"{str(v):>10}" for _, v in r['combo'])
+            fr = f"{r['fr']:.3f}" if r['fr'] is not None else "  -  "
+            we = f"{r['wer']:.2f}" if r['wer'] is not None else "  -  "
+            co = f"{r['cos']:.4f}" if r['cos'] is not None else "   -   "
+            print(f"  {vals}{fr:>10}{we:>7}{co:>11}")
+
+        winner = base_params.copy()
+        for k, v in ranked[0]['combo']:
+            winner[k] = v
+        print(f"\n  Best {args.prioritise}: " +
+              '  '.join(f"{k}={v}" for k, v in ranked[0]['combo']))
+        print(f"  Paste into the comparator (frozen seed/temp/...):")
+        print(f"  {format_xtts_block(winner)}")
 
     # Save
     print(f"\n[*] Saving {output_file}...")
