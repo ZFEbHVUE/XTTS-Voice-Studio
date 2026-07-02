@@ -552,44 +552,22 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
               f"-> speed suggestion only (emitted as 1.0)")
 
     # -- 9. XTTS params ----------------------------------------------------
-    # Use Praat shimmer+jitter when available (more accurate than F0 jitter)
-    # Stable/monotone -> high rep_pen, low temp
-    # Expressive      -> lower rep_pen, higher temp
+    # Monotone (small pitch spread) -> lower temp; expressive -> higher temp.
 
-    if praat_shimmer is not None and praat_jitter is not None:
-        # Combined expressiveness score from Praat
-        # Jitter cap raised to 0.08 (5% was too restrictive for expressive voices)
-        expr_score = (praat_shimmer * 0.6) + (min(praat_jitter, 0.08) * 0.4 / 0.08)
-        if   expr_score < 0.06:
-            temperature, top_k, top_p = 0.55, 30, 0.75
-            repetition_penalty        = 7.0
-        elif expr_score < 0.10:
-            temperature, top_k, top_p = 0.60, 35, 0.78
-            repetition_penalty        = 6.0
-        elif expr_score < 0.15:
-            temperature, top_k, top_p = 0.65, 45, 0.82
-            repetition_penalty        = 5.5
-        elif expr_score < 0.20:
-            temperature, top_k, top_p = 0.68, 50, 0.85
-            repetition_penalty        = 5.0
-        else:
-            temperature, top_k, top_p = 0.72, 55, 0.88
-            repetition_penalty        = 4.5
-        print(f"   [*] Praat expr_score={expr_score:.3f} -> temp={temperature} rep_pen={repetition_penalty}")
-    else:
-        # Fallback: F0 jitter from librosa
-        if   f0_jitter < 0.10:
-            temperature, top_k, top_p = 0.55, 30, 0.75
-            repetition_penalty        = 7.0
-        elif f0_jitter < 0.18:
-            temperature, top_k, top_p = 0.60, 35, 0.78
-            repetition_penalty        = 6.0
-        elif f0_jitter < 0.30:
-            temperature, top_k, top_p = 0.65, 45, 0.82
-            repetition_penalty        = 5.5
-        else:
-            temperature, top_k, top_p = 0.70, 50, 0.85
-            repetition_penalty        = 5.0
+    # temp prior from PROSODIC expressiveness = F0 spread in semitones.
+    # Jitter/shimmer are cycle-to-cycle micro-perturbations (vocal roughness) —
+    # they don't measure how melodic/expressive the speaker is; pitch spread
+    # does. Works identically in Praat and librosa modes (uses f0_median/std).
+    # This is a PRIOR: the optimiser's least-squares temp surface refines it.
+    st_spread = 12.0 * np.log2((f0_median + f0_std) / f0_median) if f0_median > 0 else 2.5
+    temperature = float(np.clip(0.55 + 0.035 * st_spread, 0.55, 0.72))
+    temperature = round(temperature, 2)
+    # top_k / top_p / rep_pen measured as near-inert on XTTS output (optimiser
+    # inertness probe) -> sane fixed defaults instead of pseudo-precise ladders.
+    top_k, top_p, repetition_penalty = 50, 0.85, 5.0
+    hint = ("monotone" if st_spread < 1.5 else "normal" if st_spread < 3.0 else
+            "expressive" if st_spread < 5.0 else "very expressive")
+    print(f"   [*] F0 spread {st_spread:.1f} semitones ({hint}) -> temp prior {temperature}")
 
     # length_penalty: based on voiced_ratio (speech density)
     # Dense speech (high voiced_ratio) -> model matches density -> neutral

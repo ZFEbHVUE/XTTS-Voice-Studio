@@ -172,6 +172,11 @@ def main():
     p.add_argument('--audio-block', required=True)
     p.add_argument('--text', default="Bonjour, ceci est un court test de comparaison de voix.")
     p.add_argument('--text-file', default=None)
+    p.add_argument('--auto-text', action='store_true',
+                   help='Transcribe the reference (faster-whisper, CPU) and fit on '
+                        'its own words — like-for-like phonetics for the LTAS match')
+    p.add_argument('--whisper-model', default='small',
+                   help='faster-whisper model for --auto-text (default: small)')
     p.add_argument('--output', default=None)
     p.add_argument('--output-optimised', default=None)
     p.add_argument('--device', default=None)
@@ -201,7 +206,30 @@ def main():
     audio = parse_audio_block(args.audio_block)
     lang  = audio.get('lang', lang)
 
-    if args.text_file and os.path.exists(args.text_file):
+    if args.auto_text:
+        # Fit on the reference's own words: same phonemes on both sides of the
+        # LTAS comparison, so the fit corrects the voice, not the text.
+        print(f"[*] Transcribing reference with faster-whisper '{args.whisper_model}' (cpu)...")
+        from faster_whisper import WhisperModel
+        wm = WhisperModel(args.whisper_model, device='cpu', compute_type='int8')
+        segs, _info = wm.transcribe(args.reference, language=lang.lower().split('-')[0],
+                                    beam_size=5, vad_filter=True)
+        parts, total = [], 0
+        for s in segs:                       # whole segments up to XTTS's fr limit
+            t = s.text.strip()
+            if not t:
+                continue
+            if total + len(t) + 1 > 240:
+                break
+            parts.append(t); total += len(t) + 1
+        auto = clean_text(' '.join(parts))
+        if len(auto) >= 30:
+            text = auto
+            print(f"[OK] Fitting on: \"{text[:70]}{'...' if len(text) > 70 else ''}\"")
+        else:
+            print("[!] Transcription too short — keeping the provided text.")
+            text = clean_text(args.text)
+    elif args.text_file and os.path.exists(args.text_file):
         with open(args.text_file, encoding='utf-8') as fh:
             text = clean_text(fh.read())
     else:

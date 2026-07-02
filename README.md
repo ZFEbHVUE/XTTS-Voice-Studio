@@ -371,7 +371,8 @@ LTAS. The reported residual is the weighted in-band RMS error (dB) before vs aft
 
 ### Tips
 
-- For the sharpest tonal match, run on the **reference's own transcript** (`--text-file`) so the LTAS compares like-for-like phonetics.
+- For the sharpest tonal match, use `--auto-text`: the reference is transcribed (faster-whisper, CPU) and the clone is generated on its own words, so the LTAS compares like-for-like phonetics. (`--text-file` does the same with a transcript you provide.)
+- The LS fit is perceptually weighted (A-weighting): errors are penalised where the ear hears them (~1–5 kHz) rather than uniformly across the spectrum.
 - `eq_*` and `vol` in the input `[]` are overwritten by the fit; `NR`/`comp`/`de-ess`/`hp`/`lp` are kept from the block (Analyser priors).
 - The `{}` is never modified — fix seed/temp in the Validator first.
 

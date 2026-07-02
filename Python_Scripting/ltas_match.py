@@ -153,10 +153,14 @@ def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000,
     gains, derived hp/lp, and the weighted RMS residual (dB) before/after.
     """
     D = ref_db - clone_db                       # dB the clone must gain at each f
-    # Perceptual weight: emphasise 200 Hz – 5 kHz, taper the edges.
-    w = np.ones_like(f_grid)
-    w[f_grid < 150]  = 0.5
-    w[f_grid > 6000] = 0.6
+    # Perceptual weight: IEC A-weighting (closed form), floored so the vocal
+    # low end still counts. Errors are penalised where the ear actually hears
+    # them (~1–5 kHz) instead of uniformly — replaces the old ad-hoc step.
+    f2 = np.maximum(f_grid, 1.0) ** 2
+    ra = (12194.0**2 * f2**2) / ((f2 + 20.6**2)
+         * np.sqrt((f2 + 107.7**2) * (f2 + 737.9**2)) * (f2 + 12194.0**2))
+    a_db = 20.0 * np.log10(np.maximum(ra, 1e-12)) + 2.0
+    w = np.maximum(10.0 ** (a_db / 20.0), 0.25)
     w = w / w.mean()
     sw = np.sqrt(w)
 
