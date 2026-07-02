@@ -763,6 +763,104 @@ LANGS = ['FR','EN','ES','DE','IT','PT','PL','TR','RU','NL','CS','AR','ZH-CN','HU
 
 # ── Tab: Analyser ───────────────────────────────────────────────────────────
 
+# ── Tab: Auto pipeline ────────────────────────────────────────────────────────
+
+def tab_auto(nb):
+    f = ttk.Frame(nb)
+    nb.add(f, text="[Auto] Pipeline")
+    f.grid_columnconfigure(0, weight=1)
+
+    voices_frame = tk.LabelFrame(f, text="Voices (reference + language)")
+    voices_frame.grid(row=0, column=0, columnspan=3, sticky='ew', padx=6, pady=4)
+    auto_rows = []
+
+    def add_auto_row():
+        v_path = tk.StringVar()
+        v_lang = tk.StringVar(value='FR')
+        row_f = tk.Frame(voices_frame)
+        row_f.pack(fill='x', padx=4, pady=2)
+        tk.Label(row_f, text=f"V{len(auto_rows)+1}", width=3).pack(side='left')
+        tk.Entry(row_f, textvariable=v_path).pack(side='left', fill='x', expand=True, padx=3)
+        def browse():
+            p = filedialog.askopenfilename(
+                filetypes=[("Audio", "*.wav *.mp3 *.flac *.ogg"), ("All", "*.*")],
+                initialdir=DIR_VOICES)
+            if p:
+                v_path.set(p)
+        tk.Button(row_f, text="...", command=browse).pack(side='left', padx=1)
+        ttk.Combobox(row_f, textvariable=v_lang, values=LANGS, width=7,
+                     state='readonly').pack(side='left', padx=2)
+        def remove():
+            row_f.destroy(); auto_rows.remove(entry)
+        tk.Button(row_f, text="✕", command=remove).pack(side='left', padx=1)
+        entry = (v_path, v_lang, row_f)
+        auto_rows.append(entry)
+
+    add_auto_row()
+    tk.Button(f, text="+ Add voice", command=add_auto_row).grid(row=1, column=0,
+                                                                sticky='w', padx=8, pady=2)
+
+    v_a_seeds  = tk.StringVar(value='0 42 100 180 200')
+    v_a_budget = tk.StringVar(value='60')
+    v_a_keep   = tk.StringVar(value='45')
+    v_a_wacc   = tk.StringVar(value='0.6')
+    v_a_wid    = tk.StringVar(value='0.4')
+    v_a_curate = tk.BooleanVar(value=True)
+    v_a_autotx = tk.BooleanVar(value=True)
+    try:
+        import torch as _t_auto
+        _auto_dev = 'cuda' if _t_auto.cuda.is_available() else 'cpu'
+    except Exception:
+        _auto_dev = 'cpu'
+    v_a_device = tk.StringVar(value=_auto_dev)
+
+    frm_a = tk.Frame(f); frm_a.grid(row=2, column=0, columnspan=3, sticky='w', padx=6, pady=3)
+    tk.Label(frm_a, text="Seeds").pack(side='left', padx=(6, 2))
+    tk.Entry(frm_a, textvariable=v_a_seeds, width=20).pack(side='left')
+    for lbl, var, w in [("Budget", v_a_budget, 4), ("Keep s", v_a_keep, 4),
+                        ("w_acc", v_a_wacc, 4), ("w_id", v_a_wid, 4)]:
+        tk.Label(frm_a, text=lbl).pack(side='left', padx=(8, 2))
+        tk.Entry(frm_a, textvariable=var, width=w).pack(side='left')
+    tk.Label(frm_a, text="Device").pack(side='left', padx=(8, 2))
+    ttk.Combobox(frm_a, textvariable=v_a_device, values=['cpu', 'cuda'],
+                 width=6, state='readonly').pack(side='left')
+
+    frm_b = tk.Frame(f); frm_b.grid(row=3, column=0, columnspan=3, sticky='w', padx=6)
+    tk.Checkbutton(frm_b, text="Curate reference", variable=v_a_curate).pack(side='left', padx=6)
+    tk.Checkbutton(frm_b, text="Fit on reference's own words (auto-text)",
+                   variable=v_a_autotx).pack(side='left', padx=6)
+
+    tk.Label(f, text="Runs curate → analyse → optimise → tone-fit for each voice and"
+                     " prints the final {} / [] blocks to paste. LISTEN to each"
+                     " *_pipeline_clone.wav before generating — scores don't hear"
+                     " naturalness.",
+             fg='gray', font=("Arial", 8), justify='left', wraplength=560,
+             anchor='w').grid(row=4, column=0, columnspan=3, sticky='w', padx=8)
+
+    console = add_console(f, 6)
+
+    def lancer(btn, stop_btn=None):
+        voices = [(v.get().strip(), l.get()) for v, l, _ in auto_rows if v.get().strip()]
+        if not voices:
+            log(console, "[ERR] At least one voice required."); return
+        cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'xtts_pipeline.py')]
+        for path, lg in voices:
+            cmd += ['--voice', path, lg]
+        cmd += ['--seeds', v_a_seeds.get().strip() or '0 42 100 180 200']
+        cmd += ['--budget', v_a_budget.get().strip() or '60']
+        cmd += ['--keep-seconds', v_a_keep.get().strip() or '45']
+        cmd += ['--w-accent', v_a_wacc.get().strip() or '0.6']
+        cmd += ['--w-identity', v_a_wid.get().strip() or '0.4']
+        cmd += ['--device', v_a_device.get()]
+        if not v_a_curate.get():
+            cmd += ['--no-curate']
+        if not v_a_autotx.get():
+            cmd += ['--no-auto-text']
+        run_cmd(cmd, console, btn, stop_btn)
+
+    make_btn(f, ">  Run full pipeline", lancer, 5)
+
+
 # ── Tab: Curation ─────────────────────────────────────────────────────────────
 
 def tab_curate(nb):
@@ -2025,6 +2123,7 @@ def main():
     nb.pack(fill='both', expand=True, padx=8, pady=8)
 
     tab_generator(nb)
+    tab_auto(nb)
     tab_curate(nb)
     tab_analyser(nb)
     tab_transcribe(nb)

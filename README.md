@@ -87,6 +87,7 @@ XTTS-Voice-Studio/
 │   ├── ltas_match.py                       # LTAS least-squares EQ fit (exact RBJ responses)
 │   ├── xtts_clone.py                        # Low-level XTTS gen honouring all cloning knobs
 │   ├── xtts_optimize.py                     # Coordinate-descent search of sampling params
+│   ├── xtts_pipeline.py                     # One-shot: curate -> analyse -> optimise -> fit
 │   ├── curate_reference.py                  # Curate a clean reference by ECAPA coherence
 │   ├── extract_voices.py                   # Vocal separation by gender
 │   ├── transcribeSong2txt_with_pause.py    # Audio transcription
@@ -112,6 +113,16 @@ Generates guided meditation audio from a text script with pause markers and voic
 - `+ Add voice` button
 - Ambient music and punctual sound cue inputs
 - MP3/FLAC/OGG output options
+
+### [Auto] Pipeline
+
+One-shot mode: add your voices (each with its own language), press Run, and the
+whole chain executes per voice — curation → analysis (Praat/pyin priors) →
+optimisation (seed screen + least-squares temp surface) → closed-loop tone fit
+(auto-text) — then prints the final numbered `{}` / `[]` blocks ready to paste
+into the generator prompt. Also writes a `*_pipeline_clone.wav` per voice:
+**listen to it before generating** — the scores don't hear naturalness.
+CLI equivalent: `xtts_pipeline.py --voice lea.wav FR --voice john.wav EN`.
 
 ### [Cur] Curation
 
