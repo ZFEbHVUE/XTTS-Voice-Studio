@@ -113,6 +113,15 @@ Generates guided meditation audio from a text script with pause markers and voic
 - Ambient music and punctual sound cue inputs
 - MP3/FLAC/OGG output options
 
+### [Cur] Curation
+
+Builds a clean reference before anything else: windows the raw recording, embeds
+each window with ECAPA, and keeps only the most speaker-coherent ~45 s (breaths,
+noise, reverb tails, off-voice segments are dropped). Output auto-named
+`<ref>_curated.wav`; hand-off buttons push it straight into the Analyser or
+Optimiser. Run the whole downstream pipeline on the curated file — this is the
+single biggest quality lever (Lea: identity 0.69 → 0.85).
+
 ### [Ana] Analyser
 
 Analyses voice reference files and produces ready-to-paste XTTS parameter blocks.
@@ -419,7 +428,7 @@ than an A/B listen.
 
 ## Recommended Workflow1. **Extract reference audio** → Video→Audio tab with XTTS preset (WAV, mono, 22050 Hz)
 2. **Clean if needed** → Vox tab with demucs + deepfilter
-3. **Curate the reference** (optional) → `curate_reference.py` to keep only the most coherent segments
+3. **Curate the reference** → [Cur] Curation tab (or `curate_reference.py`) to keep only the most coherent segments — then use the curated file everywhere downstream
 4. **Analyse** → Analyser tab, Praat mode, multiple reference files (gives `{}`/`[]` priors)
 5. **Find best seed + params** → Validator tab (manual A/B + scores) **or** `xtts_optimize.py` (automated search) → winning `{}` block
 6. **Fit the tone** → Comparator tab: paste the frozen `{}`; closed-loop `eq`/`vol`/`hp`/`lp` by least squares

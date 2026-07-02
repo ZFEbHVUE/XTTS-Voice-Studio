@@ -763,6 +763,91 @@ LANGS = ['FR','EN','ES','DE','IT','PT','PL','TR','RU','NL','CS','AR','ZH-CN','HU
 
 # ── Tab: Analyser ───────────────────────────────────────────────────────────
 
+# ── Tab: Curation ─────────────────────────────────────────────────────────────
+
+def tab_curate(nb):
+    f = ttk.Frame(nb)
+    nb.add(f, text="[Cur] Curation")
+    f.grid_columnconfigure(1, weight=1)
+
+    v_cur_input   = tk.StringVar()
+    v_cur_output  = tk.StringVar()
+    v_cur_keep    = tk.StringVar(value='45')
+    v_cur_window  = tk.StringVar(value='4')
+    v_cur_hop     = tk.StringVar(value='2')
+    v_cur_minsc   = tk.StringVar(value='auto')
+    try:
+        import torch as _t_cur
+        _cur_dev = 'cuda' if _t_cur.cuda.is_available() else 'cpu'
+    except Exception:
+        _cur_dev = 'cpu'
+    v_cur_device  = tk.StringVar(value=_cur_dev)
+
+    add_row(f, "Voice ref(s)", v_cur_input, 0,
+            [("Audio", "*.wav *.mp3 *.flac *.ogg"), ("All", "*.*")],
+            multi=True, initialdir=DIR_VOICES)
+    add_row(f, "Curated output", v_cur_output, 1,
+            [("WAV", "*.wav")], save=True, initialdir=DIR_VOICES)
+
+    def _suggest_out(*_):
+        # Auto-fill "<first_ref>_curated.wav" when output is empty
+        if v_cur_input.get().strip() and not v_cur_output.get().strip():
+            first = v_cur_input.get().split()[0]
+            base, _ext = os.path.splitext(first)
+            v_cur_output.set(base + "_curated.wav")
+    v_cur_input.trace_add('write', _suggest_out)
+
+    frm_c = tk.Frame(f); frm_c.grid(row=2, column=0, columnspan=3, sticky='w', padx=6, pady=3)
+    for lbl, var, w in [("Keep seconds", v_cur_keep, 5), ("Window s", v_cur_window, 4),
+                        ("Hop s", v_cur_hop, 4), ("Min score", v_cur_minsc, 6)]:
+        tk.Label(frm_c, text=lbl).pack(side='left', padx=(6, 2))
+        tk.Entry(frm_c, textvariable=var, width=w).pack(side='left')
+    tk.Label(frm_c, text="Device").pack(side='left', padx=(10, 2))
+    ttk.Combobox(frm_c, textvariable=v_cur_device, values=['cpu', 'cuda'],
+                 width=6, state='readonly').pack(side='left')
+
+    tk.Label(f, text="Keeps only the most speaker-coherent windows (ECAPA) — breaths,"
+                     " noise, off-voice segments are dropped. Run everything downstream"
+                     " (Analyser/Optimiser/Comparator) on the curated file.",
+             fg='gray', font=("Arial", 8), justify='left', wraplength=560,
+             anchor='w').grid(row=3, column=0, columnspan=3, sticky='w', padx=8)
+
+    console = add_console(f, 5)
+
+    def lancer(btn, stop_btn=None):
+        refs = [r for r in v_cur_input.get().split() if r.strip()]
+        if not refs:
+            log(console, "[ERR] At least one voice reference required."); return
+        if not v_cur_output.get().strip():
+            log(console, "[ERR] Output file required."); return
+        cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'curate_reference.py')]
+        cmd += refs
+        cmd += ['-o', v_cur_output.get().strip()]
+        cmd += ['--keep-seconds', v_cur_keep.get().strip() or '45']
+        cmd += ['--window', v_cur_window.get().strip() or '4']
+        cmd += ['--hop', v_cur_hop.get().strip() or '2']
+        cmd += ['--min-score', v_cur_minsc.get().strip() or 'auto']
+        cmd += ['--device', v_cur_device.get()]
+        run_cmd(cmd, console, btn, stop_btn)
+
+    make_btn(f, ">  Curate", lancer, 4)
+
+    frm_cho = tk.Frame(f)
+    frm_cho.grid(row=6, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
+    tk.Label(frm_cho, text="Use curated file →", fg="gray",
+             font=("Arial", 8)).pack(side='left', padx=(0, 4))
+    def _cur_to(target, name):
+        out = v_cur_output.get().strip()
+        if not out or not os.path.exists(out):
+            log(console, "[!] Run the curation first."); return
+        ok = _handoff_set(target, out)
+        log(console, f"[→] Sent curated file to {name}" if ok else f"[!] {name} tab not ready.")
+    tk.Button(frm_cho, text="→ Analyser",
+              command=lambda: _cur_to('ana_voice1', 'Analyser')).pack(side='left', padx=2)
+    tk.Button(frm_cho, text="→ Optimiser",
+              command=lambda: _cur_to('opt_voices', 'Optimiser')).pack(side='left', padx=2)
+
+
 def tab_analyser(nb):
     f = ttk.Frame(nb)
     nb.add(f, text="[Ana] Analyser")
@@ -847,6 +932,7 @@ def tab_analyser(nb):
 
     add_voice_row(1)
     add_voice_row(2)
+    TARGETS['ana_voice1'] = voice_rows[0][0]   # Curation -> Analyser hand-off
 
     # Add button + precise option
     ctrl_frame = tk.Frame(f)
@@ -1677,13 +1763,14 @@ def tab_optimize(nb):
     v_opt_xtts   = tk.StringVar()
     v_opt_text   = tk.StringVar(value="Bonjour, ceci est une phrase de test pour régler la voix avec soin.")
     v_opt_seeds  = tk.StringVar(value='0 42 100 200')
-    v_opt_budget = tk.StringVar(value='25')
+    v_opt_budget = tk.StringVar(value='60')
     v_opt_wacc   = tk.StringVar(value='0.6')
     v_opt_wid    = tk.StringVar(value='0.4')
     v_opt_maxref = tk.StringVar(value='30')
     v_opt_model  = tk.StringVar(value='small')
 
     TARGETS['opt_xtts'] = v_opt_xtts   # Analyser -> Optimiser hand-off
+    TARGETS['opt_voices'] = v_opt_voices   # Curation -> Optimiser hand-off
 
     add_row(f, "Voice ref(s)", v_opt_voices, 0,
             [("Audio", "*.wav *.mp3 *.flac *.ogg"), ("All", "*.*")],
@@ -1938,6 +2025,7 @@ def main():
     nb.pack(fill='both', expand=True, padx=8, pady=8)
 
     tab_generator(nb)
+    tab_curate(nb)
     tab_analyser(nb)
     tab_transcribe(nb)
     tab_extract(nb)
