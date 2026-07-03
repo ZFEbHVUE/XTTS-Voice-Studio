@@ -113,23 +113,42 @@ def curate(refs, out_path, keep_seconds=45.0, window=4.0, hop=2.0,
         thr = float(min_score)
 
     order = np.argsort(-cos)                  # best first
-    chosen, total = [], 0.0
+    # Windows overlap (hop < window), so naive concatenation would DUPLICATE the
+    # overlapped audio. Select by net (union) contribution and merge intervals.
+    def _merge(iv):
+        iv = sorted(iv)
+        out = [list(iv[0])]
+        for s, e in iv[1:]:
+            if s <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], e)
+            else:
+                out.append([s, e])
+        return out
+
+    chosen, unions, total = [], [], 0.0
     for idx in order:
         if cos[idx] < thr:
             break
+        s, e = wins[idx][0], wins[idx][1]
+        covered = sum(max(0, min(e, ue) - max(s, us)) for us, ue in unions)
+        if (e - s) - covered <= 0:
+            continue                          # fully covered already — no new audio
         chosen.append(idx)
-        total += (wins[idx][1] - wins[idx][0]) / sr0
+        unions = _merge(unions + [[s, e]])
+        total = sum(ue - us for us, ue in unions) / sr0
         if total >= keep_seconds:
             break
     if not chosen:                            # safety: keep the single best
-        chosen = [int(order[0])]
-    chosen.sort()                             # back to time order
+        idx = int(order[0])
+        chosen = [idx]
+        unions = [[wins[idx][0], wins[idx][1]]]
+        total = (wins[idx][1] - wins[idx][0]) / sr0
 
-    # ── Concatenate selected windows with short crossfades ────────────────────
+    # ── Concatenate merged segments with short crossfades ─────────────────────
     xf = int(0.01 * sr0)                       # 10 ms
     out = np.zeros(0, dtype=np.float32)
-    for k, idx in enumerate(chosen):
-        seg = orig[wins[idx][0]:wins[idx][1]].copy()
+    for k, (s, e) in enumerate(unions):
+        seg = orig[s:e].copy()
         if k > 0 and len(out) >= xf and len(seg) >= xf:
             ramp = np.linspace(0, 1, xf, dtype=np.float32)
             out[-xf:] = out[-xf:] * (1 - ramp) + seg[:xf] * ramp
@@ -146,8 +165,9 @@ def curate(refs, out_path, keep_seconds=45.0, window=4.0, hop=2.0,
         print(f"  Centroid coherence: mean {cos.mean():.3f}  "
               f"min {cos.min():.3f}  max {cos.max():.3f}")
         print(f"  Threshold ({min_score}): {thr:.3f}")
-        print(f"  Kept {len(chosen)}/{len(wins)} windows  "
-              f"({total:.1f}s, mean coherence {kept_cos.mean():.3f})")
+        print(f"  Kept {len(chosen)}/{len(wins)} windows -> {len(unions)} merged "
+              f"segment(s), {total:.1f}s net (no duplicated overlap), "
+              f"mean coherence {kept_cos.mean():.3f}")
         dropped = [i for i in range(len(wins)) if i not in set(chosen)]
         if dropped:
             worst = sorted(dropped, key=lambda i: cos[i])[:5]

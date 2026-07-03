@@ -42,8 +42,7 @@ RE_NEXT  = re.compile(r'Next \[\]\s*:\s*(\[[^\]]*\])')
 def run_stream(cmd, tag):
     """Run a tool, stream its output live (so the GUI console shows progress),
     return (returncode, full_output)."""
-    print(f"\n{'='*70}\n  [{tag}] {' '.join(os.path.basename(c) if i == 1 else c for i, c in enumerate(cmd[1:2])) or ''}"
-          f"{os.path.basename(cmd[1])}\n{'='*70}", flush=True)
+    print(f"\n{'='*70}\n  [{tag}] {os.path.basename(cmd[1])}\n{'='*70}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
     lines = []

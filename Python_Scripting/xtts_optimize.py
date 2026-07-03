@@ -100,10 +100,17 @@ def main():
     p.add_argument('--text', default="Bonjour, ceci est une phrase de test pour régler la voix avec soin.")
     p.add_argument('--text-file', default=None)
     p.add_argument('--seeds', default=None, help='Optional seeds to screen, e.g. "0 42 100"')
-    p.add_argument('--budget', type=int, default=25, help='Max generations (default: 25)')
+    p.add_argument('--method', default='rsm', choices=['rsm', 'coord'],
+                   help="rsm = seed screen + least-squares response surface on temp "
+                        "(matches the problem structure); coord = old coordinate descent")
+    p.add_argument('--keep-seeds', type=int, default=3,
+                   help='RSM: how many top seeds to refine on temp (default: 3)')
+    p.add_argument('--probe-texts', type=int, default=2,
+                   help='RSM: sentences averaged per score to cut phonetic noise (1-3, default: 2)')
+    p.add_argument('--budget', type=int, default=60, help='Max generations (default: 60)')
     p.add_argument('--w-accent', type=float, default=0.6)
     p.add_argument('--w-identity', type=float, default=0.4)
-    p.add_argument('--rounds', type=int, default=2, help='Coordinate-descent rounds (default: 2)')
+    p.add_argument('--rounds', type=int, default=2, help='coord only: descent rounds (default: 2)')
     p.add_argument('--max-ref-len', type=int, default=30)
     p.add_argument('--whisper-model', default='small')
     p.add_argument('--whisper-device', default='cpu',
@@ -124,12 +131,23 @@ def main():
     block_seed = int(xtts.get('seed', 0))
     seeds = [int(s) for s in re.findall(r'-?\d+', args.seeds)] if args.seeds else [block_seed]
 
+    # Probe sentences: varied phonetics so the score reflects the voice, not one
+    # sentence's sounds. XTTS is deterministic given (seed, params), so averaging
+    # across sentences is the only real variance reduction available.
+    PROBES = [
+        text,
+        "Le soleil se couche doucement derrière les collines lointaines.",
+        "Respire profondément et laisse partir toutes les tensions.",
+    ]
+    n_probe = max(1, min(3, args.probe_texts))
+    probe_texts = PROBES[:n_probe]
+
     print("=" * 64)
-    print("  XTTS Sampling Optimiser — coordinate descent (accent + identity)")
+    print(f"  XTTS Sampling Optimiser — method: {args.method}  (accent + identity)")
     print("=" * 64)
     print(f"  Reference : {os.path.basename(args.reference)}   lang {lang}")
     print(f"  Objective : {args.w_accent:.2f}·french + {args.w_identity:.2f}·identity")
-    print(f"  Budget    : {args.budget} generations   seeds {seeds}")
+    print(f"  Budget    : {args.budget} gens   seeds {seeds}   probe-texts {max(1, min(3, args.probe_texts))}")
     print("=" * 64)
 
     import torch
@@ -159,77 +177,159 @@ def main():
     cache, evals = {}, [0]
     wa, wi = args.w_accent, args.w_identity
 
-    def key(seed, prm):
+    def key(seed, prm, ntext):
         return (seed, round(prm['temp'], 3), int(prm['top_k']),
-                round(prm['top_p'], 3), round(prm['rep_pen'], 2))
+                round(prm['top_p'], 3), round(prm['rep_pen'], 2), ntext)
 
-    def evaluate(seed, prm):
-        k = key(seed, prm)
+    def evaluate(seed, prm, texts=None):
+        """Score = mean over `texts` of (wa*french + wi*identity). Deterministic
+        per (seed, params, text), so cached."""
+        texts = texts or [text]
+        k = key(seed, prm, len(texts))
         if k in cache:
             return cache[k]
         if evals[0] >= args.budget:
             return None
-        evals[0] += 1
-        wav = os.path.join(tmpdir, f"o_{evals[0]}.wav")
-        XC.generate(model, text, lang, lat_common, wav,
-                    temperature=prm['temp'], length_penalty=prm.get('len_pen', 1.0),
-                    repetition_penalty=prm['rep_pen'], top_k=int(prm['top_k']),
-                    top_p=prm['top_p'], speed=1.0, seed=seed)
-        pr = pron.score(wav, lang=lang, target_text=text)
-        co = enc.cosine(ref_emb, enc.embed(wav))
-        if device == 'cuda':
-            try: torch.cuda.empty_cache()
-            except Exception: pass
-        sc = wa * pr['score'] + wi * co
-        rec = dict(score=sc, french=pr['score'], identity=co, wer=pr['wer'],
-                   detected=pr['detected'], seed=seed, **{a: prm[a] for a in GRID})
+        frs, ids = [], []
+        for ti, txt in enumerate(texts):
+            evals[0] += 1
+            wav = os.path.join(tmpdir, f"o_{evals[0]}.wav")
+            XC.generate(model, txt, lang, lat_common, wav,
+                        temperature=prm['temp'], length_penalty=prm.get('len_pen', 1.0),
+                        repetition_penalty=prm['rep_pen'], top_k=int(prm['top_k']),
+                        top_p=prm['top_p'], speed=1.0, seed=seed)
+            pr = pron.score(wav, lang=lang, target_text=txt)
+            co = enc.cosine(ref_emb, enc.embed(wav))
+            if device == 'cuda':
+                try: torch.cuda.empty_cache()
+                except Exception: pass
+            frs.append(pr['score']); ids.append(co)
+        fr = sum(frs) / len(frs); co = sum(ids) / len(ids)
+        sc = wa * fr + wi * co
+        rec = dict(score=sc, french=fr, identity=co, wer=None, detected='',
+                   seed=seed, **{a: prm[a] for a in GRID})
         cache[k] = rec
-        print(f"  [{evals[0]:>2}] seed={seed} temp={prm['temp']:.2f} rep={prm['rep_pen']:.1f} "
-              f"top_p={prm['top_p']:.2f} top_k={int(prm['top_k'])}  ->  "
-              f"score={sc:.3f} (fr={pr['score']:.3f} id={co:.3f})")
+        print(f"  [{evals[0]:>3}] seed={seed:>3} temp={prm['temp']:.2f} rep={prm['rep_pen']:.1f} "
+              f"top_p={prm['top_p']:.2f} top_k={int(prm['top_k'])} (n={len(texts)})  ->  "
+              f"score={sc:.3f} (fr={fr:.3f} id={co:.3f})")
         return rec
 
-    # ── Optional seed screen at block params ──────────────────────────────────
     start = {a: float(xtts.get(a, GRID[a][len(GRID[a]) // 2])) for a in GRID}
     start['len_pen'] = float(xtts.get('len_pen', 1.0))
-    if len(seeds) > 1:
-        print("-" * 64 + "\n  Seed screen (block params)\n" + "-" * 64)
-        best_seed, best_sc = seeds[0], -1
-        for s in seeds:
-            r = evaluate(s, start)
-            if r and r['score'] > best_sc:
-                best_sc, best_seed = r['score'], s
-        seed = best_seed
-        print(f"  -> seed {seed}\n")
-    else:
-        seed = seeds[0]
 
-    # ── Coordinate descent ────────────────────────────────────────────────────
-    print("-" * 64 + "\n  Coordinate descent\n" + "-" * 64)
-    cur = dict(start)
-    base = evaluate(seed, cur) or dict(score=-1)
-    best_score = base['score']
-    for rnd in range(1, args.rounds + 1):
-        improved = False
-        for axis in AXIS_ORDER:
-            cands = GRID[axis]
-            best_v, best_r = cur[axis], None
-            for v in cands:
-                trial = dict(cur); trial[axis] = v
-                r = evaluate(seed, trial)
-                if r is None:
+    if args.method == 'coord':
+        # ── Legacy coordinate descent ─────────────────────────────────────────
+        if len(seeds) > 1:
+            print("-" * 64 + "\n  Seed screen (block params)\n" + "-" * 64)
+            best_seed, best_sc = seeds[0], -1
+            for s in seeds:
+                r = evaluate(s, start)
+                if r and r['score'] > best_sc:
+                    best_sc, best_seed = r['score'], s
+            seed = best_seed
+            print(f"  -> seed {seed}\n")
+        else:
+            seed = seeds[0]
+        print("-" * 64 + "\n  Coordinate descent\n" + "-" * 64)
+        cur = dict(start)
+        best_score = (evaluate(seed, cur) or dict(score=-1))['score']
+        for rnd in range(1, args.rounds + 1):
+            improved = False
+            for axis in AXIS_ORDER:
+                best_v, best_r = cur[axis], None
+                for v in GRID[axis]:
+                    trial = dict(cur); trial[axis] = v
+                    r = evaluate(seed, trial)
+                    if r is None:
+                        break
+                    if r['score'] > best_score + 1e-6:
+                        best_score, best_v, best_r = r['score'], v, r
+                if best_r is not None and best_v != cur[axis]:
+                    cur[axis] = best_v; improved = True
+                    print(f"   round {rnd}: {axis} -> {best_v}  (score {best_score:.3f})")
+                if evals[0] >= args.budget:
                     break
-                if r['score'] > best_score + 1e-6:
-                    best_score, best_v, best_r = r['score'], v, r
-            if best_r is not None and best_v != cur[axis]:
-                cur[axis] = best_v; improved = True
-                print(f"   round {rnd}: {axis} -> {best_v}  (score {best_score:.3f})")
-            if evals[0] >= args.budget:
+            if not improved or evals[0] >= args.budget:
                 break
-        if not improved or evals[0] >= args.budget:
-            break
+        best = sorted(cache.values(), key=lambda r: -r['score'])[0]
 
-    # ── Report ────────────────────────────────────────────────────────────────
+    else:
+        # ── RSM: seed screen + least-squares response surface on temp ─────────
+        rep0, topk0, topp0 = start['rep_pen'], start['top_k'], start['top_p']
+        def P(temp, rep=None, tp=None):
+            return {'temp': temp, 'rep_pen': rep0 if rep is None else rep,
+                    'top_k': topk0, 'top_p': topp0 if tp is None else tp,
+                    'len_pen': start['len_pen']}
+
+        # Stage 1 — seed screen (1 sentence, ranking only; seed is chaotic so we
+        # brute-screen it — there is no smooth structure to exploit).
+        print("-" * 64 + "\n  Stage 1 — seed screen (1 sentence, rank)\n" + "-" * 64)
+        screen = [r for s in seeds for r in [evaluate(s, P(start['temp']), [text])] if r]
+        screen.sort(key=lambda r: -r['score'])
+        keep = [r['seed'] for r in screen[:max(1, args.keep_seeds)]]
+        print(f"  kept seeds (top {len(keep)}): {keep}")
+
+        # Stage 2 — least-squares parabola of score vs temp, per kept seed.
+        # temp is the one smooth continuous axis, so this is where LS belongs.
+        print("\n" + "-" * 64 + "\n  Stage 2 — least-squares temp surface (avg of "
+              f"{len(probe_texts)} sentences)\n" + "-" * 64)
+        temps = [0.45, 0.55, 0.65, 0.75, 0.85]
+        per_seed_best = []
+        for s in keep:
+            pts = [r for t in temps for r in [evaluate(s, P(t), probe_texts)] if r]
+            if len(pts) >= 3:
+                ts = np.array([r['temp'] for r in pts])
+                ss = np.array([r['score'] for r in pts])
+                a, b, c = np.polyfit(ts, ss, 2)          # least-squares quadratic
+                if a < -1e-6:                            # concave => interior maximum
+                    t_star = float(np.clip(-b / (2 * a), 0.45, 0.85))
+                    print(f"  seed {s}: LS vertex temp* = {t_star:.3f}")
+                    rs = evaluate(s, P(t_star), probe_texts)
+                    if rs:
+                        pts.append(rs)
+                else:
+                    print(f"  seed {s}: surface not concave -> best sampled")
+            bs = max(pts, key=lambda r: r['score'])
+            per_seed_best.append(bs)
+            print(f"  seed {s}: best temp {bs['temp']:.3f}  score {bs['score']:.3f} "
+                  f"(fr {bs['french']:.3f} id {bs['identity']:.3f})")
+        best = max(per_seed_best, key=lambda r: r['score'])
+        seed = best['seed']; tw = best['temp']
+
+        # Stage 3 — inertness probe: confirm rep_pen / top_p don't move the output
+        # here (your runs showed they often don't); adopt any that genuinely helps.
+        print("\n" + "-" * 64 + "\n  Stage 3 — inertness probe (rep_pen, top_p)\n" + "-" * 64)
+        base = best['score']; probes = []
+        for rp in [4.0, 10.0]:
+            r = evaluate(seed, P(tw, rep=rp), probe_texts)
+            if r: probes.append((('rep_pen', rp), r))
+        for tp in [0.80, 0.90]:
+            r = evaluate(seed, P(tw, tp=tp), probe_texts)
+            if r: probes.append((('top_p', tp), r))
+        spread = max((abs(r['score'] - base) for _, r in probes), default=0.0)
+        if spread < 0.01:
+            print(f"  rep_pen/top_p inert here (max Δscore {spread:.3f}) -> frozen at "
+                  f"rep_pen={rep0}, top_p={topp0}")
+        else:
+            (axval, r) = max(probes, key=lambda pr: pr[1]['score'])
+            print(f"  sensitivity {spread:.3f}; best probe {axval[0]}={axval[1]} "
+                  f"score {r['score']:.3f}")
+            if r['score'] > base + 1e-6:
+                best = r
+
+        # Pareto front: french vs identity, so you can pick the tradeoff yourself
+        vals = list(cache.values())
+        def dom(r):
+            return any(o['french'] >= r['french'] and o['identity'] >= r['identity']
+                       and (o['french'] > r['french'] or o['identity'] > r['identity'])
+                       for o in vals)
+        pareto = sorted([r for r in vals if not dom(r)], key=lambda r: -r['identity'])
+        print(f"\n{'='*64}\n  PARETO FRONT (accent vs identity — pick your tradeoff)\n{'='*64}")
+        print(f"  {'french':>8}{'ident':>7}{'  seed':>6}{'temp':>6}")
+        for r in pareto[:10]:
+            print(f"  {r['french']:>8.3f}{r['identity']:>7.3f}{r['seed']:>6}{r['temp']:>6.2f}")
+
+    # ── Shared report ─────────────────────────────────────────────────────────
     ranked = sorted(cache.values(), key=lambda r: -r['score'])
     print(f"\n{'='*64}\n  TOP RESULTS ({evals[0]} generations)\n{'='*64}")
     print(f"  {'score':>6}{'french':>8}{'ident':>7}{'  seed':>6}{'temp':>6}{'rep':>5}{'top_p':>7}{'top_k':>6}")
@@ -237,8 +337,9 @@ def main():
         print(f"  {r['score']:>6.3f}{r['french']:>8.3f}{r['identity']:>7.3f}{r['seed']:>6}"
               f"{r['temp']:>6.2f}{r['rep_pen']:>5.1f}{r['top_p']:>7.2f}{int(r['top_k']):>6}")
 
-    best = ranked[0]
-    win = dict(start); win.update({a: best[a] for a in GRID})
+    # Winner block: inherit ALL non-searched fields (trim/fade/gpt_cond_len/...)
+    # from the input {} — only the searched axes are overwritten.
+    win = dict(xtts); win.update({a: best[a] for a in GRID})
     print(f"\n  Best: score {best['score']:.3f}  (french {best['french']:.3f}, "
           f"identity {best['identity']:.3f})")
     print(f"  Paste into the Validator/Comparator:")

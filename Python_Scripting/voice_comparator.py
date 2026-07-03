@@ -158,6 +158,12 @@ def apply_post(raw_path, out_path, audio, xtts, lang, gen_path):
             'limiter': int(audio.get('limiter', 1)),
         }
         seg = process_audio(seg, config, xtts_fx)
+        # In the generator, volume is applied AFTER process_audio (in
+        # generate_sentence_audio) — process_audio itself never touches it.
+        # Mirror that here, otherwise the closed loop can never level-match.
+        vol = int(audio.get('vol', 0))
+        if vol:
+            seg = seg + vol
     seg.export(out_path, format='wav')
     return out_path
 
@@ -316,7 +322,7 @@ def main():
         opt['eq_mid']  = round(opt['eq_mid']  + fit['eq_mid'], 1)
         opt['eq_high'] = round(opt['eq_high'] + fit['eq_high'], 1)
         opt['hp'] = fit['hp']; opt['lp'] = fit['lp']
-        opt['vol'] = int(np.clip(opt['vol'] + dvol, -12, 18))
+        opt['vol'] = int(np.clip(opt['vol'] + dvol, -18, 18))
         prev_step = step
         if step < args.conv_threshold:
             print(f"  converged (largest change {step:.2f} dB < {args.conv_threshold} dB)")

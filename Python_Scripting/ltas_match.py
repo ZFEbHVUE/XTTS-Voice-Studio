@@ -135,7 +135,7 @@ def derive_hp_lp(f_grid, ref_db, clone_db, cur_hp=0, cur_lp=0):
 
 # ── Least-squares EQ fit ──────────────────────────────────────────────────────
 
-def level_match_db(ref_y, clone_y, cur_vol=0, lo=-6, hi=12):
+def level_match_db(ref_y, clone_y, cur_vol=0, lo=-18, hi=18):
     """Volume correction (dB) from the RMS gap — the proper level match."""
     r = 20.0 * np.log10(np.sqrt(np.mean(np.asarray(ref_y, float) ** 2)) + 1e-12)
     c = 20.0 * np.log10(np.sqrt(np.mean(np.asarray(clone_y, float) ** 2)) + 1e-12)
