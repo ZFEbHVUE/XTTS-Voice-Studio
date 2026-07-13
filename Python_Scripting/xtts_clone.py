@@ -67,8 +67,10 @@ def set_seed(seed):
 def generate(model, text, lang, latents, out_path,
              temperature=0.65, length_penalty=1.0, repetition_penalty=5.0,
              top_k=50, top_p=0.85, speed=1.0, enable_text_splitting=False,
-             seed=None):
-    """Generate one clip from precomputed latents and write a 24 kHz WAV."""
+             seed=None, num_beams=1, do_sample=True):
+    """Generate one clip from precomputed latents and write a 24 kHz WAV.
+    num_beams>1 switches the GPT decode to beam search (length_penalty becomes
+    active only then); do_sample=False is greedy decoding."""
     import soundfile as sf
     if seed is not None:
         set_seed(seed)
@@ -81,6 +83,8 @@ def generate(model, text, lang, latents, out_path,
         repetition_penalty=float(repetition_penalty),
         top_k=int(top_k),
         top_p=float(top_p),
+        do_sample=bool(do_sample),
+        num_beams=int(num_beams),
         speed=float(speed),
         enable_text_splitting=bool(enable_text_splitting),
     )

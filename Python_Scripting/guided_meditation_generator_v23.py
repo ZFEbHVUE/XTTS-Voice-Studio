@@ -170,6 +170,15 @@ import random
 import numpy as np
 import torch
 
+# v24: low-level XTTS path (honours all cloning knobs + caches latents per voice).
+# Falls back to tts_to_file if xtts_clone.py is not present next to this script.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import xtts_clone as _XC
+except Exception:
+    _XC = None
+_LAT_CACHE = {}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Default audio config (optimised for voice cloning, anti-artifact)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,7 +220,13 @@ DEFAULT_XTTS_PARAMS = {
     'gpt_cond_len': 30,        # seconds of reference WAV used for cloning (default 30)
     'gpt_cond_chunk_len': 4,   # GPT conditioning chunk size in seconds (default 4)
     'sound_norm_refs': 0,      # normalise reference WAV before cloning (0=off, 1=on)
+    'num_beams': 1,            # v24: GPT beam search (1 = sampling; >1 activates length_penalty)
 }
+
+# Seconds of reference used for the SPEAKER EMBEDDING via the low-level path.
+# tts_to_file silently caps this at 10 s (XttsConfig default) — a major cause of
+# weak cloning. The low-level path honours it.
+MAX_REF_LEN = 30
 
 # Alias used internally
 PARAMS_GLOBAUX_DEFAUT = DEFAULT_XTTS_PARAMS
@@ -684,7 +699,8 @@ def parse_xtts_params(segment, base_params):
             'temperature', 'top_k', 'top_p',
             'repetition_penalty', 'length_penalty',    # v21: 2 new keys
             'gpt_cond_len', 'gpt_cond_chunk_len',      # v23: cloning quality
-            'sound_norm_refs']                          # v23: ref normalisation
+            'sound_norm_refs',                          # v23: ref normalisation
+            'num_beams']                                # v24: beam search (optional 15th)
     p = base_params.copy()
 
     for i, key in enumerate(keys):
@@ -935,21 +951,55 @@ def generate_sentence_audio(clean, voice_num, voice_files, tts_instances,
     if isinstance(speaker_wav, list) and len(speaker_wav) == 1:
         speaker_wav = speaker_wav[0]  # unwrap single-item list
     try:
-        tts_instances[voice_num].tts_to_file(
-            text=clean,
-            file_path=temp_file,
-            language=config.get('language', 'fr'),
-            speaker_wav=speaker_wav,
-            temperature=xtts_params['temperature'],
-            length_penalty=xtts_params['length_penalty'],
-            repetition_penalty=xtts_params['repetition_penalty'],
-            top_k=int(xtts_params['top_k']),
-            top_p=xtts_params['top_p'],
-            gpt_cond_len=int(xtts_params.get('gpt_cond_len', 30)),
-            gpt_cond_chunk_len=int(xtts_params.get('gpt_cond_chunk_len', 4)),
-            sound_norm_refs=bool(xtts_params.get('sound_norm_refs', 0)),
-            speed=1.0      # speed applied later via rubberband
-        )
+        if _XC is not None:
+            # v24 low-level path: honours gpt_cond_len / gpt_cond_chunk_len /
+            # max_ref_len / sound_norm_refs (tts_to_file silently overrides them
+            # with config defaults, capping the speaker embedding at 10 s), and
+            # computes the conditioning latents ONCE per voice+settings (cached)
+            # instead of re-extracting them for every sentence.
+            model = tts_instances[voice_num].synthesizer.tts_model
+            lat_key = (voice_num,
+                       int(xtts_params.get('gpt_cond_len', 30)),
+                       int(xtts_params.get('gpt_cond_chunk_len', 4)),
+                       MAX_REF_LEN,
+                       bool(xtts_params.get('sound_norm_refs', 0)))
+            if lat_key not in _LAT_CACHE:
+                _LAT_CACHE[lat_key] = _XC.compute_latents(
+                    model, speaker_wav,
+                    gpt_cond_len=lat_key[1], gpt_cond_chunk_len=lat_key[2],
+                    max_ref_len=lat_key[3], sound_norm_refs=lat_key[4])
+                print(f"  [*]  Voice {voice_num}: conditioning latents computed "
+                      f"(gpt_cond={lat_key[1]}s chunk={lat_key[2]}s max_ref={lat_key[3]}s)")
+            _XC.generate(
+                model, clean, config.get('language', 'fr'), _LAT_CACHE[lat_key],
+                temp_file,
+                temperature=xtts_params['temperature'],
+                length_penalty=xtts_params['length_penalty'],
+                repetition_penalty=xtts_params['repetition_penalty'],
+                top_k=int(xtts_params['top_k']),
+                top_p=xtts_params['top_p'],
+                num_beams=int(xtts_params.get('num_beams', 1)),
+                speed=1.0,     # speed applied later via rubberband
+                seed=None)     # seed is applied per-{}-block upstream, as before
+        else:
+            # Fallback (xtts_clone unavailable): legacy tts_to_file path.
+            # WARNING: gpt_cond_len/chunk/sound_norm_refs are silently ignored
+            # here and the speaker embedding uses only 10 s of reference.
+            tts_instances[voice_num].tts_to_file(
+                text=clean,
+                file_path=temp_file,
+                language=config.get('language', 'fr'),
+                speaker_wav=speaker_wav,
+                temperature=xtts_params['temperature'],
+                length_penalty=xtts_params['length_penalty'],
+                repetition_penalty=xtts_params['repetition_penalty'],
+                top_k=int(xtts_params['top_k']),
+                top_p=xtts_params['top_p'],
+                gpt_cond_len=int(xtts_params.get('gpt_cond_len', 30)),
+                gpt_cond_chunk_len=int(xtts_params.get('gpt_cond_chunk_len', 4)),
+                sound_norm_refs=bool(xtts_params.get('sound_norm_refs', 0)),
+                speed=1.0      # speed applied later via rubberband
+            )
         audio = AudioSegment.from_wav(temp_file)
 
         audio = process_audio(audio, config, xtts_params)
@@ -1223,6 +1273,13 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[*] TTS device: {_device}")
     shared_tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(_device)
+    if _XC is not None:
+        print(f"   [*]  Low-level conditioning path ACTIVE: gpt_cond_len/chunk/"
+              f"sound_norm honoured, speaker embedding uses up to {MAX_REF_LEN}s "
+              f"of reference (tts_to_file caps it at 10s), latents cached per voice.")
+    else:
+        print("   [!]  xtts_clone.py not found -> legacy tts_to_file path "
+              "(gpt_cond_len/max_ref_len NOT honoured; embedding capped at 10s).")
     tts_instances = {i: shared_tts for i in range(1, len(voice_files) + 1)}
     for i in tts_instances:
         print(f"   [OK] TTS ready for voice {i}")

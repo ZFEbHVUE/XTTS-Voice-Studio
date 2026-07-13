@@ -44,7 +44,8 @@ def run_stream(cmd, tag):
     return (returncode, full_output)."""
     print(f"\n{'='*70}\n  [{tag}] {os.path.basename(cmd[1])}\n{'='*70}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+                            text=True, bufsize=1,
+                            env=dict(os.environ, PYTHONUNBUFFERED='1'))
     lines = []
     for line in proc.stdout:
         print(line, end='', flush=True)
@@ -78,6 +79,8 @@ def main():
     p.add_argument('--recurate', action='store_true', help='Redo curation even if the curated file exists')
     p.add_argument('--no-auto-text', action='store_true',
                    help='Comparator: do not transcribe the reference (use its default text)')
+    p.add_argument('--probe-beams', action='store_true',
+                   help='Optimiser: also probe beam-search/greedy decoding on the winner')
     p.add_argument('--whisper-model', default='small')
     p.add_argument('--device', default=None, help='cpu or cuda (default: auto)')
     args = p.parse_args()
@@ -133,6 +136,8 @@ def main():
                '--budget', str(args.budget), '--method', 'rsm',
                '--w-accent', str(args.w_accent), '--w-identity', str(args.w_identity),
                '--whisper-model', args.whisper_model]
+        if args.probe_beams:
+            cmd += ['--probe-beams']
         if args.device:
             cmd += ['--device', args.device]
         rc, out = run_stream(cmd, f'V{n} 3/4 OPTIMISE')

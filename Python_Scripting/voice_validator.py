@@ -289,6 +289,7 @@ def main():
                     repetition_penalty=float(params.get('rep_pen', 5.0)),
                     top_k=int(params.get('top_k', 50)),
                     top_p=float(params.get('top_p', 0.85)),
+                    num_beams=int(params.get('num_beams', 1)),
                     speed=1.0, seed=int(params.get('seed', 0) or 0))
 
     silence = AudioSegment.silent(duration=SILENCE_MS)

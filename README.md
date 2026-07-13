@@ -191,6 +191,13 @@ Takes a **frozen** `{}` block (seed/temp chosen in the Validator) and fits only 
 
 ```
 {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs}
+
+An optional 15th value, `num_beams`, switches the GPT decode to beam search
+(default 1 = sampling). `len_pen` only has an effect when `num_beams > 1` —
+XTTS forwards it to HF `generate()`, which ignores it in sampling mode (the
+runtime warning about `num_beams`/`length_penalty` says exactly this). The
+optimiser's `--probe-beams` tests beam/greedy decoding and emits the 15-value
+block if it wins.
 ```
 
 | Pos | Parameter | Default | Description |
@@ -419,6 +426,17 @@ python curate_reference.py raw_ref.wav -o curated.wav --keep-seconds 45
 Feed `curated.wav` to the Validator / Comparator / Generator.
 
 ### Sampling optimiser (`xtts_optimize.py`)
+
+`--probe-beams` adds an optional decode-mode stage: after the winner is found it
+probes beam search (`num_beams=3`, which finally activates `length_penalty`) and
+greedy decoding (`do_sample=False`), adopting either only if the measured score
+improves — listen before trusting a beam/greedy win, they can sound flatter.
+
+The generator itself now renders through the same low-level XTTS path as the
+rest of the chain (latents cached per voice), so `gpt_cond_len`,
+`gpt_cond_chunk_len`, `sound_norm_refs` and a 30 s speaker embedding
+(`max_ref_len`) actually apply to the final meditation — `tts_to_file` silently
+capped the embedding at 10 s, which quietly degraded every final render.
 
 The automated form of the Validator. The sampling knobs (`temp`, `top_k`,
 `top_p`, `rep_pen`) don't describe the speaker, so they can't be predicted from

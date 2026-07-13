@@ -43,7 +43,8 @@ def parse_xtts_block(block):
     nums = [float(x) for x in re.findall(r'[-+]?\d+(?:\.\d+)?', block)]
     keys = ['seed', 'trim_start', 'trim_end', 'fade_in', 'fade_out',
             'temp', 'top_k', 'top_p', 'rep_pen', 'len_pen',
-            'gpt_cond_len', 'gpt_cond_chunk_len', 'sound_norm_refs']
+            'gpt_cond_len', 'gpt_cond_chunk_len', 'sound_norm_refs',
+            'num_beams']   # optional 15th (v24)
     out = {}
     for i, k in enumerate(keys):
         if i + 1 < len(nums):
@@ -288,6 +289,7 @@ def main():
                 repetition_penalty=xtts.get('rep_pen', 5.0),
                 top_k=int(xtts.get('top_k', 50)),
                 top_p=xtts.get('top_p', 0.85),
+                num_beams=int(xtts.get('num_beams', 1)),
                 speed=1.0, seed=seed)
     print("[OK] Clone generated")
 

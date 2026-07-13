@@ -569,12 +569,12 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
             "expressive" if st_spread < 5.0 else "very expressive")
     print(f"   [*] F0 spread {st_spread:.1f} semitones ({hint}) -> temp prior {temperature}")
 
-    # length_penalty: based on voiced_ratio (speech density)
-    # Dense speech (high voiced_ratio) -> model matches density -> neutral
-    # Sparse speech (slow speaker, many pauses) -> model tends to be shorter -> push up
-    if   voiced_ratio > 0.65: length_penalty = 1.0   # dense / fast speaker -> neutral
-    elif voiced_ratio > 0.45: length_penalty = 1.05  # moderate -> slight push
-    else:                     length_penalty = 1.1   # slow / breathy -> encourage length
+    # length_penalty: DEAD at num_beams=1 (the default). XTTS passes it to
+    # HF generate(), which only uses it in beam-search mode — the runtime warns
+    # about exactly this. Deriving 1.05/1.1 from voiced_ratio was pseudo-
+    # precision applied to an inert knob. Emit neutral; it becomes meaningful
+    # only if the optimiser's --probe-beams adopts num_beams>1.
+    length_penalty = 1.0
 
     # gpt_cond_len: use as much of the reference WAV as available, up to 60s
     # Longer reference = better voice fidelity. Cap at 60s (XTTS limit).

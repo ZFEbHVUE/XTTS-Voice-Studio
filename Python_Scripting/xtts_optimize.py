@@ -71,6 +71,8 @@ def format_xtts_block(seed, p):
              p['temp'], int(p['top_k']), p['top_p'], p['rep_pen'],
              p.get('len_pen', 1.0), int(p.get('gpt_cond_len', 30)),
              int(p.get('gpt_cond_chunk_len', 6)), int(p.get('sound_norm_refs', 0))]
+    if int(p.get('num_beams', 1)) != 1:
+        order.append(int(p['num_beams']))   # optional 15th field (v24 generator+)
     return '{' + ', '.join(fmt(v) for v in order) + '}'
 
 
@@ -111,6 +113,10 @@ def main():
     p.add_argument('--w-accent', type=float, default=0.6)
     p.add_argument('--w-identity', type=float, default=0.4)
     p.add_argument('--rounds', type=int, default=2, help='coord only: descent rounds (default: 2)')
+    p.add_argument('--probe-beams', action='store_true',
+                   help='After the winner is found, probe beam-search decoding '
+                        '(num_beams=3, activates length_penalty) and greedy '
+                        '(do_sample=False); adopt if the score improves')
     p.add_argument('--max-ref-len', type=int, default=30)
     p.add_argument('--whisper-model', default='small')
     p.add_argument('--whisper-device', default='cpu',
@@ -179,7 +185,8 @@ def main():
 
     def key(seed, prm, ntext):
         return (seed, round(prm['temp'], 3), int(prm['top_k']),
-                round(prm['top_p'], 3), round(prm['rep_pen'], 2), ntext)
+                round(prm['top_p'], 3), round(prm['rep_pen'], 2), ntext,
+                int(prm.get('num_beams', 1)), bool(prm.get('do_sample', True)))
 
     def evaluate(seed, prm, texts=None):
         """Score = mean over `texts` of (wa*french + wi*identity). Deterministic
@@ -197,7 +204,9 @@ def main():
             XC.generate(model, txt, lang, lat_common, wav,
                         temperature=prm['temp'], length_penalty=prm.get('len_pen', 1.0),
                         repetition_penalty=prm['rep_pen'], top_k=int(prm['top_k']),
-                        top_p=prm['top_p'], speed=1.0, seed=seed)
+                        top_p=prm['top_p'], speed=1.0, seed=seed,
+                        num_beams=int(prm.get('num_beams', 1)),
+                        do_sample=bool(prm.get('do_sample', True)))
             pr = pron.score(wav, lang=lang, target_text=txt)
             co = enc.cosine(ref_emb, enc.embed(wav))
             if device == 'cuda':
@@ -207,7 +216,8 @@ def main():
         fr = sum(frs) / len(frs); co = sum(ids) / len(ids)
         sc = wa * fr + wi * co
         rec = dict(score=sc, french=fr, identity=co, wer=None, detected='',
-                   seed=seed, **{a: prm[a] for a in GRID})
+                   seed=seed, num_beams=int(prm.get('num_beams', 1)),
+                   **{a: prm[a] for a in GRID})
         cache[k] = rec
         print(f"  [{evals[0]:>3}] seed={seed:>3} temp={prm['temp']:.2f} rep={prm['rep_pen']:.1f} "
               f"top_p={prm['top_p']:.2f} top_k={int(prm['top_k'])} (n={len(texts)})  ->  "
@@ -317,6 +327,28 @@ def main():
             if r['score'] > base + 1e-6:
                 best = r
 
+        # ── Stage 4 (optional) — decode-mode probe: beam search & greedy ──────
+        # num_beams>1 switches the GPT decode to beam search (length_penalty
+        # finally becomes active); do_sample=False is greedy. Both are decoding
+        # modes XTTS exposes but nobody sweeps. Scores don't hear naturalness:
+        # LISTEN before adopting a beam/greedy winner.
+        if args.probe_beams:
+            print("\n" + "-" * 64 + "\n  Stage 4 — decode-mode probe (beam search / greedy)\n" + "-" * 64)
+            b0 = best['score']
+            pb = dict(P(best['temp']), num_beams=3)
+            r = evaluate(best['seed'], pb, probe_texts)
+            if r:
+                print(f"  beam(3): score {r['score']:.3f} (fr {r['french']:.3f} id {r['identity']:.3f})")
+                if r['score'] > b0 + 1e-6:
+                    best = r
+            pg = dict(P(best['temp']), do_sample=False)
+            rg = evaluate(best['seed'], pg, probe_texts)
+            if rg:
+                print(f"  greedy : score {rg['score']:.3f} (fr {rg['french']:.3f} id {rg['identity']:.3f})")
+                if rg['score'] > best['score'] + 1e-6:
+                    print("  (greedy wins on score — verify by ear, greedy can sound flat)")
+                    best = rg
+
         # Pareto front: french vs identity, so you can pick the tradeoff yourself
         vals = list(cache.values())
         def dom(r):
@@ -340,6 +372,7 @@ def main():
     # Winner block: inherit ALL non-searched fields (trim/fade/gpt_cond_len/...)
     # from the input {} — only the searched axes are overwritten.
     win = dict(xtts); win.update({a: best[a] for a in GRID})
+    win['num_beams'] = int(best.get('num_beams', 1))
     print(f"\n  Best: score {best['score']:.3f}  (french {best['french']:.3f}, "
           f"identity {best['identity']:.3f})")
     print(f"  Paste into the Validator/Comparator:")
