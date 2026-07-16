@@ -44,13 +44,48 @@ import soundfile as sf
 import librosa
 import argparse
 import os
+import re
 import tempfile
 import subprocess
 
 
 # ── Dereverberation ──────────────────────────────────────────────────────────
 
+def _voice_health(y, sr):
+    """Cheap voice-health proxies: HF energy ratio (4-8 kHz vs 0.3-3 kHz, dB) and
+    spectral flatness. Denoisers that eat the voice show up as HF collapse."""
+    n = min(len(y), sr * 60)
+    Y = np.abs(np.fft.rfft(y[:n] * np.hanning(n))) ** 2
+    f = np.fft.rfftfreq(n, 1 / sr)
+    def band(lo, hi):
+        m = (f >= lo) & (f < hi)
+        return float(Y[m].mean()) if m.any() else 1e-12
+    hf_db = 10 * np.log10(band(4000, 8000) / (band(300, 3000) + 1e-12) + 1e-12)
+    flat = float(np.exp(np.mean(np.log(Y + 1e-12))) / (np.mean(Y) + 1e-12))
+    return hf_db, flat
+
+
 def dereverberate(y, sr, method='none', device='cpu'):
+    """Denoise/dereverb with a measured voice-health guard: warns when the
+    processing audibly degrades the voice (HF collapse) — the elo lesson:
+    stacked denoisers destroy timbre and cloning identity."""
+    if method == 'none':
+        return y
+    hf0, fl0 = _voice_health(y, sr)
+    out = _dereverberate_impl(y, sr, method=method, device=device)
+    hf1, fl1 = _voice_health(out, sr)
+    d_hf = hf1 - hf0
+    if d_hf < -3.0:
+        print(f"   [!] WARNING: '{method}' removed {-d_hf:.1f} dB of the voice's "
+              f"high band (4-8 kHz) — this dulls timbre and HURTS cloning identity.")
+        print(f"   [!] Use ONE light denoising pass max; never stack denoisers "
+              f"(deepfilter + noisereduce). If the source already sounds clean, use none.")
+    else:
+        print(f"   [*] Voice health after '{method}': HF {d_hf:+.1f} dB (ok)")
+    return out
+
+
+def _dereverberate_impl(y, sr, method='none', device='cpu'):
     if method == 'none':
         return y
     elif method == 'noisereduce':
@@ -88,6 +123,7 @@ def dereverberate(y, sr, method='none', device='cpu'):
         t_sr = 48000
         y48 = librosa.resample(y, orig_sr=sr, target_sr=t_sr) if sr != t_sr else y.copy()
         cs = 30 * t_sr; ov = int(0.5 * t_sr)
+        xf = int(0.02 * t_sr)                       # 20 ms seam crossfade
         chunks = []; n_chunks = int(np.ceil(len(y48) / cs))
         for i in range(n_chunks):
             s = max(0, i * cs - ov); e = min(len(y48), (i + 1) * cs + ov)
@@ -95,12 +131,23 @@ def dereverberate(y, sr, method='none', device='cpu'):
             with torch.no_grad():
                 t = torch.from_numpy(c[None]).float()
                 enh = enhance(model, df_state, t).cpu().numpy()[0]
-            ts = (i * cs - s) if i > 0 else 0
+            # Keep xf extra samples before the nominal seam so consecutive
+            # chunks overlap and can be crossfaded (hard cuts can click:
+            # DeepFilter's output is not sample-consistent across boundaries).
+            ts = max(0, (i * cs - s) - xf) if i > 0 else 0
             te = len(enh) - (e - (i + 1) * cs) if e > (i + 1) * cs else len(enh)
             chunks.append(enh[ts:te])
             print(f"   [*]  {i+1}/{n_chunks}...", end='\r')
         print()
-        out48 = np.concatenate(chunks)
+        out48 = chunks[0]
+        ramp = np.linspace(0, 1, xf, dtype=np.float32)
+        for c in chunks[1:]:
+            if len(out48) >= xf and len(c) >= xf:
+                out48 = np.concatenate([out48[:-xf],
+                                        out48[-xf:] * (1 - ramp) + c[:xf] * ramp,
+                                        c[xf:]])
+            else:
+                out48 = np.concatenate([out48, c])
         out = librosa.resample(out48, orig_sr=t_sr, target_sr=sr) if sr != t_sr else out48
         res = np.zeros_like(y); res[:min(len(out), len(y))] = out[:min(len(out), len(y))]
         return res.astype(np.float32)
@@ -109,8 +156,10 @@ def dereverberate(y, sr, method='none', device='cpu'):
 
 # ── Demucs music removal ─────────────────────────────────────────────────────
 
-def remove_music_demucs(input_file, demucs_model='htdemucs_ft', device='cpu'):
-    """Use demucs to separate vocals. Returns (y_vocals, sr) or (None, None)."""
+def remove_music_demucs(input_file, demucs_model='htdemucs_ft', device='cpu', shifts=2):
+    """Use demucs to separate vocals. Returns (y_vocals, sr) or (None, None).
+    shifts>1 = test-time augmentation (N shifted passes averaged) — demucs'
+    main quality lever: cleaner vocal stem, fewer music residues, ~N x slower."""
     try:
         import demucs.separate
     except ImportError:
@@ -121,8 +170,9 @@ def remove_music_demucs(input_file, demucs_model='htdemucs_ft', device='cpu'):
 
     tmp_dir = tempfile.mkdtemp(prefix='demucs_')
     try:
-        print(f"   [*] demucs ({demucs_model}) separating sources...")
-        demucs_args = ["--two-stems", "vocals", "-n", demucs_model, "--out", tmp_dir]
+        print(f"   [*] demucs ({demucs_model}, shifts={shifts}) separating sources...")
+        demucs_args = ["--two-stems", "vocals", "-n", demucs_model,
+                       "--shifts", str(int(shifts)), "--out", tmp_dir]
         if device == "cuda":
             demucs_args += ["--device", "cuda"]
         demucs_args.append(input_file)
@@ -152,26 +202,45 @@ _TEMPO = 1.0   # global time-stretch factor (pitch preserved); set from --tempo
 
 
 def _time_stretch(y, sr, rate):
-    """Time-stretch preserving pitch/timbre. rate>1 faster, rate<1 slower."""
+    """Time-stretch preserving pitch/timbre. rate>1 faster, rate<1 slower.
+    Engine order: rubberband CLI (R3 '--fine' when available — best for voice),
+    else librosa phase vocoder (audibly metallic on speech; loud warning)."""
     if rate is None or rate <= 0 or abs(rate - 1.0) < 1e-3:
         return y
-    y = np.asarray(y)
-    try:
-        import pyrubberband as prb
-        if y.ndim == 1:
-            return prb.time_stretch(y, sr, rate)
-        chans = [prb.time_stretch(np.ascontiguousarray(y[:, c]), sr, rate)
-                 for c in range(y.shape[1])]
-        n = min(len(c) for c in chans)
-        return np.stack([c[:n] for c in chans], axis=1)
-    except Exception:
-        import librosa
-        if y.ndim == 1:
-            return librosa.effects.time_stretch(y.astype(np.float32), rate=rate)
-        chans = [librosa.effects.time_stretch(np.ascontiguousarray(y[:, c]).astype(np.float32), rate=rate)
-                 for c in range(y.shape[1])]
-        n = min(len(c) for c in chans)
-        return np.stack([c[:n] for c in chans], axis=1)
+    import shutil, subprocess, tempfile as _tf
+    y = np.asarray(y, dtype=np.float32)
+    rb = shutil.which('rubberband')
+    if rb:
+        try:
+            vp = subprocess.run([rb, '--version'], capture_output=True, text=True)
+            ver = (vp.stderr or '') + (vp.stdout or '')
+            m = re.search(r'(\d+)\.', ver)
+            major = int(m.group(1)) if m else 2
+            fi = _tf.NamedTemporaryFile(suffix='.wav', delete=False).name
+            fo = _tf.NamedTemporaryFile(suffix='.wav', delete=False).name
+            sf.write(fi, y, sr)                 # stereo handled natively
+            cmd = [rb, '--tempo', str(rate)]
+            if major >= 3:
+                cmd.append('--fine')            # R3 engine: much cleaner speech
+            cmd += [fi, fo]
+            subprocess.run(cmd, check=True, capture_output=True)
+            out, _ = sf.read(fo, dtype='float32')
+            os.unlink(fi); os.unlink(fo)
+            print(f"   [*] time-stretch x{rate} via rubberband "
+                  f"{'R3 (--fine)' if major >= 3 else 'R2 (install rubberband>=3 for cleaner voice)'}")
+            return out
+        except Exception as e:
+            print(f"   [!] rubberband failed ({e}) -> librosa fallback")
+    else:
+        print("   [!] 'rubberband' binary NOT FOUND -> librosa phase-vocoder fallback,")
+        print("   [!] which sounds METALLIC on voice. Fix: sudo apt install rubberband-cli")
+    import librosa
+    if y.ndim == 1:
+        return librosa.effects.time_stretch(y, rate=rate)
+    chans = [librosa.effects.time_stretch(np.ascontiguousarray(y[:, c]), rate=rate)
+             for c in range(y.shape[1])]
+    n = min(len(c) for c in chans)
+    return np.stack([c[:n] for c in chans], axis=1)
 
 
 def save_audio(y, sr, output_file, mp3_bitrate=192, mp3_mode='cbr'):
@@ -944,12 +1013,110 @@ def cluster_speakers(y, sr, segs, ov_range=80, device='cpu'):
     return result, (f_centroid, m_centroid)
 
 
+def cluster_speakers_ecapa(y, sr, segs, device='cpu'):
+    """
+    SPEAKER-based clustering: ECAPA-TDNN embedding per segment + k-means k=2.
+
+    Unlike F0 clustering, this separates by WHO is speaking, not by pitch —
+    so two women, or a high-pitched man vs a low-pitched woman, are separable
+    (pitch-based separation fails there by construction). Clusters are then
+    labelled female/male from their median F0 so --keep female/male keeps
+    working. Same return contract as cluster_speakers:
+      ({seg_idx: 'female'|'male'|'silence'}, (f0_female_hz, f0_male_hz))
+    Falls back to F0 clustering if speechbrain/ECAPA is unavailable.
+    """
+    try:
+        from speaker_identity import SpeakerEncoder
+        enc = SpeakerEncoder(device=device)
+    except Exception as e:
+        print(f"   [!] ECAPA unavailable ({e}) -> F0 clustering fallback")
+        return cluster_speakers(y, sr, segs, device=device)
+    from scipy.signal import resample_poly
+    from scipy.cluster.vq import kmeans2
+    from math import gcd
+
+    g16 = gcd(int(sr), 16000)
+    embs, idxs = [], []
+    print(f"   [*] ECAPA embeddings on {len(segs)} segments...")
+    for i, (start, end) in enumerate(segs):
+        if end - start < 0.5:                      # too short for a reliable embedding
+            continue
+        seg = y[int(start * sr):int(end * sr)]
+        s16 = resample_poly(seg, 16000 // g16, sr // g16).astype(np.float32)
+        try:
+            e = np.asarray(enc.embed(s16, sr=16000), dtype=np.float64).ravel()
+        except Exception:
+            continue
+        embs.append(e / (np.linalg.norm(e) + 1e-9))
+        idxs.append(i)
+        print(f"   [*] {len(embs)} embedded\r", end="", flush=True)
+    print()
+    if len(embs) < 4:
+        print("   [!] Too few voiced segments for ECAPA clustering -> F0 fallback")
+        return cluster_speakers(y, sr, segs, device=device)
+
+    E = np.stack(embs)
+    np.random.seed(0)                              # deterministic k-means init
+    try:
+        centroids, labels = kmeans2(E, 2, minit='++', iter=50)
+    except Exception as e:
+        print(f"   [!] kmeans2 error: {e} -> F0 fallback")
+        return cluster_speakers(y, sr, segs, device=device)
+
+    c0 = centroids[0] / (np.linalg.norm(centroids[0]) + 1e-9)
+    c1 = centroids[1] / (np.linalg.norm(centroids[1]) + 1e-9)
+    inter = float(np.dot(c0, c1))
+    if inter > 0.85:
+        print(f"   [!] Clusters very similar (cosine {inter:.2f}) — this recording "
+              f"probably has a SINGLE speaker; the split will be arbitrary.")
+
+    # Label clusters female/male from median F0 of a few representative segments
+    def _cluster_f0(k, cen):
+        members = [j for j in range(len(idxs)) if labels[j] == k]
+        members.sort(key=lambda j: -float(np.dot(E[j], cen)))   # closest first
+        vals = []
+        for j in members[:6]:
+            s, e_ = segs[idxs[j]]
+            chunk = y[int(s * sr):int(e_ * sr)]
+            try:
+                f0r, vr, _ = librosa.pyin(chunk.astype(np.float32), fmin=60, fmax=500, sr=sr)
+                fv = f0r[vr & ~np.isnan(f0r)] if vr is not None else []
+                if len(fv) > 2:
+                    vals.append(float(np.median(fv)))
+            except Exception:
+                pass
+        return float(np.median(vals)) if vals else None
+
+    f0_c0, f0_c1 = _cluster_f0(0, c0), _cluster_f0(1, c1)
+    if f0_c0 is None and f0_c1 is None:
+        print("   [!] Could not measure cluster F0 — labelling arbitrarily (0=female).")
+        female_cluster, f_hz, m_hz = 0, 0.0, 0.0
+    else:
+        if f0_c0 is None: f0_c0 = (f0_c1 or 165) - 1
+        if f0_c1 is None: f0_c1 = (f0_c0 or 165) - 1
+        female_cluster = 0 if f0_c0 >= f0_c1 else 1
+        f_hz = f0_c0 if female_cluster == 0 else f0_c1
+        m_hz = f0_c1 if female_cluster == 0 else f0_c0
+
+    dur = lambda k: sum(segs[idxs[j]][1] - segs[idxs[j]][0]
+                        for j in range(len(idxs)) if labels[j] == k)
+    print(f"   [OK] ECAPA clustering: female={f_hz:.0f} Hz ({dur(female_cluster):.0f}s)  "
+          f"male={m_hz:.0f} Hz ({dur(1 - female_cluster):.0f}s)  "
+          f"inter-cluster cosine {inter:.2f}")
+
+    result = {i: 'silence' for i in range(len(segs))}
+    for j, seg_idx in enumerate(idxs):
+        result[seg_idx] = 'female' if labels[j] == female_cluster else 'male'
+    return result, (f_hz, m_hz)
+
+
 # ── Process principal (méthode F0) ───────────────────────────────────────────
 
 def process(input_file, output_file, keep_set=None, silence_mode='auto',
             deverb_method='none', f0_thr=165, ov_range=80, min_dur=0.2,
             debug=False, remove_music=False, demucs_model='htdemucs_ft', device='cpu',
-            mp3_bitrate=192, mp3_mode='cbr', min_silence=0.15, split_output=False):
+            mp3_bitrate=192, mp3_mode='cbr', min_silence=0.15, split_output=False,
+            demucs_shifts=2, cluster_method='f0'):
 
     if keep_set is None:
         keep_set = {'female_solo'}
@@ -959,7 +1126,7 @@ def process(input_file, output_file, keep_set=None, silence_mode='auto',
 
     # -- Demucs music removal -------------------------------------------------
     if remove_music:
-        y, sr = remove_music_demucs(input_file, demucs_model, device)
+        y, sr = remove_music_demucs(input_file, demucs_model, device, shifts=demucs_shifts)
         if y is None:
             print("[!] Music removal failed — chargement direct")
             y, sr = librosa.load(input_file, sr=None, mono=True)
@@ -998,7 +1165,10 @@ def process(input_file, output_file, keep_set=None, silence_mode='auto',
     # Plus robuste qu'un seuil fixe : s'adapte automatiquement aux deux voix.
     if split_output:
         # Passe 1 : clustering global
-        seg_labels, (f_cent, m_cent) = cluster_speakers(y, sr, segs, ov_range, device)
+        if cluster_method == 'ecapa':
+            seg_labels, (f_cent, m_cent) = cluster_speakers_ecapa(y, sr, segs, device)
+        else:
+            seg_labels, (f_cent, m_cent) = cluster_speakers(y, sr, segs, ov_range, device)
 
         if seg_labels is None:
             # Fallback : logique inverse seuil fixe
@@ -1057,9 +1227,20 @@ def process(input_file, output_file, keep_set=None, silence_mode='auto',
         result      = []
         last_kept_end = None
 
-        for start, end in segs:
-            dur        = end - start
-            kind, f0, cent = classify(y, sr, start, end, f0_thr, ov_range, device)
+        # ECAPA mode: one global speaker clustering, then map to keep labels.
+        seg_labels_ec = None
+        if cluster_method == 'ecapa' and keep_set and (keep_set & {'female_solo', 'male_solo'}):
+            seg_labels_ec, _ = cluster_speakers_ecapa(y, sr, segs, device)
+
+        for i, (start, end) in enumerate(segs):
+            dur = end - start
+            if seg_labels_ec is not None:
+                lab  = seg_labels_ec.get(i, 'silence')
+                kind = ('female_solo' if lab == 'female'
+                        else 'male_solo' if lab == 'male' else 'silence')
+                f0 = cent = None
+            else:
+                kind, f0, cent = classify(y, sr, start, end, f0_thr, ov_range, device)
 
             if debug:
                 f0_s   = f"{f0:.0f}"   if f0   is not None else "  -"
@@ -1145,7 +1326,7 @@ if __name__ == "__main__":
                    help="Durée minimale de silence pour séparer deux segments (défaut: 0.15)")
     p.add_argument("--dereverberate", choices=['none', 'noisereduce', 'wpe', 'deepfilter'],
                    default='none')
-    p.add_argument("--method", choices=['f0', 'sepformer', 'pyannote'], default='f0',
+    p.add_argument("--method", choices=['f0', 'ecapa', 'sepformer', 'pyannote'], default='f0',
                    help="Methode: f0 (defaut) | sepformer (separation neuronale, recommande) | pyannote (requiert --hf-token)")
     p.add_argument("--hf-token", default="",
                    help="Token HuggingFace pour pyannote.audio")
@@ -1161,6 +1342,9 @@ if __name__ == "__main__":
     p.add_argument("--remove-music", action="store_true")
     p.add_argument("--demucs-model", default="htdemucs_ft",
                    choices=["htdemucs", "htdemucs_ft", "mdx_extra"])
+    p.add_argument("--demucs-shifts", type=int, default=2,
+                   help="demucs test-time augmentation passes (1=fast, 2=default, "
+                        "5=best quality; separation time scales with it)")
     p.add_argument("--tempo", type=float, default=1.0,
                    help="Time-stretch factor, pitch preserved (e.g. 0.85 slower, "
                         "1.25 faster; 1.0 = unchanged)")
@@ -1207,4 +1391,6 @@ if __name__ == "__main__":
         process(args.input, args.output, args.keep, args.silence, args.dereverberate,
                 args.threshold, args.overlap_range, args.min_dur, args.debug,
                 args.remove_music, args.demucs_model, args.device,
-                args.mp3_bitrate, args.mp3_mode, args.min_silence, args.split_output)
+                args.mp3_bitrate, args.mp3_mode, args.min_silence, args.split_output,
+                demucs_shifts=args.demucs_shifts,
+                cluster_method=('ecapa' if args.method == 'ecapa' else 'f0'))

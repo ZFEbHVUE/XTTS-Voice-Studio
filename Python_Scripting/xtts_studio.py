@@ -1345,10 +1345,17 @@ def tab_extract(nb):
     tk.Checkbutton(f, text="Remove background music (demucs)",
                    variable=v_remove_music).grid(row=11, column=0, columnspan=2, sticky='w', padx=6, pady=2)
 
-    # row 12 : Demucs model
+    # row 12 : Demucs model + shifts (quality passes)
     tk.Label(f, text="Demucs model", anchor='w', width=20).grid(row=12, column=0, sticky='w', padx=6, pady=3)
-    ttk.Combobox(f, textvariable=v_demucs_model, width=16, state='readonly',
-        values=['htdemucs', 'htdemucs_ft', 'mdx_extra']).grid(row=12, column=1, sticky='w', padx=4)
+    frm_dm = tk.Frame(f)
+    frm_dm.grid(row=12, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_dm, textvariable=v_demucs_model, width=16, state='readonly',
+        values=['htdemucs', 'htdemucs_ft', 'mdx_extra']).pack(side='left')
+    v_demucs_shifts = tk.StringVar(value='2')
+    tk.Label(frm_dm, text="Shifts").pack(side='left', padx=(10, 2))
+    ttk.Combobox(frm_dm, textvariable=v_demucs_shifts, width=4, state='readonly',
+        values=['1', '2', '5']).pack(side='left')
+    tk.Label(frm_dm, text="(1=fast, 5=best)", fg='grey').pack(side='left', padx=(4, 0))
 
     # row 13 : MP3 bitrate
     tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=13, column=0, sticky='w', padx=6, pady=3)
@@ -1365,7 +1372,8 @@ def tab_extract(nb):
     frm_method = tk.Frame(f)
     frm_method.grid(row=14, column=1, sticky='w', padx=4)
     ttk.Combobox(frm_method, textvariable=v_method, width=12, state='readonly',
-        values=['f0', 'sepformer', 'pyannote']).pack(side='left')
+        values=['f0', 'ecapa', 'sepformer', 'pyannote']).pack(side='left')
+    tk.Label(frm_method, text="(ecapa = by speaker, not pitch)", fg='grey').pack(side='left', padx=(6, 0))
     tk.Label(frm_method,
              text="  f0=rapide  |  sepformer=separation reelle  |  pyannote=diarisation",
              fg='grey').pack(side='left')
@@ -1393,7 +1401,8 @@ def tab_extract(nb):
             cmd += ['--tempo', v_vox_tempo.get().strip()]
         cmd += ['--mp3-bitrate', v_mp3_bitrate.get(), '--mp3-mode', v_mp3_mode.get()]
         if v_remove_music.get():
-            cmd += ['--remove-music', '--demucs-model', v_demucs_model.get()]
+            cmd += ['--remove-music', '--demucs-model', v_demucs_model.get(),
+                    '--demucs-shifts', v_demucs_shifts.get()]
         return cmd
 
     def lancer(btn, stop_btn=None):
@@ -1946,6 +1955,138 @@ def tab_optimize(nb):
 
 # ── Tab: Comparator ──────────────────────────────────────────────────────────
 
+
+# ── Tab: RVC (timbre conversion) ─────────────────────────────────────────────
+
+def tab_rvc(nb):
+    f = ttk.Frame(nb)
+    nb.add(f, text="[RVC] Timbre")
+    f.grid_columnconfigure(1, weight=1)
+
+    # ── 1. Dataset (train data for Applio) ───────────────────────────────────
+    tk.Label(f, text="1. Build training dataset (10+ min of the voice)",
+             font=("Arial", 9, "bold"), anchor='w').grid(row=0, column=0, columnspan=3,
+                                                         sticky='w', padx=6, pady=(6, 2))
+    v_rvc_refs = tk.StringVar()
+    v_rvc_ds   = tk.StringVar()
+    v_rvc_min  = tk.StringVar(value='12')
+    try:
+        import torch as _t_rvc
+        _rvc_dev = 'cuda' if _t_rvc.cuda.is_available() else 'cpu'
+    except Exception:
+        _rvc_dev = 'cpu'
+    v_rvc_dev  = tk.StringVar(value=_rvc_dev)
+
+    add_row(f, "Raw voice ref(s)", v_rvc_refs, 1,
+            [("Audio", "*.wav *.mp3 *.flac *.ogg"), ("All", "*.*")],
+            multi=True, initialdir=DIR_VOICES)
+    add_row(f, "Dataset folder", v_rvc_ds, 2, save=True, initialdir=XTTS_ROOT)
+
+    def _rvc_suggest(*_):
+        if v_rvc_refs.get().strip() and not v_rvc_ds.get().strip():
+            base = os.path.splitext(os.path.basename(v_rvc_refs.get().split()[0]))[0]
+            v_rvc_ds.set(os.path.join(XTTS_ROOT, 'RVC_datasets', base))
+    v_rvc_refs.trace_add('write', _rvc_suggest)
+
+    frm_r1 = tk.Frame(f); frm_r1.grid(row=3, column=0, columnspan=3, sticky='w', padx=6, pady=2)
+    tk.Label(frm_r1, text="Keep minutes").pack(side='left', padx=(6, 2))
+    tk.Entry(frm_r1, textvariable=v_rvc_min, width=5).pack(side='left')
+    tk.Label(frm_r1, text="Device").pack(side='left', padx=(10, 2))
+    ttk.Combobox(frm_r1, textvariable=v_rvc_dev, values=['cpu', 'cuda'],
+                 width=6, state='readonly').pack(side='left')
+    tk.Label(frm_r1, text="→ then TRAIN in Applio (docs/RVC_GUIDE.md): 40k, rmvpe, "
+                          "250-300 epochs, save every 50", fg='grey',
+             font=("Arial", 8)).pack(side='left', padx=(12, 0))
+
+    # ── 2. Convert (through the trained model) ────────────────────────────────
+    tk.Label(f, text="2. Convert XTTS output through the trained RVC model",
+             font=("Arial", 9, "bold"), anchor='w').grid(row=5, column=0, columnspan=3,
+                                                         sticky='w', padx=6, pady=(10, 2))
+    v_rvc_applio = tk.StringVar(value=os.path.expanduser('~/Applio'))
+    v_rvc_pth    = tk.StringVar()
+    v_rvc_idx    = tk.StringVar()
+    v_rvc_in     = tk.StringVar()
+    v_rvc_out    = tk.StringVar()
+    v_rvc_pitch  = tk.StringVar(value='0')
+    v_rvc_irate  = tk.StringVar(value='0.75')
+    v_rvc_prot   = tk.StringVar(value='0.33')
+
+    add_row(f, "Applio folder", v_rvc_applio, 6)
+    add_row(f, "Model (.pth)", v_rvc_pth, 7, [("RVC model", "*.pth"), ("All", "*.*")],
+            initialdir=os.path.expanduser('~/Applio/logs'))
+    add_row(f, "Index (.index)", v_rvc_idx, 8, [("Index", "*.index"), ("All", "*.*")],
+            initialdir=os.path.expanduser('~/Applio/logs'))
+    add_row(f, "Input audio", v_rvc_in, 9,
+            [("Audio", "*.wav *.mp3"), ("All", "*.*")], initialdir=DIR_OUTPUT)
+    add_row(f, "Output audio", v_rvc_out, 10, [("WAV", "*.wav")], save=True,
+            initialdir=DIR_OUTPUT)
+
+    def _rvc_out_suggest(*_):
+        if v_rvc_in.get().strip() and not v_rvc_out.get().strip():
+            v_rvc_out.set(os.path.splitext(v_rvc_in.get().strip())[0] + '_rvc.wav')
+    v_rvc_in.trace_add('write', _rvc_out_suggest)
+
+    frm_r2 = tk.Frame(f); frm_r2.grid(row=11, column=0, columnspan=3, sticky='w', padx=6, pady=2)
+    for lbl, var, w in [("Pitch (st)", v_rvc_pitch, 4), ("Index rate", v_rvc_irate, 5),
+                        ("Protect", v_rvc_prot, 5)]:
+        tk.Label(frm_r2, text=lbl).pack(side='left', padx=(6, 2))
+        tk.Entry(frm_r2, textvariable=var, width=w).pack(side='left')
+    tk.Label(frm_r2, text="(index rate ↑ = more target timbre, more artefacts)",
+             fg='grey', font=("Arial", 8)).pack(side='left', padx=(8, 0))
+
+    # ── 3. Measure ────────────────────────────────────────────────────────────
+    tk.Label(f, text="3. Measure identity vs the real reference",
+             font=("Arial", 9, "bold"), anchor='w').grid(row=12, column=0, columnspan=3,
+                                                         sticky='w', padx=6, pady=(10, 2))
+    v_rvc_measref = tk.StringVar()
+    add_row(f, "Real reference", v_rvc_measref, 13,
+            [("Audio", "*.wav *.mp3"), ("All", "*.*")], initialdir=DIR_VOICES)
+
+    console = add_console(f, 15)
+
+    def lancer_dataset(btn, stop_btn=None):
+        refs = [r for r in v_rvc_refs.get().split() if r.strip()]
+        if not refs:
+            log(console, "[ERR] Raw voice reference(s) required."); return
+        if not v_rvc_ds.get().strip():
+            log(console, "[ERR] Dataset folder required."); return
+        cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'prepare_rvc_dataset.py')]
+        cmd += refs + ['-o', v_rvc_ds.get().strip(),
+                       '--keep-minutes', v_rvc_min.get().strip() or '12',
+                       '--device', v_rvc_dev.get()]
+        run_cmd(cmd, console, btn, stop_btn)
+
+    def lancer_convert(btn, stop_btn=None):
+        if not (v_rvc_in.get().strip() and v_rvc_pth.get().strip() and v_rvc_idx.get().strip()):
+            log(console, "[ERR] Input, model .pth and .index are required."); return
+        cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'rvc_convert.py'),
+               v_rvc_in.get().strip(),
+               '-o', v_rvc_out.get().strip() or
+                     (os.path.splitext(v_rvc_in.get().strip())[0] + '_rvc.wav'),
+               '--model', v_rvc_pth.get().strip(),
+               '--index', v_rvc_idx.get().strip(),
+               '--applio-dir', v_rvc_applio.get().strip() or os.path.expanduser('~/Applio'),
+               '--pitch', v_rvc_pitch.get().strip() or '0',
+               '--index-rate', v_rvc_irate.get().strip() or '0.75',
+               '--protect', v_rvc_prot.get().strip() or '0.33']
+        run_cmd(cmd, console, btn, stop_btn)
+
+    def lancer_measure(btn, stop_btn=None):
+        ref = v_rvc_measref.get().strip()
+        if not ref:
+            log(console, "[ERR] Real reference required."); return
+        cands = [c for c in [v_rvc_in.get().strip(), v_rvc_out.get().strip()]
+                 if c and os.path.exists(c)]
+        if not cands:
+            log(console, "[ERR] No existing input/converted file to measure."); return
+        cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'speaker_identity.py'), ref] + cands
+        run_cmd(cmd, console, btn, stop_btn)
+
+    make_btn(f, ">  1. Build dataset", lancer_dataset, 4)
+    make_btn(f, ">  2. Convert", lancer_convert, 14)
+    make_btn(f, ">  3. Measure identity (before/after)", lancer_measure, 16)
+
+
 def tab_comparator(nb):
     f = tk.Frame(nb)
     nb.add(f, text="[Cmp] Comparator")
@@ -2133,6 +2274,7 @@ def main():
     tab_validator(nb)
     tab_optimize(nb)
     tab_comparator(nb)
+    tab_rvc(nb)
 
     def on_close():
         _stop_player()       # stop audio player if running

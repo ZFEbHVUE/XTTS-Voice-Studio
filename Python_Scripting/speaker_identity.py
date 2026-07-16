@@ -103,3 +103,19 @@ class SpeakerEncoder:
 
 
 __all__ = ['SpeakerEncoder']
+
+
+if __name__ == '__main__':
+    # CLI: identity cosine between two audio files (for A/B measurements).
+    #   python speaker_identity.py reference.wav candidate.wav [candidate2.wav ...]
+    import sys as _sys
+    if len(_sys.argv) < 3:
+        _sys.exit("usage: python speaker_identity.py ref.wav candidate.wav [more.wav ...]")
+    _enc = SpeakerEncoder()
+    _ref = _enc.embed(_sys.argv[1])
+    print(f"  reference: {_sys.argv[1]}")
+    for _cand in _sys.argv[2:]:
+        _c = _enc.cosine(_ref, _enc.embed(_cand))
+        _verdict = ("same speaker" if _c > 0.80 else
+                    "close" if _c > 0.60 else "different")
+        print(f"  identity {_c:.4f}  ({_verdict})  {_cand}")

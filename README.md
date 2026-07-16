@@ -52,14 +52,19 @@ conda activate xtts
 ### Step 3 — Install dependencies
 
 ```bash
-pip install TTS torch torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install faster-whisper librosa pydub numpy soundfile pyrubberband scipy
-pip install torchcrepe demucs noisereduce nara-wpe deepfilternet
-pip install praat-parselmouth
-pip install speechbrain          # ECAPA-TDNN speaker identity (comparator)
+# CUDA torch first (pick your CUDA version at pytorch.org):
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-sudo apt install ffmpeg rubberboard-cli
+# Everything else, pinned and documented:
+pip install -r requirements.txt
+
+# System tools (ffmpeg for audio/video, rubberband for pitch-preserving tempo):
+sudo apt install ffmpeg rubberband-cli
 ```
+
+Run this in the `xtts` env on EVERY machine you clone the repo to — git syncs
+the code, never the Python environment (the recurring `ModuleNotFoundError:
+librosa/speechbrain` on a freshly pulled machine is exactly this).
 
 ### Step 4 — Launch the GUI
 
@@ -89,6 +94,8 @@ XTTS-Voice-Studio/
 │   ├── xtts_optimize.py                     # Coordinate-descent search of sampling params
 │   ├── xtts_pipeline.py                     # One-shot: curate -> analyse -> optimise -> fit
 │   ├── curate_reference.py                  # Curate a clean reference by ECAPA coherence
+│   ├── prepare_rvc_dataset.py               # Build an RVC training dataset (10+ min utterances)
+│   ├── rvc_convert.py                       # Timbre conversion via a trained Applio/RVC model
 │   ├── extract_voices.py                   # Vocal separation by gender
 │   ├── transcribeSong2txt_with_pause.py    # Audio transcription
 │   └── video2txt.py                        # Video transcription
@@ -151,9 +158,17 @@ Transcribes audio or video files to XTTS-ready text with pause markers.
 Separates vocal stems from mixed audio or video sources.
 
 - Accepts audio (WAV, MP3, FLAC) and video (MP4, MKV, AVI, MOV, WEBM...)
-- F0-based male/female separation
-- demucs music removal (htdemucs, htdemucs_ft, mdx_extra)
-- Dereverberation: none / noisereduce / wpe / deepfilter
+- Speaker separation methods: `f0` (pitch threshold/k-means), **`ecapa`**
+  (ECAPA-TDNN embedding clustering — separates by WHO speaks, not by pitch,
+  so two same-register speakers are separable; F0 methods fail there by
+  construction), `sepformer`, `pyannote`
+- demucs music removal (htdemucs, htdemucs_ft, mdx_extra) with `--demucs-shifts`
+  (test-time augmentation: 1=fast, 2=default, 5=cleanest vocal stem)
+- Dereverberation: none / noisereduce / wpe / deepfilter — with a measured
+  voice-health guard that warns when denoising eats the voice's high band
+  (dulls timbre, hurts cloning identity; never stack denoisers)
+- Pitch-preserving tempo via rubberband (R3 `--fine` engine when rubberband≥3
+  is installed; loud warning if only the metallic librosa fallback is available)
 
 ### [Pit] Pitch
 
@@ -162,6 +177,17 @@ Applies pitch correction to cloned voice audio.
 ### [Vid] Video→Audio
 
 Extracts audio from any video file with format, channel and sample rate options. Includes an **XTTS preset** button (WAV + mono + 22050 Hz).
+
+### [RVC] Timbre
+
+The stage past the zero-shot ceiling: XTTS clones top out around identity
+0.7–0.85 ("close", not "the person"). An RVC model TRAINED on the target
+(Applio) re-voices the XTTS output with their actual timbre. The tab covers:
+1) building the training dataset (ECAPA-coherent 3–10 s utterances, 10+ min
+needed — `prepare_rvc_dataset.py`), 2) converting any XTTS output through the
+trained model (`rvc_convert.py`, runs Applio's own env), 3) measuring identity
+before/after against the real reference. Training itself stays in Applio's UI
+— see docs/RVC_GUIDE.md for settings and the A/B protocol.
 
 ### [Val] Validator
 
