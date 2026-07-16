@@ -87,7 +87,7 @@ XTTS-Voice-Studio/
 │   ├── voice_analyser.py                   # Acoustic analysis → XTTS params
 │   ├── voice_validator.py                  # Param sweep + accent/identity scoring
 │   ├── voice_comparator.py                 # Closed-loop EQ/vol fit (LTAS, least squares)
-│   ├── speaker_identity.py                 # ECAPA-TDNN speaker embedding / cosine
+│   ├── speaker_identity.py                 # ECAPA speaker embedding + identity CLI (ref vs clones)
 │   ├── pron_score.py                       # French accent scoring via faster-whisper
 │   ├── ltas_match.py                       # LTAS least-squares EQ fit (exact RBJ responses)
 │   ├── xtts_clone.py                        # Low-level XTTS gen honouring all cloning knobs
@@ -96,6 +96,7 @@ XTTS-Voice-Studio/
 │   ├── curate_reference.py                  # Curate a clean reference by ECAPA coherence
 │   ├── prepare_rvc_dataset.py               # Build an RVC training dataset (10+ min utterances)
 │   ├── rvc_convert.py                       # Timbre conversion via a trained Applio/RVC model
+│   ├── chatterbox_ab.py                     # A/B sample vs Chatterbox (own env, see below)
 │   ├── extract_voices.py                   # Vocal separation by gender
 │   ├── transcribeSong2txt_with_pause.py    # Audio transcription
 │   └── video2txt.py                        # Video transcription
@@ -178,17 +179,6 @@ Applies pitch correction to cloned voice audio.
 
 Extracts audio from any video file with format, channel and sample rate options. Includes an **XTTS preset** button (WAV + mono + 22050 Hz).
 
-### [RVC] Timbre
-
-The stage past the zero-shot ceiling: XTTS clones top out around identity
-0.7–0.85 ("close", not "the person"). An RVC model TRAINED on the target
-(Applio) re-voices the XTTS output with their actual timbre. The tab covers:
-1) building the training dataset (ECAPA-coherent 3–10 s utterances, 10+ min
-needed — `prepare_rvc_dataset.py`), 2) converting any XTTS output through the
-trained model (`rvc_convert.py`, runs Applio's own env), 3) measuring identity
-before/after against the real reference. Training itself stays in Applio's UI
-— see docs/RVC_GUIDE.md for settings and the A/B protocol.
-
 ### [Val] Validator
 
 Sweeps XTTS/audio parameters, generates a variation per value for A/B listening, and **scores** each variation to rank them and produce the winning `{}` block.
@@ -200,6 +190,16 @@ Sweeps XTTS/audio parameters, generates a variation per value for A/B listening,
 - Single XTTS generation for audio params (fast), N generations for XTTS params
 - **Scoring** (when a `{}` param is swept): accent (faster-whisper → `french`/WER) + identity (ECAPA cosine vs reference) per variant, a ranked table, and the best `{}` to paste into the Comparator. `--no-score` to disable.
 
+### [Opt] Optimiser
+
+Automated search of the sampling parameters against a measured objective
+(`w_accent`·french + `w_identity`·identity). RSM method: seed screen →
+least-squares temp surface per kept seed → inertness probe (rep_pen/top_p) →
+Pareto front. Fields: voice ref(s), starting `{}` (hand-off from the Analyser),
+seeds to screen, budget, weights, whisper model, device. `--probe-beams`
+optionally tests beam-search/greedy decoding on the winner. Prints the winning
+`{}` block; **→ Comparator** pushes it to the next stage.
+
 ### [Cmp] Comparator
 
 Takes a **frozen** `{}` block (seed/temp chosen in the Validator) and fits only the post-processing tone, in a closed loop against the reference.
@@ -208,6 +208,19 @@ Takes a **frozen** `{}` block (seed/temp chosen in the Validator) and fits only 
 - Each pass renders the full chain (hp/lp/NR/comp/limiter), re-measures, and adds the LS correction — closing the loop on the post-chain colouring.
 - No seed search, no accent/identity scoring (that is the Validator's job).
 - `[]` Audio params field updates automatically with the fitted block.
+
+---
+
+### [RVC] Timbre
+
+The stage past the zero-shot ceiling: XTTS clones top out around identity
+0.7–0.85 ("close", not "the person"). An RVC model TRAINED on the target
+(Applio) re-voices the XTTS output with their actual timbre. The tab covers:
+1) building the training dataset (ECAPA-coherent 3–10 s utterances, 10+ min
+needed — `prepare_rvc_dataset.py`), 2) converting any XTTS output through the
+trained model (`rvc_convert.py`, runs Applio's own env), 3) measuring identity
+before/after against the real reference. Training itself stays in Applio's UI
+— see docs/RVC_GUIDE.md for settings and the A/B protocol.
 
 ---
 
@@ -481,13 +494,20 @@ than an A/B listen.
 
 ---
 
-## Recommended Workflow1. **Extract reference audio** → Video→Audio tab with XTTS preset (WAV, mono, 22050 Hz)
+## Recommended Workflow
+
+One-shot: the **[Auto] Pipeline** tab runs steps 3–6 automatically per voice.
+Manual chain:
+
+1. **Extract reference audio** → Video→Audio tab with XTTS preset (WAV, mono, 22050 Hz)
 2. **Clean if needed** → Vox tab with demucs + deepfilter
 3. **Curate the reference** → [Cur] Curation tab (or `curate_reference.py`) to keep only the most coherent segments — then use the curated file everywhere downstream
 4. **Analyse** → Analyser tab, Praat mode, multiple reference files (gives `{}`/`[]` priors)
 5. **Find best seed + params** → Validator tab (manual A/B + scores) **or** `xtts_optimize.py` (automated search) → winning `{}` block
 6. **Fit the tone** → Comparator tab: paste the frozen `{}`; closed-loop `eq`/`vol`/`hp`/`lp` by least squares
 7. **Generate** → Generator tab with the final `{}` and `[]` blocks
+8. *(optional)* **RVC timbre conversion** → [RVC] tab, when zero-shot identity
+   (~0.7–0.85) is not enough — requires a model trained on 10+ min of the voice
 
 ---
 
@@ -496,9 +516,15 @@ than an A/B listen.
 | Model | French | Cloning | GPU | Verdict |
 |-------|--------|---------|-----|---------|
 | **XTTS v2** | ✅ native | ✅ excellent | 4GB+ | **Best for French** |
-| Chatterbox | ✅ correct | ✅ good | 8GB+ | Acceptable |
+| Chatterbox V2 | ✅ correct | ✅ good | CPU ok / 4GB | Competitive (see note) |
 | F5-TTS | ❌ English accent | ✅ timbre | 8GB+ | Not usable for French |
 | IndexTTS2 | ❌ English accent | ✅ timbre | 8GB+ | Not usable for French |
+
+Measured (same curated reference, same sentence, ECAPA identity): XTTS pipeline
+0.710 vs Chatterbox V2 0.725 — same zero-shot ceiling, no migration justified;
+the identity gap is RVC territory. `chatterbox_ab.py` regenerates this A/B
+(own conda env — its deps clash with TTS 0.22.0). V3 (better similarity per
+Resemble) not yet on PyPI; retest when released.
 
 ---
 
