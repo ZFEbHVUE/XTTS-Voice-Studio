@@ -198,6 +198,15 @@ def main():
     p.add_argument('--conv-threshold', type=float, default=0.5,
                    help='Stop when the largest EQ/vol change in a pass falls '
                         'below this many dB (default: 0.5)')
+    p.add_argument('--target-dbfs', type=float, default=None,
+                   help='Production level mode: fit the volume toward this absolute '
+                        'RMS target (e.g. -20) instead of matching the reference. '
+                        'Use it when the reference is quiet — matching a -33 dBFS '
+                        'reference yields an unusable meditation level.')
+    p.add_argument('--no-fit-dynamics', dest='fit_dynamics', action='store_false',
+                   help='Do not fit comp / de-ess by measurement (crest factor and '
+                        '5-8 kHz sibilance vs the reference)')
+    p.set_defaults(fit_dynamics=True)
     args = p.parse_args()
 
     # Separate trailing lang from refs
@@ -313,7 +322,10 @@ def main():
         _, cd = L.compute_ltas(cy, ref_sr)
         fit  = L.fit_eq_ls(f_grid, ref_db, cd, fs=ref_sr,
                            cur_hp=opt.get('hp', 0), cur_lp=opt.get('lp', 0))
-        dvol = L.level_match_db(ref_y, cy, cur_vol=0)
+        if args.target_dbfs is not None:
+            dvol = L.level_to_target_db(cy, args.target_dbfs, cur_vol=0)
+        else:
+            dvol = L.level_match_db(ref_y, cy, cur_vol=0)
         step = max(abs(fit['eq_low']), abs(fit['eq_mid']), abs(fit['eq_high']), abs(dvol))
         print(f"  pass {it}: residual {fit['residual_before']:.2f}->{fit['residual_after']:.2f} dB"
               f"  | Δeq=({fit['eq_low']:+.1f},{fit['eq_mid']:+.1f},{fit['eq_high']:+.1f}) Δvol={dvol:+d}")
@@ -329,6 +341,40 @@ def main():
         if step < args.conv_threshold:
             print(f"  converged (largest change {step:.2f} dB < {args.conv_threshold} dB)")
             break
+
+    # ── Measured fit of de-ess and compression ────────────────────────────────
+    # The tail of the [] block used to stay at zero because nothing measured it.
+    # Sibilance (5-8 kHz vs 300-3 kHz) and crest factor ARE measurable against
+    # the reference, so they get the same treatment as the EQ: propose a value,
+    # render, re-measure, and KEEP IT ONLY IF THE GAP SHRINKS. NR/reverb/gate/pan
+    # stay at zero on purpose (no measurable target; the gate chops speech).
+    if args.fit_dynamics:
+        print(f"\n{'-'*64}\n  Measured de-ess / compression fit\n{'-'*64}")
+        ref_sib, ref_crest = L.sibilance_db(ref_y, ref_sr), L.crest_db(ref_y)
+        apply_post(raw, cand, opt, xtts, lang, gen_path)
+        cy, _ = load_mono(cand, target_sr=ref_sr)
+        sib_gap = L.sibilance_db(cy, ref_sr) - ref_sib
+        crest_gap = L.crest_db(cy) - ref_crest
+        print(f"  reference: sibilance {ref_sib:+.1f} dB   crest {ref_crest:.1f} dB")
+        print(f"  clone gap: sibilance {sib_gap:+.1f} dB   crest {crest_gap:+.1f} dB")
+
+        for name, gap, thr, scale, cap in (('de-ess', sib_gap, 1.5, 0.18, 0.5),
+                                           ('comp', crest_gap, 2.0, 0.12, 0.6)):
+            if gap <= thr:
+                print(f"  {name}: gap within tolerance -> left at 0")
+                continue
+            trial = dict(opt)
+            trial[name] = round(min(cap, (gap - thr) * scale), 2)
+            apply_post(raw, cand, trial, xtts, lang, gen_path)
+            ty, _ = load_mono(cand, target_sr=ref_sr)
+            new_gap = ((L.sibilance_db(ty, ref_sr) - ref_sib) if name == 'de-ess'
+                       else (L.crest_db(ty) - ref_crest))
+            if abs(new_gap) < abs(gap) - 0.2:
+                opt[name] = trial[name]
+                print(f"  {name} -> {trial[name]}  (gap {gap:+.1f} -> {new_gap:+.1f} dB)")
+            else:
+                print(f"  {name} {trial[name]} did not help ({gap:+.1f} -> {new_gap:+.1f}) "
+                      f"-> reverted to 0")
 
     print(f"  Final []: vol={opt['vol']:+d}  eq_low={opt['eq_low']:+.1f}  "
           f"eq_mid={opt['eq_mid']:+.1f}  eq_high={opt['eq_high']:+.1f}  "

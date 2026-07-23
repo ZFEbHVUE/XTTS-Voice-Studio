@@ -439,6 +439,8 @@ LTAS. The reported residual is the weighted in-band RMS error (dB) before vs aft
 
 - For the sharpest tonal match, use `--auto-text`: the reference is transcribed (faster-whisper, CPU) and the clone is generated on its own words, so the LTAS compares like-for-like phonetics. (`--text-file` does the same with a transcript you provide.)
 - The LS fit is perceptually weighted (A-weighting): errors are penalised where the ear hears them (~1–5 kHz) rather than uniformly across the spectrum.
+- `--target-dbfs -20` switches the volume fit to an absolute production level instead of matching the reference. Use it whenever the reference is quiet: matching a -33 dBFS reference produces an unusable meditation level (the fitted `vol` was the honest match, not a good render level).
+- comp and de-ess are now fitted by measurement too (crest factor and 5–8 kHz sibilance vs the reference), each kept only if the measured gap actually shrinks — `--no-fit-dynamics` disables it. NR, reverb, noise_gate and pan stay at 0 by design: no measurable target, and the gate chops speech.
 - `eq_*` and `vol` in the input `[]` are overwritten by the fit; `NR`/`comp`/`de-ess`/`hp`/`lp` are kept from the block (Analyser priors).
 - The `{}` is never modified — fix seed/temp in the Validator first.
 

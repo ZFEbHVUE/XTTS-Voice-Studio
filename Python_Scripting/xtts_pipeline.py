@@ -79,6 +79,9 @@ def main():
     p.add_argument('--recurate', action='store_true', help='Redo curation even if the curated file exists')
     p.add_argument('--no-auto-text', action='store_true',
                    help='Comparator: do not transcribe the reference (use its default text)')
+    p.add_argument('--target-dbfs', type=float, default=None,
+                   help='Comparator: fit the volume toward this absolute RMS level '
+                        '(e.g. -20) instead of matching a quiet reference')
     p.add_argument('--probe-beams', action='store_true',
                    help='Optimiser: also probe beam-search/greedy decoding on the winner')
     p.add_argument('--whisper-model', default='small')
@@ -156,6 +159,8 @@ def main():
                '--whisper-model', args.whisper_model]
         if not args.no_auto_text:
             cmd += ['--auto-text']
+        if args.target_dbfs is not None:
+            cmd += ['--target-dbfs', str(args.target_dbfs)]
         if args.device:
             cmd += ['--device', args.device]
         rc, out = run_stream(cmd, f'V{n} 4/4 TONE FIT')

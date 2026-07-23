@@ -192,3 +192,36 @@ def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000,
 
 
 __all__ = ['compute_ltas', 'fit_eq_ls', 'level_match_db', 'eq_peaking_db', 'rbj_peaking_db']
+
+
+# ── Dynamics / sibilance measurements (closed-loop comp & de-ess fitting) ─────
+
+def sibilance_db(y, sr):
+    """Sibilance ratio in dB: energy(5-8 kHz) vs energy(300-3 kHz).
+    Comparing this between reference and clone gives a MEASURED de-esser
+    setting instead of an by-ear guess."""
+    y = np.asarray(y, float)
+    n = min(len(y), sr * 60)
+    Y = np.abs(np.fft.rfft(y[:n] * np.hanning(n))) ** 2
+    f = np.fft.rfftfreq(n, 1 / sr)
+    def band(lo, hi):
+        m = (f >= lo) & (f < hi)
+        return float(Y[m].mean()) if m.any() else 1e-12
+    return 10.0 * np.log10(band(5000, 8000) / (band(300, 3000) + 1e-12) + 1e-12)
+
+
+def crest_db(y):
+    """Crest factor in dB (peak vs RMS) — a proxy for dynamic range.
+    Clone crest >> reference crest means the clone is more 'peaky' and a
+    matching compression amount can be derived by measurement."""
+    y = np.asarray(y, float)
+    rms = float(np.sqrt(np.mean(y ** 2)) + 1e-12)
+    peak = float(np.max(np.abs(y)) + 1e-12)
+    return 20.0 * np.log10(peak / rms)
+
+
+def level_to_target_db(clone_y, target_dbfs, cur_vol=0, lo=-18, hi=18):
+    """Volume correction (dB) to bring the clone to an absolute RMS target,
+    instead of matching a (possibly very quiet) reference."""
+    c = 20.0 * np.log10(np.sqrt(np.mean(np.asarray(clone_y, float) ** 2)) + 1e-12)
+    return int(np.clip(round(cur_vol + (target_dbfs - c)), lo, hi))
