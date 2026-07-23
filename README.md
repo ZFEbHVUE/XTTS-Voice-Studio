@@ -97,6 +97,7 @@ XTTS-Voice-Studio/
 │   ├── prepare_rvc_dataset.py               # Build an RVC training dataset (10+ min utterances)
 │   ├── rvc_convert.py                       # Timbre conversion via a trained Applio/RVC model
 │   ├── chatterbox_ab.py                     # A/B sample vs Chatterbox (own env, see below)
+│   ├── listening_test.py                    # Blind A/B listening test + binomial sign test
 │   ├── extract_voices.py                   # Vocal separation by gender
 │   ├── transcribeSong2txt_with_pause.py    # Audio transcription
 │   └── video2txt.py                        # Video transcription
@@ -468,6 +469,15 @@ Feed `curated.wav` to the Validator / Comparator / Generator.
 
 ### Sampling optimiser (`xtts_optimize.py`)
 
+**Methodology safeguards.** The search is validated on HELD-OUT sentences never
+used during optimisation (`--holdout-texts`, default 2): the reported score is
+that one, and a large drop versus the search sentences is flagged as
+overfitting of the seed to the test phrase. Seeds are ranked on their
+WORST-CASE sentence (`--seed-mean` restores mean ranking), so a seed that shines
+on one phrase and fails on others cannot win. Every score now carries its
+standard deviation, and candidates whose difference falls within the measurement
+noise are marked `=` in the table — their ranking is noise, pick by ear.
+
 `--probe-beams` adds an optional decode-mode stage: after the winner is found it
 probes beam search (`num_beams=3`, which finally activates `length_penalty`) and
 greedy decoding (`do_sample=False`), adopting either only if the measured score
@@ -565,6 +575,24 @@ Some GPU operations ignore SIGKILL until the current CUDA kernel completes. Wait
 
 **`eq_high` takes non-integer values like -3.775**
 Fixed in recent version — values are now rounded to 1 decimal place.
+
+---
+
+## Evaluation methodology
+
+Objective metrics (ECAPA cosine, ASR-based accent score) are proxies: they do
+not hear diction or naturalness. Three habits keep the numbers honest:
+
+- **Blind listening** — `listening_test.py` runs a forced-choice A/B with the
+  order randomised and the labels hidden, then a two-sided binomial sign test.
+  10 preferences out of 12 is significant (p=0.039); 9 out of 12 is not
+  (p=0.146). This is the only test that answers "is it really her".
+- **Identity relative to a ceiling** — `speaker_identity.py` splits the
+  reference in two halves and scores them against each other. That is the
+  same-speaker maximum for that recording, so 0.847 reads as "91 % of what is
+  reachable" rather than against the generic 0.80 VoxCeleb threshold, which is
+  not calibrated for synthetic speech.
+- **Hold-out + noise floor** — see the optimiser safeguards above.
 
 ---
 

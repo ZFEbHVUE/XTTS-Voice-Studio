@@ -113,6 +113,17 @@ def main():
     p.add_argument('--w-accent', type=float, default=0.6)
     p.add_argument('--w-identity', type=float, default=0.4)
     p.add_argument('--rounds', type=int, default=2, help='coord only: descent rounds (default: 2)')
+    p.add_argument('--holdout-texts', type=int, default=2,
+                   help='Sentences reserved for validating the winner (1-2, default: 2). '
+                        'Never used during the search — the reported score comes from them.')
+    p.add_argument('--no-holdout', action='store_true',
+                   help='Skip hold-out validation (faster, but the reported score is '
+                        'then the optimised-on score and is optimistically biased)')
+    p.add_argument('--seed-robust', action='store_true', default=True,
+                   help='Rank seeds on worst-case across sentences instead of the mean, '
+                        'so a seed that is great on one phrase and poor on others loses')
+    p.add_argument('--seed-mean', dest='seed_robust', action='store_false',
+                   help='Rank seeds on the mean score (legacy behaviour)')
     p.add_argument('--probe-beams', action='store_true',
                    help='After the winner is found, probe beam-search decoding '
                         '(num_beams=3, activates length_penalty) and greedy '
@@ -140,13 +151,23 @@ def main():
     # Probe sentences: varied phonetics so the score reflects the voice, not one
     # sentence's sounds. XTTS is deterministic given (seed, params), so averaging
     # across sentences is the only real variance reduction available.
+    # Search sentences vs HELD-OUT sentences. The winner is picked on the search
+    # set, then re-scored on sentences it has never seen: that hold-out score is
+    # the honest one, and the gap search->holdout measures how much the seed was
+    # overfitted to the test phrase (the main methodological hole of a 1-2
+    # sentence search).
     PROBES = [
         text,
         "Le soleil se couche doucement derrière les collines lointaines.",
         "Respire profondément et laisse partir toutes les tensions.",
     ]
+    HOLDOUT = [
+        "Chaque expiration relâche un peu plus les épaules et la mâchoire.",
+        "Quarante-huit personnes attendaient déjà sur le quai numéro trois.",
+    ]
     n_probe = max(1, min(3, args.probe_texts))
     probe_texts = PROBES[:n_probe]
+    holdout_texts = [] if args.no_holdout else HOLDOUT[:max(1, min(2, args.holdout_texts))]
 
     print("=" * 64)
     print(f"  XTTS Sampling Optimiser — method: {args.method}  (accent + identity)")
@@ -213,16 +234,30 @@ def main():
                 try: torch.cuda.empty_cache()
                 except Exception: pass
             frs.append(pr['score']); ids.append(co)
+        per = [wa * a + wi * b for a, b in zip(frs, ids)]   # score per sentence
         fr = sum(frs) / len(frs); co = sum(ids) / len(ids)
         sc = wa * fr + wi * co
+        # Keep the dispersion: a mean alone cannot say whether two candidates
+        # differ. sem = standard error of the mean -> the noise floor below
+        # which two scores must be called a tie.
+        sd = float(np.std(per, ddof=1)) if len(per) > 1 else 0.0
+        sem = sd / np.sqrt(len(per)) if len(per) > 1 else 0.0
         rec = dict(score=sc, french=fr, identity=co, wer=None, detected='',
                    seed=seed, num_beams=int(prm.get('num_beams', 1)),
+                   per_text=per, sd=sd, sem=sem, worst=min(per),
                    **{a: prm[a] for a in GRID})
         cache[k] = rec
+        disp = f" ±{sd:.3f}" if len(per) > 1 else ""
         print(f"  [{evals[0]:>3}] seed={seed:>3} temp={prm['temp']:.2f} rep={prm['rep_pen']:.1f} "
               f"top_p={prm['top_p']:.2f} top_k={int(prm['top_k'])} (n={len(texts)})  ->  "
-              f"score={sc:.3f} (fr={fr:.3f} id={co:.3f})")
+              f"score={sc:.3f}{disp} (fr={fr:.3f} id={co:.3f})")
         return rec
+
+    def tie(a, b):
+        """True when two candidates are statistically indistinguishable:
+        their difference is within the combined noise of the measurements."""
+        noise = max(0.01, np.hypot(a.get('sem', 0.0), b.get('sem', 0.0)))
+        return abs(a['score'] - b['score']) <= noise
 
     start = {a: float(xtts.get(a, GRID[a][len(GRID[a]) // 2])) for a in GRID}
     start['len_pen'] = float(xtts.get('len_pen', 1.0))
@@ -271,12 +306,19 @@ def main():
                     'top_k': topk0, 'top_p': topp0 if tp is None else tp,
                     'len_pen': start['len_pen']}
 
-        # Stage 1 — seed screen (1 sentence, ranking only; seed is chaotic so we
-        # brute-screen it — there is no smooth structure to exploit).
-        print("-" * 64 + "\n  Stage 1 — seed screen (1 sentence, rank)\n" + "-" * 64)
-        screen = [r for s in seeds for r in [evaluate(s, P(start['temp']), [text])] if r]
-        screen.sort(key=lambda r: -r['score'])
+        # Stage 1 — seed screen. The seed is chaotic, so we brute-screen it; but
+        # screening on ONE sentence overfits the seed to that phrase. We screen
+        # on the probe set and rank by WORST-CASE sentence, so a seed that is
+        # brilliant once and mediocre twice cannot win.
+        rank_mode = 'worst-case' if args.seed_robust else 'mean'
+        print("-" * 64 + f"\n  Stage 1 — seed screen ({len(probe_texts)} sentence(s), "
+              f"ranked on {rank_mode})\n" + "-" * 64)
+        screen = [r for s in seeds for r in [evaluate(s, P(start['temp']), probe_texts)] if r]
+        screen.sort(key=lambda r: -(r['worst'] if args.seed_robust else r['score']))
         keep = [r['seed'] for r in screen[:max(1, args.keep_seeds)]]
+        for r in screen[:max(1, args.keep_seeds)]:
+            print(f"    seed {r['seed']:>3}: mean {r['score']:.3f} ±{r['sd']:.3f}  "
+                  f"worst {r['worst']:.3f}")
         print(f"  kept seeds (top {len(keep)}): {keep}")
 
         # Stage 2 — least-squares parabola of score vs temp, per kept seed.
@@ -317,15 +359,21 @@ def main():
             r = evaluate(seed, P(tw, tp=tp), probe_texts)
             if r: probes.append((('top_p', tp), r))
         spread = max((abs(r['score'] - base) for _, r in probes), default=0.0)
-        if spread < 0.01:
-            print(f"  rep_pen/top_p inert here (max Δscore {spread:.3f}) -> frozen at "
-                  f"rep_pen={rep0}, top_p={topp0}")
+        # Compare against the MEASURED noise (standard error), not an arbitrary
+        # constant: a difference smaller than the measurement noise is not a
+        # difference. This is what keeps the optimiser from chasing 0.01s.
+        (axval, rbest) = (max(probes, key=lambda pr: pr[1]['score'])
+                          if probes else ((None, None), None))
+        if rbest is None or tie(rbest, best):
+            noise = max(0.01, np.hypot(best.get('sem', 0.0),
+                                       rbest.get('sem', 0.0) if rbest else 0.0))
+            print(f"  rep_pen/top_p inert here (max Δ {spread:.3f} <= noise {noise:.3f}) "
+                  f"-> frozen at rep_pen={rep0}, top_p={topp0}")
         else:
-            (axval, r) = max(probes, key=lambda pr: pr[1]['score'])
-            print(f"  sensitivity {spread:.3f}; best probe {axval[0]}={axval[1]} "
-                  f"score {r['score']:.3f}")
-            if r['score'] > base + 1e-6:
-                best = r
+            print(f"  sensitivity {spread:.3f} (above noise); best probe "
+                  f"{axval[0]}={axval[1]} score {rbest['score']:.3f}")
+            if rbest['score'] > best['score']:
+                best = rbest
 
         # ── Stage 4 (optional) — decode-mode probe: beam search & greedy ──────
         # num_beams>1 switches the GPT decode to beam search (length_penalty
@@ -364,17 +412,46 @@ def main():
     # ── Shared report ─────────────────────────────────────────────────────────
     ranked = sorted(cache.values(), key=lambda r: -r['score'])
     print(f"\n{'='*64}\n  TOP RESULTS ({evals[0]} generations)\n{'='*64}")
-    print(f"  {'score':>6}{'french':>8}{'ident':>7}{'  seed':>6}{'temp':>6}{'rep':>5}{'top_p':>7}{'top_k':>6}")
+    print(f"  {'score':>6}{'sd':>7}{'french':>8}{'ident':>7}{'  seed':>6}{'temp':>6}"
+          f"{'rep':>5}{'top_p':>7}{'top_k':>6}")
+    top = ranked[0]
     for r in ranked[:8]:
-        print(f"  {r['score']:>6.3f}{r['french']:>8.3f}{r['identity']:>7.3f}{r['seed']:>6}"
-              f"{r['temp']:>6.2f}{r['rep_pen']:>5.1f}{r['top_p']:>7.2f}{int(r['top_k']):>6}")
+        mark = ' =' if (r is not top and tie(r, top)) else '  '
+        print(f"  {r['score']:>6.3f}{r['sd']:>7.3f}{r['french']:>8.3f}{r['identity']:>7.3f}"
+              f"{r['seed']:>6}{r['temp']:>6.2f}{r['rep_pen']:>5.1f}{r['top_p']:>7.2f}"
+              f"{int(r['top_k']):>6}{mark}")
+    n_tied = sum(1 for r in ranked[:8] if r is not top and tie(r, top))
+    if n_tied:
+        print(f"  ('=' marks the {n_tied} candidate(s) statistically indistinguishable "
+              f"from the best — the ranking between them is noise, pick by ear)")
 
     # Winner block: inherit ALL non-searched fields (trim/fade/gpt_cond_len/...)
     # from the input {} — only the searched axes are overwritten.
     win = dict(xtts); win.update({a: best[a] for a in GRID})
     win['num_beams'] = int(best.get('num_beams', 1))
-    print(f"\n  Best: score {best['score']:.3f}  (french {best['french']:.3f}, "
-          f"identity {best['identity']:.3f})")
+    print(f"\n  Best on the search sentences: score {best['score']:.3f}  "
+          f"(french {best['french']:.3f}, identity {best['identity']:.3f})")
+
+    # ── Hold-out validation: sentences never used during the search ───────────
+    if holdout_texts:
+        print(f"\n{'-'*64}\n  Hold-out validation ({len(holdout_texts)} unseen sentence(s))\n{'-'*64}")
+        pw = {'temp': best['temp'], 'rep_pen': best['rep_pen'], 'top_k': best['top_k'],
+              'top_p': best['top_p'], 'len_pen': start['len_pen'],
+              'num_beams': int(best.get('num_beams', 1))}
+        args.budget += len(holdout_texts) + 2          # never starve the validation
+        hv = evaluate(best['seed'], pw, holdout_texts)
+        if hv:
+            drop = best['score'] - hv['score']
+            print(f"  HELD-OUT score {hv['score']:.3f} ±{hv['sd']:.3f}  "
+                  f"(french {hv['french']:.3f}, identity {hv['identity']:.3f})")
+            if drop > 0.05:
+                print(f"  [!] Drops {drop:.3f} vs the search sentences: this seed is "
+                      f"partly OVERFITTED to them. It will not hold as well over a long")
+                print(f"  [!] text — prefer a candidate marked '=' above with a smaller "
+                      f"drop, or re-run with more --probe-texts.")
+            else:
+                print(f"  Generalises well (drop {drop:+.3f}) — this score is the honest one.")
+
     print(f"  Paste into the Validator/Comparator:")
     print(f"  {format_xtts_block(best['seed'], win)}")
     print("[OK] Done.")

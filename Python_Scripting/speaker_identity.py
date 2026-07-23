@@ -102,6 +102,25 @@ class SpeakerEncoder:
                      ((np.linalg.norm(a) + 1e-12) * (np.linalg.norm(b) + 1e-12)))
 
 
+    def self_ceiling(self, reference):
+        """Estimate the SAME-SPEAKER ceiling for this reference: split it in two
+        halves and score them against each other. Both halves are the same
+        person, same mic, same session — so this cosine is the practical upper
+        bound for that recording, and it makes identity scores interpretable
+        (0.847 out of a 0.93 ceiling = 91 % of what is reachable).
+
+        The generic '>0.80 = same speaker' threshold comes from VoxCeleb EER on
+        REAL recordings; applied to synthetic speech it is not calibrated, so
+        this per-reference anchor is the honest reading."""
+        y, _ = _load_audio(reference) if isinstance(reference, str) else (reference, None)
+        y = np.asarray(y, dtype=np.float32)
+        h = len(y) // 2
+        if h < _TARGET_SR:            # under 1 s per half: meaningless
+            return None
+        return self.cosine(self.embed(y[:h], sr=_TARGET_SR),
+                           self.embed(y[h:], sr=_TARGET_SR))
+
+
 __all__ = ['SpeakerEncoder']
 
 
@@ -114,8 +133,13 @@ if __name__ == '__main__':
     _enc = SpeakerEncoder()
     _ref = _enc.embed(_sys.argv[1])
     print(f"  reference: {_sys.argv[1]}")
+    _ceil = _enc.self_ceiling(_sys.argv[1])
+    if _ceil:
+        print(f"  same-speaker ceiling for this recording: {_ceil:.4f}  "
+              f"(reference split in two halves — the practical maximum)")
     for _cand in _sys.argv[2:]:
         _c = _enc.cosine(_ref, _enc.embed(_cand))
         _verdict = ("same speaker" if _c > 0.80 else
                     "close" if _c > 0.60 else "different")
-        print(f"  identity {_c:.4f}  ({_verdict})  {_cand}")
+        _rel = f"  [{100.0 * _c / _ceil:.0f}% of ceiling]" if _ceil else ""
+        print(f"  identity {_c:.4f}  ({_verdict}){_rel}  {_cand}")
