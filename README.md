@@ -471,8 +471,12 @@ Feed `curated.wav` to the Validator / Comparator / Generator.
 
 **Methodology safeguards.** The search is validated on HELD-OUT sentences never
 used during optimisation (`--holdout-texts`, default 2): the reported score is
-that one, and a large drop versus the search sentences is flagged as
-overfitting of the seed to the test phrase. Seeds are ranked on their
+that one, and a drop versus the search sentences — compared against the measured
+noise, not a fixed constant — flags overfitting of the seed to the test phrase.
+The winner AND every candidate statistically tied with it are validated on those
+unseen sentences, and the final pick is the one with the best HELD-OUT score:
+their ranking on the search sentences is noise, so what decides is which one
+still holds up on unseen text. Seeds are ranked on their
 WORST-CASE sentence (`--seed-mean` restores mean ranking), so a seed that shines
 on one phrase and fails on others cannot win. Every score now carries its
 standard deviation, and candidates whose difference falls within the measurement

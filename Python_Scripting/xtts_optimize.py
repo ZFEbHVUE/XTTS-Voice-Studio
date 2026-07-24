@@ -204,16 +204,21 @@ def main():
     cache, evals = {}, [0]
     wa, wi = args.w_accent, args.w_identity
 
-    def key(seed, prm, ntext):
+    def key(seed, prm, texts):
+        # The text SET must be part of the key: keying on len(texts) alone made
+        # a hold-out evaluation collide with a search evaluation of the same
+        # size, silently returning the cached search result (the hold-out then
+        # reported a fake +0.000 drop).
         return (seed, round(prm['temp'], 3), int(prm['top_k']),
-                round(prm['top_p'], 3), round(prm['rep_pen'], 2), ntext,
+                round(prm['top_p'], 3), round(prm['rep_pen'], 2),
+                tuple(texts),
                 int(prm.get('num_beams', 1)), bool(prm.get('do_sample', True)))
 
     def evaluate(seed, prm, texts=None):
         """Score = mean over `texts` of (wa*french + wi*identity). Deterministic
         per (seed, params, text), so cached."""
         texts = texts or [text]
-        k = key(seed, prm, len(texts))
+        k = key(seed, prm, texts)
         if k in cache:
             return cache[k]
         if evals[0] >= args.budget:
@@ -433,24 +438,52 @@ def main():
           f"(french {best['french']:.3f}, identity {best['identity']:.3f})")
 
     # ── Hold-out validation: sentences never used during the search ───────────
+    # Validate the winner AND every candidate that tied with it: their ranking
+    # on the search sentences is noise, so the tie-break that matters is which
+    # one still holds up on unseen text. That is also what makes the overfitting
+    # warning actionable — otherwise it points at candidates nobody measured.
     if holdout_texts:
-        print(f"\n{'-'*64}\n  Hold-out validation ({len(holdout_texts)} unseen sentence(s))\n{'-'*64}")
-        pw = {'temp': best['temp'], 'rep_pen': best['rep_pen'], 'top_k': best['top_k'],
-              'top_p': best['top_p'], 'len_pen': start['len_pen'],
-              'num_beams': int(best.get('num_beams', 1))}
-        args.budget += len(holdout_texts) + 2          # never starve the validation
-        hv = evaluate(best['seed'], pw, holdout_texts)
-        if hv:
-            drop = best['score'] - hv['score']
-            print(f"  HELD-OUT score {hv['score']:.3f} ±{hv['sd']:.3f}  "
-                  f"(french {hv['french']:.3f}, identity {hv['identity']:.3f})")
-            if drop > 0.05:
-                print(f"  [!] Drops {drop:.3f} vs the search sentences: this seed is "
-                      f"partly OVERFITTED to them. It will not hold as well over a long")
-                print(f"  [!] text — prefer a candidate marked '=' above with a smaller "
-                      f"drop, or re-run with more --probe-texts.")
+        cands = [best] + [r for r in ranked[:8]
+                          if r is not best and tie(r, best)][:3]
+        print(f"\n{'-'*64}\n  Hold-out validation ({len(holdout_texts)} unseen sentence(s), "
+              f"{len(cands)} candidate(s))\n{'-'*64}")
+        args.budget += len(holdout_texts) * (len(cands) + 1) + 2   # never starve it
+        results = []
+        for c in cands:
+            pw = {'temp': c['temp'], 'rep_pen': c['rep_pen'], 'top_k': c['top_k'],
+                  'top_p': c['top_p'], 'len_pen': start['len_pen'],
+                  'num_beams': int(c.get('num_beams', 1))}
+            hv = evaluate(c['seed'], pw, holdout_texts)
+            if hv:
+                results.append((c, hv))
+        if results:
+            print(f"\n  {'seed':>5}{'temp':>6}{'search':>9}{'held-out':>10}{'drop':>8}")
+            for c, hv in results:
+                print(f"  {c['seed']:>5}{c['temp']:>6.2f}{c['score']:>9.3f}"
+                      f"{hv['score']:>10.3f}{c['score'] - hv['score']:>+8.3f}")
+            # Pick on the HELD-OUT score: that is the unbiased estimate.
+            c, hv = max(results, key=lambda p: p[1]['score'])
+            drop = c['score'] - hv['score']
+            # Compare the drop to the MEASURED noise, not to a magic constant.
+            noise = max(0.01, np.hypot(c.get('sem', 0.0), hv.get('sem', 0.0)))
+            if c is not best:
+                print(f"\n  Winner CHANGED: seed {c['seed']} temp {c['temp']:.2f} "
+                      f"generalises better than seed {best['seed']} temp {best['temp']:.2f}.")
+                best = c
+                win = dict(xtts); win.update({a: best[a] for a in GRID})
+                win['num_beams'] = int(best.get('num_beams', 1))
+            print(f"\n  HELD-OUT score {hv['score']:.3f} ±{hv['sd']:.3f}  "
+                  f"(french {hv['french']:.3f}, identity {hv['identity']:.3f})"
+                  f"  <- the honest figures")
+            if drop > 2 * noise:
+                print(f"  [!] Drops {drop:.3f} (noise {noise:.3f}): still partly overfitted "
+                      f"to the search sentences.")
+                print(f"  [!] Re-run with --probe-texts 3 for a more robust pick.")
+            elif drop > noise:
+                print(f"  Drop {drop:+.3f} is around the measurement noise ({noise:.3f}) "
+                      f"— weak evidence of overfitting.")
             else:
-                print(f"  Generalises well (drop {drop:+.3f}) — this score is the honest one.")
+                print(f"  Generalises well (drop {drop:+.3f} within noise {noise:.3f}).")
 
     print(f"  Paste into the Validator/Comparator:")
     print(f"  {format_xtts_block(best['seed'], win)}")
