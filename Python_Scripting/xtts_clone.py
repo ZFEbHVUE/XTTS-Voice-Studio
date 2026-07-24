@@ -56,12 +56,17 @@ def compute_latents(model, speaker_wav, gpt_cond_len=30, gpt_cond_chunk_len=6,
 
 
 def set_seed(seed):
+    """Seed every RNG involved in generation. Convention: the CALLER passes
+    None to leave generation unseeded; any integer — INCLUDING 0 — is a valid
+    seed. The old `if seed > 0` guard silently skipped seed 0, so every 'seed 0'
+    result was unseeded and unreproducible (it scored differently on every run
+    while all other seeds were stable), and could still be picked as a winner.
+    """
     import torch, random
-    seed = int(seed or 0)
-    if seed > 0:
-        torch.manual_seed(seed); random.seed(seed); np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+    seed = int(seed)
+    torch.manual_seed(seed); random.seed(seed); np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def generate(model, text, lang, latents, out_path,

@@ -335,7 +335,11 @@ def main():
         opt['eq_low']  = round(opt['eq_low']  + fit['eq_low'], 1)
         opt['eq_mid']  = round(opt['eq_mid']  + fit['eq_mid'], 1)
         opt['eq_high'] = round(opt['eq_high'] + fit['eq_high'], 1)
-        opt['hp'] = fit['hp']; opt['lp'] = fit['lp']
+        if it == 1:
+            # hp/lp are guards, set once from the first measurement. Re-deriving
+            # them every pass let them walk away cumulatively while the EQ was
+            # already correcting the same imbalance.
+            opt['hp'] = fit['hp']; opt['lp'] = fit['lp']
         opt['vol'] = int(np.clip(opt['vol'] + dvol, -18, 18))
         prev_step = step
         if step < args.conv_threshold:
@@ -358,10 +362,19 @@ def main():
         print(f"  reference: sibilance {ref_sib:+.1f} dB   crest {ref_crest:.1f} dB")
         print(f"  clone gap: sibilance {sib_gap:+.1f} dB   crest {crest_gap:+.1f} dB")
 
-        for name, gap, thr, scale, cap in (('de-ess', sib_gap, 1.5, 0.18, 0.5),
-                                           ('comp', crest_gap, 2.0, 0.12, 0.6)):
+        for name, gap, thr, scale, cap, what in (
+                ('de-ess', sib_gap, 1.5, 0.18, 0.5, 'sibilance'),
+                ('comp', crest_gap, 2.0, 0.12, 0.6, 'dynamics')):
             if gap <= thr:
-                print(f"  {name}: gap within tolerance -> left at 0")
+                if gap < 0:
+                    # Expected for synthetic speech: XTTS output is smoother than
+                    # a real recording. A de-esser/compressor can only REDUCE, so
+                    # a negative gap is not correctable here — 0 is the right value.
+                    print(f"  {name}: clone has LESS {what} than the reference "
+                          f"({gap:+.1f} dB) — a {name} can only reduce it, nothing "
+                          f"to do -> 0")
+                else:
+                    print(f"  {name}: gap {gap:+.1f} dB within tolerance ({thr}) -> 0")
                 continue
             trial = dict(opt)
             trial[name] = round(min(cap, (gap - thr) * scale), 2)

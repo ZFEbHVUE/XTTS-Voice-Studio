@@ -115,14 +115,22 @@ def compute_ltas(y, sr, fmin=FIT_FMIN, fmax=FIT_FMAX, n_grid=N_GRID):
 # ── Roll-off based hp / lp ────────────────────────────────────────────────────
 
 def derive_hp_lp(f_grid, ref_db, clone_db, cur_hp=0, cur_lp=0):
-    """Set hp/lp from excess energy at the spectral extremes of the clone."""
+    """Set hp/lp from excess energy at the spectral extremes of the clone.
+
+    hp/lp are SAFETY guards (rumble / hiss), not tone controls — the EQ fits the
+    tone. So hp is never allowed below 40 Hz: lowering it to compensate a
+    low-end deficit is the EQ's job, and an unbounded loop walked it down 30 Hz
+    per pass (95 -> 65 -> 35 -> 5 Hz = no filter at all, DC and rumble through).
+    """
+    HP_MIN, HP_MAX = 40.0, 150.0
     hp, lp = cur_hp, cur_lp
     lo = f_grid < 120
     if lo.any():
         excess_low = float(np.mean(clone_db[lo] - ref_db[lo]))
-        if excess_low > 3:   hp = float(np.clip((cur_hp or 0) + 30, 0, 150))
-        elif excess_low < -3 and cur_hp > 0:
-            hp = float(np.clip(cur_hp - 30, 0, 150))
+        if excess_low > 3:
+            hp = float(np.clip((cur_hp or HP_MIN) + 30, HP_MIN, HP_MAX))
+        elif excess_low < -3 and cur_hp > HP_MIN:
+            hp = float(np.clip(cur_hp - 30, HP_MIN, HP_MAX))
     hi = f_grid > 8000
     if hi.any():
         excess_high = float(np.mean(clone_db[hi] - ref_db[hi]))
