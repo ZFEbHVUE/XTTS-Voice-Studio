@@ -807,6 +807,10 @@ def tab_auto(nb):
     v_a_wid    = tk.StringVar(value='0.4')
     v_a_curate = tk.BooleanVar(value=True)
     v_a_autotx = tk.BooleanVar(value=True)
+    v_a_beams  = tk.BooleanVar(value=False)
+    v_a_screen = tk.BooleanVar(value=False)
+    v_a_target = tk.StringVar(value='')          # empty = match the reference
+    v_a_optaud = tk.StringVar(value='none')
     try:
         import torch as _t_auto
         _auto_dev = 'cuda' if _t_auto.cuda.is_available() else 'cpu'
@@ -829,15 +833,28 @@ def tab_auto(nb):
     tk.Checkbutton(frm_b, text="Curate reference", variable=v_a_curate).pack(side='left', padx=6)
     tk.Checkbutton(frm_b, text="Fit on reference's own words (auto-text)",
                    variable=v_a_autotx).pack(side='left', padx=6)
+    tk.Checkbutton(frm_b, text="Probe beam/greedy decoding",
+                   variable=v_a_beams).pack(side='left', padx=6)
+
+    frm_c = tk.Frame(f); frm_c.grid(row=4, column=0, columnspan=3, sticky='w', padx=6, pady=2)
+    tk.Checkbutton(frm_c, text="Screen audio params (which knobs move identity)",
+                   variable=v_a_screen).pack(side='left', padx=6)
+    tk.Label(frm_c, text="Optimise audio").pack(side='left', padx=(10, 2))
+    ttk.Combobox(frm_c, textvariable=v_a_optaud, values=['none', 'nelder', 'de'],
+                 width=7, state='readonly').pack(side='left')
+    tk.Label(frm_c, text="Target dBFS").pack(side='left', padx=(10, 2))
+    tk.Entry(frm_c, textvariable=v_a_target, width=6).pack(side='left')
+    tk.Label(frm_c, text="(empty = match reference; -20 = production level)",
+             fg='grey', font=("Arial", 8)).pack(side='left', padx=(4, 0))
 
     tk.Label(f, text="Runs curate → analyse → optimise → tone-fit for each voice and"
                      " prints the final {} / [] blocks to paste. LISTEN to each"
                      " *_pipeline_clone.wav before generating — scores don't hear"
                      " naturalness.",
              fg='gray', font=("Arial", 8), justify='left', wraplength=560,
-             anchor='w').grid(row=4, column=0, columnspan=3, sticky='w', padx=8)
+             anchor='w').grid(row=5, column=0, columnspan=3, sticky='w', padx=8)
 
-    console = add_console(f, 6)
+    console = add_console(f, 7)
 
     def lancer(btn, stop_btn=None):
         voices = [(v.get().strip(), l.get()) for v, l, _ in auto_rows if v.get().strip()]
@@ -856,9 +873,17 @@ def tab_auto(nb):
             cmd += ['--no-curate']
         if not v_a_autotx.get():
             cmd += ['--no-auto-text']
+        if v_a_beams.get():
+            cmd += ['--probe-beams']
+        if v_a_screen.get():
+            cmd += ['--screen-audio']
+        if v_a_optaud.get() != 'none':
+            cmd += ['--optimise-audio', v_a_optaud.get()]
+        if v_a_target.get().strip():
+            cmd += ['--target-dbfs', v_a_target.get().strip()]
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Run full pipeline", lancer, 5)
+    make_btn(f, ">  Run full pipeline", lancer, 6)
 
 
 # ── Tab: Curation ─────────────────────────────────────────────────────────────

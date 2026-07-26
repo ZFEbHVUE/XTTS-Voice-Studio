@@ -206,6 +206,25 @@ def main():
     p.add_argument('--no-fit-dynamics', dest='fit_dynamics', action='store_false',
                    help='Do not fit comp / de-ess by measurement (crest factor and '
                         '5-8 kHz sibilance vs the reference)')
+    p.add_argument('--fit-identity', action='store_true',
+                   help='After the tone fit, search the remaining post-processing '
+                        'settings for one that measurably raises ECAPA identity '
+                        '(the tone fit optimises spectrum, never identity). Keeps a '
+                        'candidate only if it beats the measured noise floor.')
+    p.add_argument('--screen-audio', action='store_true',
+                   help='Sensitivity screening BEFORE optimising (the Optimetrics '
+                        'reflex): sweep each audio parameter alone over its full range '
+                        'and report how much ECAPA identity moves, so you know which '
+                        'knobs matter for this voice and which are measurably inert.')
+    p.add_argument('--optimise-audio', default='none', choices=['none', 'nelder', 'de'],
+                   help="Derivative-free optimisation of the whole audio block against "
+                        "ECAPA identity. 'nelder' = local simplex (fast), 'de' = "
+                        "differential evolution then simplex polish (global, slower). "
+                        "Any result is validated on a clone of an unseen sentence and "
+                        "discarded if the gain does not transfer.")
+    p.add_argument('--optimise-budget', type=int, default=400,
+                   help='Max objective evaluations for --optimise-audio (default: 400; '
+                        'each one is just post-processing + an embedding)')
     p.set_defaults(fit_dynamics=True)
     args = p.parse_args()
 
@@ -388,6 +407,240 @@ def main():
             else:
                 print(f"  {name} {trial[name]} did not help ({gap:+.1f} -> {new_gap:+.1f}) "
                       f"-> reverted to 0")
+
+    # ── Identity-driven post-processing search ────────────────────────────────
+    # Everything above optimises TONE (LTAS residual). This stage asks a
+    # different question, the one that actually matters: can post-processing
+    # raise the ECAPA IDENTITY of the clone? Nobody had ever measured it — the
+    # remaining [] fields stayed at 0 because no criterion ever asked them to
+    # move. Each candidate is rendered and scored; only a gain above the
+    # measured noise floor is kept.
+    if args.fit_identity:
+        print(f"\n{'-'*64}\n  Identity-driven post-processing search (ECAPA)\n{'-'*64}")
+        try:
+            from speaker_identity import SpeakerEncoder
+            enc = SpeakerEncoder(device=args.device)
+            ref_emb = enc.embed(args.reference)
+
+            def ident_of(block):
+                apply_post(raw, cand, block, xtts, lang, gen_path)
+                return float(enc.cosine(ref_emb, enc.embed(cand))), cand
+
+            base_id, _ = ident_of(opt)
+            # Noise floor: identity measured on each half of the same clone.
+            # Two halves of one render are the same voice, so their spread is
+            # the measurement variability for this clip.
+            cy_all, csr = load_mono(cand, target_sr=16000)   # ECAPA rate
+            h = len(cy_all) // 2
+            halves = [float(enc.cosine(ref_emb, enc.embed(cy_all[:h], sr=csr))),
+                      float(enc.cosine(ref_emb, enc.embed(cy_all[h:], sr=csr)))]
+            noise = max(0.005, abs(halves[0] - halves[1]) / 2.0)
+            print(f"  baseline (tone-fitted) identity {base_id:.4f}   "
+                  f"noise floor ±{noise:.4f}")
+
+            trials = [('no post-processing at all',
+                       dict(opt, vol=0, eq_low=0, eq_mid=0, eq_high=0, hp=0, lp=0)),
+                      ('EQ off (keep vol/filters)', dict(opt, eq_low=0, eq_mid=0, eq_high=0)),
+                      ('brighter (eq_high +2)', dict(opt, eq_high=opt['eq_high'] + 2)),
+                      ('darker (eq_high -2)',   dict(opt, eq_high=opt['eq_high'] - 2)),
+                      ('full band (lp 16k)',    dict(opt, lp=16000)),
+                      ('narrow band (lp 8k)',   dict(opt, lp=8000)),
+                      ('NR 0.2',                dict(opt, NR=0.2)),
+                      ('comp 0.3',              dict(opt, comp=0.3)),
+                      ('de-ess 0.3',            {**opt, 'de-ess': 0.3})]
+            results = [('baseline', opt, base_id)]
+            for label, blk in trials:
+                try:
+                    v, _ = ident_of(blk)
+                except Exception as e:
+                    print(f"  {label:26s} failed ({e})"); continue
+                results.append((label, blk, v))
+                d = v - base_id
+                flag = '  <-- above noise' if d > noise else ''
+                print(f"  {label:26s} identity {v:.4f}  ({d:+.4f}){flag}")
+
+            lbl, blk, best_id = max(results, key=lambda r: r[2])
+            if best_id > base_id + noise:
+                print(f"\n  ADOPTED '{lbl}': identity {base_id:.4f} -> {best_id:.4f} "
+                      f"(+{best_id - base_id:.4f}, above the {noise:.4f} noise floor)")
+                opt = dict(blk)
+            else:
+                print(f"\n  No post-processing setting raises identity beyond the noise "
+                      f"floor (best {best_id:.4f} vs baseline {base_id:.4f}).")
+                print(f"  Conclusion for this voice: post-processing shapes TONE, not "
+                      f"IDENTITY — the zero fields are zero because nothing they can do")
+                print(f"  makes the clone measurably more like the person.")
+            apply_post(raw, cand, opt, xtts, lang, gen_path)   # restore chosen block
+        except Exception as e:
+            print(f"  [!] Identity search unavailable ({e})")
+
+    # ── Sensitivity screening (which knobs matter at all?) ────────────────────
+    # The Optimetrics reflex: screen BEFORE optimising. One factor at a time
+    # across its full musical range, measuring how much ECAPA identity actually
+    # moves. This answers, per parameter and with numbers, the question the tool
+    # could never answer before: does this knob do anything for THIS voice?
+    if args.screen_audio:
+        print(f"\n{'-'*64}\n  Sensitivity screening (one factor at a time, ECAPA identity)\n{'-'*64}")
+        try:
+            from speaker_identity import SpeakerEncoder
+            enc_s = SpeakerEncoder(device=args.device)
+            ref_s = enc_s.embed(args.reference)
+
+            def ident_blk(blk):
+                apply_post(raw, cand, blk, xtts, lang, gen_path)
+                return float(enc_s.cosine(ref_s, enc_s.embed(cand)))
+
+            base_s = ident_blk(opt)
+            # Noise floor from the two halves of the same render (same voice,
+            # so their spread is the measurement variability for this clip).
+            cy_h, csr_h = load_mono(cand, target_sr=16000)
+            hh = len(cy_h) // 2
+            noise_s = max(0.004, abs(
+                float(enc_s.cosine(ref_s, enc_s.embed(cy_h[:hh], sr=csr_h))) -
+                float(enc_s.cosine(ref_s, enc_s.embed(cy_h[hh:], sr=csr_h)))) / 2.0)
+            print(f"  baseline identity {base_s:.4f}   noise floor ±{noise_s:.4f}\n")
+
+            GRID = [('vol',    [-12, -6, 0, 6, 12]),
+                    ('eq_low', [-6, -3, 0, 3, 6]),
+                    ('eq_mid', [-6, -3, 0, 3, 6]),
+                    ('eq_high',[-6, -3, 0, 3, 6]),
+                    ('hp',     [40, 65, 95, 150]),
+                    ('lp',     [6000, 8000, 11000, 16000]),
+                    ('NR',     [0, 0.15, 0.3, 0.5]),
+                    ('comp',   [0, 0.2, 0.4, 0.6]),
+                    ('de-ess', [0, 0.15, 0.3, 0.5])]
+            rows = []
+            for axis, values in GRID:
+                ids = []
+                for v in values:
+                    blk = dict(opt); blk[axis] = v
+                    ids.append((v, ident_blk(blk)))
+                swing = max(i for _, i in ids) - min(i for _, i in ids)
+                bestv, besti = max(ids, key=lambda t: t[1])
+                rows.append((axis, swing, bestv, besti, besti - base_s))
+            rows.sort(key=lambda r: -r[1])
+
+            print(f"  {'axis':>8}{'swing':>9}{'best value':>12}{'identity':>10}{'vs base':>9}")
+            for axis, swing, bestv, besti, delta in rows:
+                verdict = ('MATTERS' if swing > 3 * noise_s else
+                           'marginal' if swing > noise_s else 'INERT')
+                print(f"  {axis:>8}{swing:>9.4f}{str(bestv):>12}{besti:>10.4f}"
+                      f"{delta:>+9.4f}   {verdict}")
+            live = [r[0] for r in rows if r[1] > 3 * noise_s]
+            dead = [r[0] for r in rows if r[1] <= noise_s]
+            print(f"\n  Knobs that move identity for this voice: "
+                  f"{', '.join(live) if live else 'NONE'}")
+            if dead:
+                print(f"  Knobs measurably inert here: {', '.join(dead)}")
+            print(f"  (screening only — use --optimise-audio to search the live axes "
+                  f"jointly, interactions included)")
+        except Exception as e:
+            print(f"  [!] Screening unavailable ({e})")
+
+    # ── Derivative-free optimisation of the whole audio block ─────────────────
+    # Evaluations here are CHEAP (one clone, then post-processing + one ECAPA
+    # embed each), so unlike the XTTS search we can afford hundreds of them —
+    # which is exactly the regime where derivative-free global optimisers earn
+    # their keep. Least squares does not apply (ECAPA is a non-differentiable
+    # black box, there is no design matrix); bisection does not either (12
+    # interacting axes, non-monotonic). Differential evolution + Nelder-Mead
+    # polish is the method that matches this structure.
+    #
+    # DANGER, handled below: optimising 12 knobs against a neural metric is
+    # metric hacking. Every result is therefore validated on a SECOND clone
+    # generated from a different sentence, and rejected if it does not transfer.
+    if args.optimise_audio != 'none':
+        print(f"\n{'-'*64}\n  Audio-block optimisation ({args.optimise_audio}) — "
+              f"target: identity\n{'-'*64}")
+        try:
+            import numpy as _np
+            from scipy.optimize import differential_evolution, minimize
+            from speaker_identity import SpeakerEncoder
+            enc = SpeakerEncoder(device=args.device)
+            ref_emb = enc.embed(args.reference)
+
+            # Bounds kept musically sane: outside these the result stops being
+            # a listenable voice regardless of what the metric says.
+            AXES = [('vol', -18, 18), ('eq_low', -6, 6), ('eq_mid', -6, 6),
+                    ('eq_high', -6, 6), ('hp', 40, 150), ('lp', 6000, 16000),
+                    ('NR', 0, 0.5), ('comp', 0, 0.6), ('de-ess', 0, 0.5)]
+            x0 = _np.array([float(opt.get(k, 0)) for k, _, _ in AXES])
+            bounds = [(lo, hi) for _, lo, hi in AXES]
+
+            evals = [0]
+            def identity_of(x, wav_in, wav_out):
+                blk = dict(opt)
+                for (k, _, _), v in zip(AXES, x):
+                    blk[k] = float(v)
+                apply_post(wav_in, wav_out, blk, xtts, lang, gen_path)
+                return float(enc.cosine(ref_emb, enc.embed(wav_out))), blk
+
+            def neg_identity(x):
+                evals[0] += 1
+                v, _ = identity_of(x, raw, cand)
+                return -v
+
+            base_id = -neg_identity(x0)
+            print(f"  start (tone-fitted block): identity {base_id:.4f}")
+
+            if args.optimise_audio == 'de':
+                res = differential_evolution(
+                    neg_identity, bounds, maxiter=max(5, args.optimise_budget // 90),
+                    popsize=10, tol=1e-4, seed=0, polish=False, init='sobol')
+                xb = res.x
+                print(f"  differential evolution: {evals[0]} evaluations")
+                r2 = minimize(neg_identity, xb, method='Nelder-Mead',
+                              options={'maxiter': 120, 'xatol': 1e-3, 'fatol': 1e-5})
+                if r2.fun < res.fun:
+                    xb = r2.x
+                print(f"  + Nelder-Mead polish: {evals[0]} total evaluations")
+            else:
+                r = minimize(neg_identity, x0, method='Nelder-Mead',
+                             options={'maxiter': args.optimise_budget,
+                                      'xatol': 1e-3, 'fatol': 1e-5})
+                xb = _np.clip(r.x, [b[0] for b in bounds], [b[1] for b in bounds])
+                print(f"  Nelder-Mead: {evals[0]} evaluations")
+
+            best_id, best_blk = identity_of(xb, raw, cand)
+            print(f"  optimised identity {best_id:.4f}  ({best_id - base_id:+.4f})")
+
+            # ── Hold-out: does it transfer to a clone of a DIFFERENT sentence? ──
+            HOLD_TEXT = ("Respire lentement et laisse les épaules redescendre, "
+                         "sans forcer.")
+            print(f"\n  Hold-out check on an unseen sentence "
+                  f"(one extra generation)...")
+            raw2 = os.path.join(tmpdir, 'clone_raw_holdout.wav')
+            cand2 = os.path.join(tmpdir, 'cand_holdout.wav')
+            XC.generate(model, HOLD_TEXT, lang, latents, raw2,
+                        temperature=xtts.get('temp', 0.65),
+                        length_penalty=xtts.get('len_pen', 1.0),
+                        repetition_penalty=xtts.get('rep_pen', 5.0),
+                        top_k=int(xtts.get('top_k', 50)),
+                        top_p=xtts.get('top_p', 0.85),
+                        num_beams=int(xtts.get('num_beams', 1)),
+                        speed=1.0, seed=seed)
+            h_base, _ = identity_of(x0, raw2, cand2)
+            h_best, _ = identity_of(xb, raw2, cand2)
+            print(f"  held-out clone: {h_base:.4f} -> {h_best:.4f} "
+                  f"({h_best - h_base:+.4f})")
+
+            gain_fit = best_id - base_id
+            gain_out = h_best - h_base
+            if gain_out > 0.01 and gain_out > 0.4 * gain_fit:
+                for k, _, _ in AXES:
+                    opt[k] = (round(best_blk[k]) if k in ('vol', 'hp', 'lp')
+                              else round(best_blk[k], 2))
+                print(f"\n  ADOPTED: the gain transfers to unseen speech "
+                      f"({gain_out:+.4f}).")
+            else:
+                print(f"\n  REJECTED: the gain does NOT transfer "
+                      f"(fit {gain_fit:+.4f} vs held-out {gain_out:+.4f}).")
+                print(f"  That is metric hacking — settings tuned to flatter ECAPA on "
+                      f"one clip, not to make the voice more like the person.")
+                print(f"  Keeping the tone-fitted block.")
+            apply_post(raw, cand, opt, xtts, lang, gen_path)
+        except Exception as e:
+            print(f"  [!] Audio optimisation unavailable ({e})")
 
     print(f"  Final []: vol={opt['vol']:+d}  eq_low={opt['eq_low']:+.1f}  "
           f"eq_mid={opt['eq_mid']:+.1f}  eq_high={opt['eq_high']:+.1f}  "

@@ -144,6 +144,12 @@ def main():
                         help='XTTS {} block from voice_analyser (e.g. "{1, 42, 0, 200, ...}")')
     parser.add_argument('--audio-block', default=None,
                         help='Audio [] block from voice_analyser (e.g. "[1, FR, 0.9, 6, ...]")')
+    parser.add_argument('--blind', action='store_true',
+                        help='Blind audition: randomise variant order and announce only '
+                             '"Variante N" instead of the settings, so the label cannot '
+                             'bias the ear. The key is printed after the ranking.')
+    parser.add_argument('--blind-seed', type=int, default=0,
+                        help='Seed for the blind shuffle (change it to re-randomise)')
     parser.add_argument('--no-labels', action='store_true',
                         help='Do not prepend spoken labels to each variation')
     parser.add_argument('--no-score', action='store_true',
@@ -358,10 +364,10 @@ def main():
     audio_only_params = AUDIO_PARAMS
     all_audio = all(p in audio_only_params for p in param_keys)
 
-    # Scoring makes sense only when generation actually changes between variants
-    # (i.e. a {} param is swept). For audio-only sweeps every variant is the same
-    # clone, so accent/identity would be identical — skip.
-    do_score = (not args.no_score) and (not all_audio)
+    # Audio-only sweeps ARE scorable: the clone is identical, but post-processing
+    # changes the rendered spectrum, and ECAPA identity is measured on that.
+    # (Accent may also move if heavy processing hurts intelligibility — useful.)
+    do_score = not args.no_score
     pron = None; enc = None; ref_emb = None; scores = []
     if do_score:
         ref0 = voice_refs[0] if isinstance(voice_refs, list) else voice_refs
@@ -388,16 +394,40 @@ def main():
         base_audio_raw = AudioSegment.from_wav(base_wav)
         print(f"[OK] Base audio: {len(base_audio_raw)/1000:.1f}s\n")
 
-    for i, combo in enumerate(all_combos):
+    # Blind mode: hearing "N R zero point three" just before a clip biases the
+    # judgement. Randomise the order, drop the spoken labels, and reveal the key
+    # only at the end — so the ear decides before the label does.
+    order = list(range(len(all_combos)))
+    if args.blind:
+        import random as _rnd
+        _rnd.Random(args.blind_seed).shuffle(order)
+        print(f"[*] BLIND mode: {len(order)} variants in random order, no spoken "
+              f"labels. The key is printed at the end.\n")
+    blind_key = []
+    noise_floor = [None]
+
+    for pos, i in enumerate(order):
+        combo = all_combos[i]
         params = base_params.copy()
         for pk, pv in zip(param_keys, combo):
             params[pk] = pv
 
         combo_str = '  '.join(f"{pk}={pv}" for pk, pv in zip(param_keys, combo))
-        print(f"[{i+1}/{len(all_combos)}] {combo_str}")
+        blind_key.append((pos + 1, combo_str))
+        if args.blind:
+            print(f"[{pos+1}/{len(all_combos)}] (hidden)")
+        else:
+            print(f"[{pos+1}/{len(all_combos)}] {combo_str}")
 
-        # Spoken label
-        if not args.no_labels:
+        # Spoken label ("variant N" only in blind mode, so you can still count)
+        if args.blind:
+            label_path = os.path.join(tmpdir, f'label_{i}.wav')
+            try:
+                speak_label(tts, speaker_wav, lang, f"Variante {pos+1}.", label_path)
+                final_audio = final_audio + AudioSegment.from_wav(label_path) + label_pause
+            except Exception as e:
+                print(f"   [!] Label failed: {e}")
+        elif not args.no_labels:
             label_text = '  '.join(f"{pk} {pv}" for pk, pv in zip(param_keys, combo)) + '.'
             label_path = os.path.join(tmpdir, f'label_{i}.wav')
             try:
@@ -417,20 +447,45 @@ def main():
                 if device == 'cuda':
                     try: torch.cuda.empty_cache()
                     except Exception: pass
-                if do_score:
-                    rec = {'combo': list(zip(param_keys, combo)),
-                           'fr': None, 'detected': '', 'wer': None, 'cos': None}
-                    if pron is not None:
-                        pr = pron.score(out_path, lang=lang, target_text=args.text)
-                        rec['fr'] = pr['score']; rec['detected'] = pr['detected']; rec['wer'] = pr['wer']
-                    if enc is not None:
-                        rec['cos'] = enc.cosine(ref_emb, enc.embed(out_path))
-                    scores.append(rec)
-                    sc = (f"french={rec['fr']:.3f} " if rec['fr'] is not None else "") + \
-                         (f"identity={rec['cos']:.4f}" if rec['cos'] is not None else "")
-                    print(f"   [score] {sc}")
                 audio = AudioSegment.from_wav(out_path)
                 audio = apply_audio(audio, params)
+
+            # Score the audio you will actually HEAR — i.e. AFTER post-processing.
+            # Scoring the raw clone meant the [] parameters could never influence
+            # the ranking, and audio-only sweeps were left unscored entirely.
+            # ECAPA reads the processed spectrum, so EQ/NR/filters DO move identity.
+            if do_score:
+                scored_path = os.path.join(tmpdir, f'scored_{i}.wav')
+                audio.export(scored_path, format='wav')
+                rec = {'combo': list(zip(param_keys, combo)),
+                       'fr': None, 'detected': '', 'wer': None, 'cos': None}
+                if pron is not None:
+                    pr = pron.score(scored_path, lang=lang, target_text=args.text)
+                    rec['fr'] = pr['score']; rec['detected'] = pr['detected']; rec['wer'] = pr['wer']
+                if enc is not None:
+                    rec['cos'] = enc.cosine(ref_emb, enc.embed(scored_path))
+                    # Noise floor, measured once: identity of each half of the
+                    # same render. Same voice, so their spread is this clip's
+                    # measurement variability — the bar a difference must clear
+                    # before it means anything.
+                    if noise_floor[0] is None:
+                        try:
+                            import soundfile as _sf
+                            _y, _sr = _sf.read(scored_path)
+                            if getattr(_y, 'ndim', 1) > 1:
+                                _y = _y.mean(axis=1)
+                            _h = len(_y) // 2
+                            noise_floor[0] = max(0.004, abs(
+                                float(enc.cosine(ref_emb, enc.embed(_y[:_h], sr=_sr))) -
+                                float(enc.cosine(ref_emb, enc.embed(_y[_h:], sr=_sr)))) / 2.0)
+                            print(f"   [noise floor] identity differences below "
+                                  f"±{noise_floor[0]:.4f} are not meaningful")
+                        except Exception:
+                            noise_floor[0] = 0.004
+                scores.append(rec)
+                sc = (f"french={rec['fr']:.3f} " if rec['fr'] is not None else "") + \
+                     (f"identity={rec['cos']:.4f}" if rec['cos'] is not None else "")
+                print(f"   [score] {sc}")
 
             elapsed = time.time() - t0
             final_audio = final_audio + audio + silence
@@ -451,20 +506,54 @@ def main():
         print(f"\n{'='*60}\n  RANKING (by {args.prioritise})\n{'='*60}")
         hdr = '  '.join(f"{k:>10}" for k in param_keys)
         print(f"  {hdr}{'french':>10}{'wer':>7}{'identity':>11}")
+        nf = noise_floor[0] or 0.004
+        top = ranked[0]
+        n_tied = 0
         for r in ranked:
             vals = '  '.join(f"{str(v):>10}" for _, v in r['combo'])
             fr = f"{r['fr']:.3f}" if r['fr'] is not None else "  -  "
             we = f"{r['wer']:.2f}" if r['wer'] is not None else "  -  "
             co = f"{r['cos']:.4f}" if r['cos'] is not None else "   -   "
-            print(f"  {vals}{fr:>10}{we:>7}{co:>11}")
+            tie = ''
+            if (r is not top and r['cos'] is not None and top['cos'] is not None
+                    and abs(top['cos'] - r['cos']) <= nf):
+                tie = ' ='; n_tied += 1
+            print(f"  {vals}{fr:>10}{we:>7}{co:>11}{tie}")
+        if n_tied:
+            print(f"\n  '=' marks {n_tied} variant(s) whose identity is within the "
+                  f"±{nf:.4f} noise floor of the best —")
+            print(f"  the measurement cannot separate them. THIS is where your ear "
+                  f"decides, not the ranking.")
 
         winner = base_params.copy()
         for k, v in ranked[0]['combo']:
             winner[k] = v
         print(f"\n  Best {args.prioritise}: " +
               '  '.join(f"{k}={v}" for k, v in ranked[0]['combo']))
-        print(f"  Paste into the comparator (frozen seed/temp/...):")
-        print(f"  {format_xtts_block(winner)}")
+        swept_audio = [k for k in param_keys if k in AUDIO_PARAMS]
+        if swept_audio:
+            # Audio params live in the [] block, not the {} one.
+            a = dict(base_params)
+            for k, v in ranked[0]['combo']:
+                if k in AUDIO_PARAMS:
+                    a[k] = v
+            order = ['speed', 'vol', 'eq_low', 'eq_mid', 'eq_high', 'hp', 'lp',
+                     'NR', 'comp', 'de-ess', 'reverb', 'noise_gate', 'pan', 'limiter']
+            def _f(x):
+                x = float(x)
+                return str(int(x)) if abs(x - round(x)) < 1e-9 else f"{x:g}"
+            vals = ', '.join(_f(a.get(k, 1 if k in ('speed', 'limiter') else 0))
+                             for k in order)
+            print(f"  Paste into the generator / comparator (audio block):")
+            print(f"  [1, {lang}, {vals}]")
+        if any(k not in AUDIO_PARAMS for k in param_keys):
+            print(f"  Paste into the comparator (frozen seed/temp/...):")
+            print(f"  {format_xtts_block(winner)}")
+
+    if args.blind and blind_key:
+        print(f"\n{'='*60}\n  BLIND KEY (read AFTER listening)\n{'='*60}")
+        for n, desc in blind_key:
+            print(f"  Variante {n}: {desc}")
 
     # Save
     print(f"\n[*] Saving {output_file}...")

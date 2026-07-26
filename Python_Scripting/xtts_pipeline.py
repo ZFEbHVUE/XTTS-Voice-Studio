@@ -82,6 +82,15 @@ def main():
     p.add_argument('--target-dbfs', type=float, default=None,
                    help='Comparator: fit the volume toward this absolute RMS level '
                         '(e.g. -20) instead of matching a quiet reference')
+    p.add_argument('--fit-identity', action='store_true',
+                   help='Comparator: also search post-processing settings that raise '
+                        'ECAPA identity (not just spectral tone)')
+    p.add_argument('--screen-audio', action='store_true',
+                   help='Comparator: sensitivity screening of each audio parameter '
+                        '(which knobs move identity for this voice)')
+    p.add_argument('--optimise-audio', default='none', choices=['none','nelder','de'],
+                   help='Comparator: derivative-free optimisation of the audio block '
+                        'against ECAPA identity (validated on an unseen sentence)')
     p.add_argument('--probe-beams', action='store_true',
                    help='Optimiser: also probe beam-search/greedy decoding on the winner')
     p.add_argument('--whisper-model', default='small')
@@ -161,6 +170,12 @@ def main():
             cmd += ['--auto-text']
         if args.target_dbfs is not None:
             cmd += ['--target-dbfs', str(args.target_dbfs)]
+        if args.fit_identity:
+            cmd += ['--fit-identity']
+        if args.screen_audio:
+            cmd += ['--screen-audio']
+        if args.optimise_audio != 'none':
+            cmd += ['--optimise-audio', args.optimise_audio]
         if args.device:
             cmd += ['--device', args.device]
         rc, out = run_stream(cmd, f'V{n} 4/4 TONE FIT')

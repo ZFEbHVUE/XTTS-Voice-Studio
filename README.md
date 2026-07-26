@@ -133,6 +133,20 @@ into the generator prompt. Also writes a `*_pipeline_clone.wav` per voice:
 **listen to it before generating** — the scores don't hear naturalness.
 CLI equivalent: `xtts_pipeline.py --voice lea.wav FR --voice john.wav EN`.
 
+Options (all off by default — the safeguards below them are always on):
+
+| Control | CLI | Effect |
+|---|---|---|
+| Screen audio params | `--screen-audio` | Which knobs move identity for this voice |
+| Optimise audio | `--optimise-audio nelder\|de` | Joint search of the audio block, transfer-tested |
+| Target dBFS | `--target-dbfs -20` | Absolute render level instead of matching a quiet reference |
+| Probe beam/greedy | `--probe-beams` | Test beam-search and greedy decoding on the winner |
+
+Always applied, no option needed: hold-out validation with tied-candidate
+selection, worst-case seed ranking, per-score sigma with ties marked, hp floored
+and frozen, measured de-ess/comp fit, auto-text. See **Measurement &
+optimisation reference** for what each of these means.
+
 ### [Cur] Curation
 
 Builds a clean reference before anything else: windows the raw recording, embeds
@@ -510,6 +524,209 @@ than an A/B listen.
 
 ---
 
+## Measurement & optimisation reference
+
+Everything below is what makes the blocks trustworthy. Read this section if a
+number surprises you, or before adding a knob "because it should help".
+
+### The three measurements
+
+| Metric | What it means | Tool | Blind spot |
+|---|---|---|---|
+| `french` | ASR-based pronunciation/accent score (faster-whisper) | `pron_score.py` | Says nothing about timbre |
+| `identity` | ECAPA-TDNN cosine, reference vs clone | `speaker_identity.py` | Says nothing about diction or naturalness |
+| `residual` | Weighted RMS error between LTAS curves, in dB | `ltas_match.py` | Tonal only — a wrong voice can still match |
+
+The optimiser objective is `w_accent · french + w_identity · identity`
+(default 0.6 / 0.4). French saturates around 0.93–0.96 in practice, so the
+composite is driven almost entirely by identity.
+
+### Reading an identity score
+
+The generic "0.80 = same speaker" threshold comes from VoxCeleb EER between
+REAL recordings; it is not calibrated for synthetic speech. Use the per-
+reference ceiling instead:
+
+```bash
+python speaker_identity.py reference.wav clone.wav clone_rvc.wav
+```
+
+```
+  reference: Lea_curated.wav
+  same-speaker ceiling for this recording: 0.9310   (reference split in halves)
+  identity 0.8470  (same speaker)  [91% of ceiling]  Lea_pipeline_clone.wav
+```
+
+The ceiling is the reference scored against itself (two halves, same person,
+same mic). It collapses on a degraded reference — which is the quantitative
+explanation of why a badly denoised source caps out low.
+
+### Statistical honesty
+
+Every score is a mean over N sentences and now carries its standard deviation.
+Two rules follow, applied everywhere:
+
+- **Ties are marked `=`.** When two candidates differ by less than the combined
+  measurement noise, the ranking between them is noise. Pick by ear.
+- **Thresholds are noise-derived, not constants.** The inertness probe, the
+  overfitting warning and the validator ranking all compare against the measured
+  standard error, never a hard-coded 0.01.
+
+Noise floor for a single clip is estimated by scoring each half of the same
+render: same voice, so the spread is that clip's measurement variability.
+
+### Hold-out validation (why the reported score is lower — and true)
+
+Searching seeds on 1–2 sentences overfits them to those sentences. The optimiser
+therefore keeps sentences aside:
+
+```
+  seed  temp   search  held-out    drop
+    50  0.85    0.823     0.771  +0.053
+   125  0.75    0.821     0.786  +0.036
+   125  0.63    0.819     0.718  +0.100
+  Winner CHANGED: seed 125 temp 0.75 generalises better than seed 50 temp 0.85.
+```
+
+The winner AND every candidate tied with it are re-scored on sentences never
+used during the search; the final pick is the best HELD-OUT score. A drop far
+above the noise means the seed was tuned to the test phrase and will not hold
+over a long meditation.
+
+| Option | Default | Effect |
+|---|---|---|
+| `--holdout-texts N` | 2 | Sentences reserved for validation |
+| `--no-holdout` | off | Skip it (reported score becomes optimistically biased) |
+| `--seed-robust` / `--seed-mean` | robust | Rank seeds on worst-case sentence vs mean |
+| `--probe-texts N` | 2 | Sentences averaged per score (3 cuts noise by ~1/3) |
+
+### Sampling search (`xtts_optimize.py`)
+
+Method `rsm`, four stages, matched to the structure of each axis:
+
+1. **Seed screen** — the seed is chaotic, so it is brute-screened; ranked on the
+   WORST sentence so a seed that shines once and fails twice cannot win.
+2. **Least-squares temp surface** — `temp` is the one smooth continuous axis, so
+   a parabola is fitted per kept seed and its vertex solved analytically. In
+   practice XTTS landscapes are often non-concave; the code then falls back to
+   the best sampled point (this is expected, not an error).
+3. **Inertness probe** — `rep_pen` / `top_p` are usually inert; they are frozen
+   unless they move the score beyond the noise.
+4. **Decode-mode probe** (`--probe-beams`, optional) — `num_beams=3` beam search
+   and greedy decoding. Beam search is the only mode where `length_penalty` does
+   anything at all; at `num_beams=1` that field is dead.
+
+The Pareto front (french vs identity) is printed so the accent/timbre trade-off
+is yours to make, not the weighted sum's.
+
+### Audio-block tools — screening, optimisation, transfer test
+
+The `[]` block is fitted by measurement, never by heuristics. Three stages, in
+the order an Optimetrics user would run them:
+
+```bash
+python voice_comparator.py ref_curated.wav FR \
+    --xtts-block "{...}" --audio-block "[...]" --auto-text \
+    --screen-audio --optimise-audio de
+```
+
+**1. Closed-loop tone fit (always on).** Least squares on the LTAS difference
+using the generator's EXACT EQ responses, perceptually weighted (IEC
+A-weighting), iterated until the largest change falls under `--conv-threshold`.
+`hp`/`lp` are guards, not tone controls: they are floored at 40 Hz and frozen
+after the first pass — re-deriving them each pass walked the high-pass down
+30 Hz per iteration until it filtered nothing.
+
+**2. Sensitivity screening (`--screen-audio`).** Each audio parameter alone,
+across its full musical range, measuring how far ECAPA identity moves:
+
+```
+     axis    swing  best value  identity  vs base
+   eq_low   0.0450          -3    0.7350  +0.0210   MATTERS
+       lp   0.0180       11000    0.7290  +0.0080   marginal
+       NR   0.0007         0.0    0.7141  +0.0000   INERT
+```
+
+Verdicts are relative to the measured noise floor: `MATTERS` above 3×, `INERT`
+below 1×. The answer differs per voice — screen before assuming.
+
+**3. Joint optimisation (`--optimise-audio nelder|de`).** Evaluations here are
+cheap (one clone, then post-processing plus one embedding), which is exactly the
+regime where derivative-free global search pays off. `de` runs differential
+evolution (Sobol init) then a Nelder-Mead polish over 9 bounded axes at once,
+capturing the interactions one-factor-at-a-time screening misses by
+construction.
+
+Why not the other classics: least squares needs a design matrix and ECAPA is a
+non-differentiable black box; bisection is a 1-D monotonic tool; gradient
+methods (quasi-Newton, SQP) need reliable finite differences, but `vol` is an
+integer, `hp`/`lp` are rounded and samples are quantised — several axes are
+piecewise constant.
+
+**4. Transfer test (automatic after optimisation).** Optimising 12 knobs against
+a neural metric is metric hacking. A second clone is generated from an unseen
+sentence and the settings are adopted only if the gain transfers:
+
+```
+  optimised identity 0.7290 -> 0.7710  (+0.0420)
+  held-out clone:    0.7180 -> 0.7530  (+0.0350)
+  ADOPTED: the gain transfers to unseen speech (+0.0350).
+```
+
+Otherwise it is rejected and the tone-fitted block is kept.
+
+### Why some `[]` fields stay at zero
+
+Not a bug — a measured decision, printed with its reason:
+
+```
+  de-ess: clone has LESS sibilance than the reference (-5.1 dB) — a de-ess can
+          only reduce it, nothing to do -> 0
+```
+
+- `de-ess`, `comp` — synthetic speech is smoother than a real recording, so the
+  gaps are usually NEGATIVE; a de-esser and a compressor can only reduce. They
+  activate on an abnormally sibilant or peaky clone.
+- `NR` — XTTS output is synthetic; there is no noise to remove, only voice to
+  damage.
+- `reverb`, `pan` — creative choices, no measurable target.
+- `noise_gate` — chops speech; left at 0 deliberately.
+- `limiter` — always 1.
+
+### Production level vs reference matching
+
+The tone fit matches the reference by default, which is correct but produces an
+unusable render level when the reference is quiet (a -33 dBFS source yields
+`vol=-13`). For a deliverable:
+
+```bash
+--target-dbfs -20        # absolute RMS target instead of matching
+```
+
+### Blind listening — the only test the metrics cannot do
+
+```bash
+python listening_test.py clone_a.wav clone_b.wav --reference real.wav --trials 12
+```
+
+Forced-choice A/B, order randomised and labels hidden, concluded with a
+two-sided binomial sign test: 10 preferences out of 12 is significant
+(p = 0.039), 9 out of 12 is not (p = 0.146). The validator has the same
+discipline via `--blind`: randomised order, only "Variante N" announced, key
+revealed after the ranking.
+
+Division of labour, in order:
+
+| Stage | Answers |
+|---|---|
+| `--screen-audio` | which knobs matter for this voice |
+| `--optimise-audio` | the best joint setting |
+| transfer test | is that gain real or metric hacking |
+| `--blind` / `listening_test.py` | **does it sound like the person** |
+
+The first three filter noise and cheating; only the last one answers the
+question you actually care about.
+
 ## Recommended Workflow
 
 One-shot: the **[Auto] Pipeline** tab runs steps 3–6 automatically per voice.
@@ -579,24 +796,6 @@ Some GPU operations ignore SIGKILL until the current CUDA kernel completes. Wait
 
 **`eq_high` takes non-integer values like -3.775**
 Fixed in recent version — values are now rounded to 1 decimal place.
-
----
-
-## Evaluation methodology
-
-Objective metrics (ECAPA cosine, ASR-based accent score) are proxies: they do
-not hear diction or naturalness. Three habits keep the numbers honest:
-
-- **Blind listening** — `listening_test.py` runs a forced-choice A/B with the
-  order randomised and the labels hidden, then a two-sided binomial sign test.
-  10 preferences out of 12 is significant (p=0.039); 9 out of 12 is not
-  (p=0.146). This is the only test that answers "is it really her".
-- **Identity relative to a ceiling** — `speaker_identity.py` splits the
-  reference in two halves and scores them against each other. That is the
-  same-speaker maximum for that recording, so 0.847 reads as "91 % of what is
-  reachable" rather than against the generic 0.80 VoxCeleb threshold, which is
-  not calibrated for synthetic speech.
-- **Hold-out + noise floor** — see the optimiser safeguards above.
 
 ---
 
