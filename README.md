@@ -311,6 +311,47 @@ block if it wins.
 | 15 | `pan` | 0 | Stereo pan (-1.0=left, 0=centre, +1.0=right) |
 | 16 | `limiter` | 0 | Output limiter (0=off, 1=on) |
 
+### Pause syntax
+
+Two forms. The second one is the important one for guided meditation, and it is
+the reason a script keeps its timing when you change voice, speed or seed.
+
+| Form | Meaning |
+|---|---|
+| `[pause=2s]` | Insert 2 s of silence after the sentence |
+| `[pause=4s,start]` | Silence adjusted so that **speech + silence = 4 s total**, counted from the START of the sentence |
+
+```
+Installe-toi confortablement.
+[pause=4s,start]
+Et laisse ton souffle ralentir.
+[pause=2s]
+```
+
+With `,start`, the generator measures how long the sentence actually took and
+subtracts it:
+
+```
+  [*]  Adjusted pause: speech=2.35s + silence=1.65s = TOTAL 4.00s [OK]
+```
+
+Why it matters: a fixed `[pause=2s]` shifts the whole timeline as soon as the
+spoken part changes length — a different `speed`, a different seed, or another
+voice all change sentence duration. `,start` pins the **cadence** instead: each
+cue starts on a fixed grid, which is what a meditation script needs to stay in
+step with breathing or with a music bed.
+
+If the sentence is already longer than the requested total, no silence is added
+and the generator says so:
+
+```
+  [*]  Adjusted pause: speech already >= 4s
+```
+
+Notes: the `s` suffix is optional (`[pause=4,start]` works), decimals are
+accepted (`[pause=1.5s]`), and a `,start` pause placed before any speech behaves
+like a plain pause since there is nothing to subtract.
+
 ### Per-voice config persistence
 
 Short blocks inherit the last full config for that voice:
