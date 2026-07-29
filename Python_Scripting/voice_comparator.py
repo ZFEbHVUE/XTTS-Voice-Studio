@@ -92,8 +92,9 @@ def format_blocks(N, xtts, audio, lang):
 
 # ── Text ──────────────────────────────────────────────────────────────────────
 
-def clean_text(raw):
-    """Strip pause/parameter markup, keep prose for a short test clip."""
+def clean_text(raw, lang='en'):
+    """Strip pause/parameter markup, keep prose for a short test clip.
+    Falls back to a built-in sentence IN THE TARGET LANGUAGE when empty."""
     lines = []
     for ln in raw.splitlines():
         s = ln.strip()
@@ -107,7 +108,8 @@ def clean_text(raw):
         if s:
             lines.append(s)
     text = ' '.join(lines).strip()
-    return text or "Bonjour, ceci est un court test de comparaison de voix."
+    from probe_texts import default_text as _dt
+    return text or _dt(lang)
 
 
 # ── Audio I/O ─────────────────────────────────────────────────────────────────
@@ -128,6 +130,15 @@ def load_mono(path, target_sr=None):
 
 
 # ── Post-processing ───────────────────────────────────────────────────────────
+
+def _quiet_post(raw_path, out_path, audio, xtts, lang, gen_path):
+    """apply_post with the generator's per-render logging suppressed.
+    The screening and the optimiser call it hundreds of times; without this,
+    one useful line drowns in thousands of '[*] Audio: EQ(...)' lines."""
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        return apply_post(raw_path, out_path, audio, xtts, lang, gen_path)
+
 
 def apply_post(raw_path, out_path, audio, xtts, lang, gen_path):
     """Apply the generator's process_audio chain to a raw clone."""
@@ -177,7 +188,9 @@ def main():
     p.add_argument('voice_refs', nargs='*')
     p.add_argument('--xtts-block', required=True)
     p.add_argument('--audio-block', required=True)
-    p.add_argument('--text', default="Bonjour, ceci est un court test de comparaison de voix.")
+    p.add_argument('--text', default=None,
+                   help='Sentence to fit on (default: a built-in sentence in the '
+                        'target language — see probe_texts.py)')
     p.add_argument('--text-file', default=None)
     p.add_argument('--auto-text', action='store_true',
                    help='Transcribe the reference (faster-whisper, CPU) and fit on '
@@ -225,6 +238,9 @@ def main():
     p.add_argument('--optimise-budget', type=int, default=400,
                    help='Max objective evaluations for --optimise-audio (default: 400; '
                         'each one is just post-processing + an embedding)')
+    p.add_argument('--no-identity-check', action='store_true',
+                   help='Skip the extra generation that measures identity on UNSEEN '
+                        'text (the figure that matches real usage)')
     p.set_defaults(fit_dynamics=True)
     args = p.parse_args()
 
@@ -257,18 +273,18 @@ def main():
             if total + len(t) + 1 > 240:
                 break
             parts.append(t); total += len(t) + 1
-        auto = clean_text(' '.join(parts))
+        auto = clean_text(' '.join(parts), lang)
         if len(auto) >= 30:
             text = auto
             print(f"[OK] Fitting on: \"{text[:70]}{'...' if len(text) > 70 else ''}\"")
         else:
             print("[!] Transcription too short — keeping the provided text.")
-            text = clean_text(args.text)
+            text = clean_text(args.text, lang)
     elif args.text_file and os.path.exists(args.text_file):
         with open(args.text_file, encoding='utf-8') as fh:
-            text = clean_text(fh.read())
+            text = clean_text(fh.read(), lang)
     else:
-        text = clean_text(args.text)
+        text = clean_text(args.text, lang)
 
     seed = int(xtts.get('seed', 0))
 
@@ -378,6 +394,7 @@ def main():
         cy, _ = load_mono(cand, target_sr=ref_sr)
         sib_gap = L.sibilance_db(cy, ref_sr) - ref_sib
         crest_gap = L.crest_db(cy) - ref_crest
+        left_at_zero = []
         print(f"  reference: sibilance {ref_sib:+.1f} dB   crest {ref_crest:.1f} dB")
         print(f"  clone gap: sibilance {sib_gap:+.1f} dB   crest {crest_gap:+.1f} dB")
 
@@ -394,6 +411,7 @@ def main():
                           f"to do -> 0")
                 else:
                     print(f"  {name}: gap {gap:+.1f} dB within tolerance ({thr}) -> 0")
+                left_at_zero.append(name)
                 continue
             trial = dict(opt)
             trial[name] = round(min(cap, (gap - thr) * scale), 2)
@@ -474,6 +492,12 @@ def main():
         except Exception as e:
             print(f"  [!] Identity search unavailable ({e})")
 
+        if left_at_zero and not args.screen_audio:
+            print(f"  ({', '.join(left_at_zero)} left at 0 because the measured gap "
+                  f"points the wrong way for these tools.")
+            print(f"   To find out whether ANY audio parameter can move identity for "
+                  f"this voice, re-run with --screen-audio.)")
+
     # ── Sensitivity screening (which knobs matter at all?) ────────────────────
     # The Optimetrics reflex: screen BEFORE optimising. One factor at a time
     # across its full musical range, measuring how much ECAPA identity actually
@@ -487,7 +511,7 @@ def main():
             ref_s = enc_s.embed(args.reference)
 
             def ident_blk(blk):
-                apply_post(raw, cand, blk, xtts, lang, gen_path)
+                _quiet_post(raw, cand, blk, xtts, lang, gen_path)
                 return float(enc_s.cosine(ref_s, enc_s.embed(cand)))
 
             base_s = ident_blk(opt)
@@ -571,8 +595,8 @@ def main():
             def identity_of(x, wav_in, wav_out):
                 blk = dict(opt)
                 for (k, _, _), v in zip(AXES, x):
-                    blk[k] = float(v)
-                apply_post(wav_in, wav_out, blk, xtts, lang, gen_path)
+                    blk[k] = round(float(v)) if k in ('vol', 'hp', 'lp') else float(v)
+                _quiet_post(wav_in, wav_out, blk, xtts, lang, gen_path)
                 return float(enc.cosine(ref_emb, enc.embed(wav_out))), blk
 
             def neg_identity(x):
@@ -584,9 +608,18 @@ def main():
             print(f"  start (tone-fitted block): identity {base_id:.4f}")
 
             if args.optimise_audio == 'de':
-                res = differential_evolution(
-                    neg_identity, bounds, maxiter=max(5, args.optimise_budget // 90),
-                    popsize=10, tol=1e-4, seed=0, polish=False, init='sobol')
+                # Seed the population with the tone-fitted block. Without it,
+                # differential evolution never evaluates the starting point and
+                # can return something WORSE after hundreds of evaluations —
+                # which is exactly what happens on a flat, noisy landscape.
+                try:
+                    res = differential_evolution(
+                        neg_identity, bounds, maxiter=max(5, args.optimise_budget // 90),
+                        popsize=10, tol=1e-4, seed=0, polish=False, init='sobol', x0=x0)
+                except TypeError:            # older scipy has no x0=
+                    res = differential_evolution(
+                        neg_identity, bounds, maxiter=max(5, args.optimise_budget // 90),
+                        popsize=10, tol=1e-4, seed=0, polish=False, init='sobol')
                 xb = res.x
                 print(f"  differential evolution: {evals[0]} evaluations")
                 r2 = minimize(neg_identity, xb, method='Nelder-Mead',
@@ -602,6 +635,16 @@ def main():
                 print(f"  Nelder-Mead: {evals[0]} evaluations")
 
             best_id, best_blk = identity_of(xb, raw, cand)
+            if best_id < base_id:
+                # A search that ends below its own starting point has found
+                # nothing; say so plainly instead of reporting a "result".
+                print(f"  search ended BELOW the starting point "
+                      f"({best_id:.4f} < {base_id:.4f}) — the landscape is flat "
+                      f"and the optimiser is sampling noise.")
+                print(f"  Keeping the tone-fitted block (run --screen-audio to see "
+                      f"which axes, if any, actually move identity for this voice).")
+                apply_post(raw, cand, opt, xtts, lang, gen_path)
+                raise StopIteration
             print(f"  optimised identity {best_id:.4f}  ({best_id - base_id:+.4f})")
 
             # ── Hold-out: does it transfer to a clone of a DIFFERENT sentence? ──
@@ -639,6 +682,8 @@ def main():
                       f"one clip, not to make the voice more like the person.")
                 print(f"  Keeping the tone-fitted block.")
             apply_post(raw, cand, opt, xtts, lang, gen_path)
+        except StopIteration:
+            pass          # search ended below its start; message already printed
         except Exception as e:
             print(f"  [!] Audio optimisation unavailable ({e})")
 
@@ -666,6 +711,41 @@ def main():
     res_base = float(np.sqrt(np.mean((ref_shape - (bd - bd.mean())) ** 2)))
     res_opt  = float(np.sqrt(np.mean((ref_shape - (od - od.mean())) ** 2)))
     print(f"  LTAS residual vs reference: base {res_base:.2f} dB -> optimised {res_opt:.2f} dB")
+
+    # ── Identity on UNSEEN text — the figure that matches real usage ──────────
+    # With --auto-text the fit runs on the reference's OWN words, and identity
+    # measured there is systematically optimistic: the clone repeats sentences
+    # the speaker actually said, with matching prosody. Measured on new text —
+    # i.e. on the meditation you will actually generate — it drops noticeably
+    # (0.80 vs 0.69 on one measured voice). Report both so the number you read
+    # is the one that applies.
+    if not args.no_identity_check:
+        try:
+            from speaker_identity import SpeakerEncoder
+            _enc = SpeakerEncoder(device=args.device)
+            _ref = _enc.embed(args.reference)
+            _fit_id = float(_enc.cosine(_ref, _enc.embed(out_opt)))
+            UNSEEN = ("Installe-toi confortablement et laisse le silence "
+                      "prendre sa place.")
+            _raw2 = os.path.join(tmpdir, 'clone_unseen_raw.wav')
+            _out2 = os.path.join(tmpdir, 'clone_unseen.wav')
+            XC.generate(model, UNSEEN, lang, latents, _raw2,
+                        temperature=xtts.get('temp', 0.65),
+                        length_penalty=xtts.get('len_pen', 1.0),
+                        repetition_penalty=xtts.get('rep_pen', 5.0),
+                        top_k=int(xtts.get('top_k', 50)),
+                        top_p=xtts.get('top_p', 0.85),
+                        num_beams=int(xtts.get('num_beams', 1)),
+                        speed=1.0, seed=seed)
+            apply_post(_raw2, _out2, opt, xtts, lang, gen_path)
+            _unseen_id = float(_enc.cosine(_ref, _enc.embed(_out2)))
+            print(f"  Identity: {_fit_id:.4f} on the fitted sentence, "
+                  f"{_unseen_id:.4f} on UNSEEN text ({_unseen_id - _fit_id:+.4f})")
+            if _fit_id - _unseen_id > 0.05:
+                print(f"  ^ the fitted figure is optimistic; {_unseen_id:.4f} is what "
+                      f"your generated meditation will resemble.")
+        except Exception as _e:
+            print(f"  [!] Unseen-text identity check skipped ({_e})")
 
     print(f"\n{'='*64}\n  RESULT\n{'='*64}")
     print(f"  {xtts_str}")

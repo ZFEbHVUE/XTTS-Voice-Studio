@@ -6,7 +6,7 @@ Graphical interface for all XTTS-Voice-Studio scripts.
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext
+from tkinter import ttk, filedialog, scrolledtext, simpledialog, messagebox
 import subprocess
 import threading
 import sys
@@ -335,6 +335,42 @@ def make_btn(parent, text, cmd_fn, row):
 
 # ── Tab: Generator ─────────────────────────────────────────────────────────
 
+
+# ── Language-aware default sentences ─────────────────────────────────────────
+# The scoring tools transcribe the clone against the sentence they asked for,
+# so the sentence must be in the target language. These fields follow the
+# language combobox — but only while they still hold a built-in default, so a
+# sentence you typed is never overwritten.
+try:
+    from probe_texts import (default_text as _default_text,
+                             supported as _langs_ok,
+                             default_lang as _default_lang)
+except Exception:                                    # keep the GUI usable
+    def _default_text(lang): return "Hello, this is a short test sentence for tuning the voice."
+    def _langs_ok(): return ['en']
+    def _default_lang(): return 'EN'
+
+# Start on the user's own language rather than imposing one: an explicit
+# XTTS_STUDIO_LANG wins, else the system locale when we have sentences for it,
+# else English. No configuration needed for anybody.
+DEFAULT_LANG = _default_lang()
+
+_BUILTIN_TEXTS = set()
+
+
+def _bind_default_text(v_lang, v_text, extra=''):
+    """Keep v_text in sync with v_lang unless the user edited it."""
+    def _apply(*_):
+        cur = v_text.get().strip()
+        if cur and cur not in _BUILTIN_TEXTS:
+            return                                   # user text: leave it alone
+        new = _default_text(v_lang.get()) + extra
+        _BUILTIN_TEXTS.add(new)
+        v_text.set(new)
+    _BUILTIN_TEXTS.add(v_text.get().strip())
+    v_lang.trace_add('write', _apply)
+    _apply()
+
 def tab_generator(nb):
     f = ttk.Frame(nb)
     nb.add(f, text="[Gen] Generator")
@@ -417,7 +453,7 @@ def tab_generator(nb):
     editor_frame = ttk.LabelFrame(f, text="Prompt Editor")
     editor_frame.grid(row=7, column=0, columnspan=3, sticky='nsew', padx=6, pady=4)
     editor_frame.grid_columnconfigure(0, weight=1)
-    editor_frame.grid_rowconfigure(1, weight=1)
+    editor_frame.grid_rowconfigure(3, weight=1)   # editor row expands
 
     # Editor toolbar
     btn_bar = tk.Frame(editor_frame)
@@ -465,9 +501,165 @@ def tab_generator(nb):
     tk.Button(btn_bar, text="Go to line (Ctrl+G)", width=18,
               command=lambda: open_goto_line()).pack(side='left', padx=2)
 
+    # ── Insert bar: pauses, ambient and punctual music ────────────────────
+    # Inserts the exact tag syntax at the caret so it never has to be
+    # memorised or mistyped.
+    ins_bar = tk.Frame(editor_frame)
+    ins_bar.grid(row=1, column=0, columnspan=2, sticky='w', padx=4, pady=(0, 2))
+
+    v_pause_dur = tk.StringVar(value='2')
+    v_music_num = tk.StringVar(value='1')
+    v_music_dur = tk.StringVar(value='16')
+    v_music_vol = tk.StringVar(value='-15')
+    v_amb_vol   = tk.StringVar(value='-12')
+    v_preset    = tk.StringVar()
+
+    def _insert(tag, newline=True):
+        """Insert a tag on its own line at the caret, keeping the script tidy."""
+        try:
+            line_start = editor.index('insert linestart')
+            cur_line = editor.get(line_start, f'{line_start} lineend')
+            prefix = '' if (not cur_line.strip()) else '\n'
+            editor.insert('insert lineend' if cur_line.strip() else 'insert',
+                          f"{prefix}{tag}" + ('\n' if newline else ''))
+            editor.focus_set()
+            update_line_numbers()
+        except Exception as e:
+            print(f"[!] insert failed: {e}")
+
+    def _num(var, default, keep_int=True):
+        """Accept a French decimal comma; emit a clean number."""
+        d = var.get().strip().replace(',', '.')
+        try:
+            f = float(d)
+        except ValueError:
+            return default
+        return str(int(f)) if (keep_int and abs(f - round(f)) < 1e-9) else f"{f:g}"
+
+    def _signed(var, default):
+        s = _num(var, default, keep_int=True)
+        return s if s.startswith(('-', '+')) else '+' + s
+
+    tk.Label(ins_bar, text="Insert:", fg='#444').pack(side='left', padx=(0, 4))
+    tk.Label(ins_bar, text="s").pack(side='left')
+    tk.Entry(ins_bar, textvariable=v_pause_dur, width=4).pack(side='left', padx=(0, 4))
+    tk.Button(ins_bar, text="Pause",
+              command=lambda: _insert(f"[pause={_num(v_pause_dur, '2')}s]"),
+              width=7).pack(side='left', padx=2)
+    tk.Button(ins_bar, text="Paced pause",
+              command=lambda: _insert(f"[pause={_num(v_pause_dur, '2')}s,start]"),
+              width=12).pack(side='left', padx=2)
+
+    ttk.Separator(ins_bar, orient='vertical').pack(side='left', fill='y', padx=6, pady=2)
+
+    # Ambient bed: the parser accepts 'ambient_volume' ONLY — 'ambient_vol' is
+    # silently treated as plain text and the bed never plays.
+    tk.Label(ins_bar, text="dB").pack(side='left')
+    tk.Entry(ins_bar, textvariable=v_amb_vol, width=4).pack(side='left', padx=(0, 4))
+    tk.Button(ins_bar, text="Ambient",
+              command=lambda: _insert(f"ambient_volume={_num(v_amb_vol, '-12')}"),
+              width=8).pack(side='left', padx=2)
+
+    ttk.Separator(ins_bar, orient='vertical').pack(side='left', fill='y', padx=6, pady=2)
+
+    tk.Label(ins_bar, text="music #").pack(side='left')
+    tk.Entry(ins_bar, textvariable=v_music_num, width=3).pack(side='left')
+    tk.Label(ins_bar, text="s").pack(side='left', padx=(4, 0))
+    tk.Entry(ins_bar, textvariable=v_music_dur, width=4).pack(side='left')
+    tk.Label(ins_bar, text="dB").pack(side='left', padx=(4, 0))
+    tk.Entry(ins_bar, textvariable=v_music_vol, width=4).pack(side='left', padx=(0, 4))
+    tk.Button(ins_bar, text="Declare",
+              command=lambda: _insert(
+                  f"music_{v_music_num.get().strip() or '1'}="
+                  f"{_num(v_music_dur, '16')}s,{_signed(v_music_vol, '-15')}"),
+              width=8).pack(side='left', padx=2)
+    tk.Button(ins_bar, text="Trigger",
+              command=lambda: _insert(f"[music={v_music_num.get().strip() or '1'}]"),
+              width=8).pack(side='left', padx=2)
+
+    # ── Voice presets: save the {} / [] pair once, paste it into any script ──
+    ins_bar2 = tk.Frame(editor_frame)
+    ins_bar2.grid(row=2, column=0, columnspan=2, sticky='w', padx=4, pady=(0, 2))
+
+    PRESET_FILE = os.path.join(XTTS_ROOT, 'voice_presets.json')
+
+    def _load_presets():
+        try:
+            import json
+            with open(PRESET_FILE, 'r', encoding='utf-8') as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
+
+    def _refresh_presets():
+        names = sorted(_load_presets().keys())
+        cb_preset['values'] = names
+        if names and v_preset.get() not in names:
+            v_preset.set(names[0])
+
+    def _save_preset():
+        """Store the {} and [] currently in the editor selection, or the first
+        pair found in the script, under a name."""
+        import json, re as _re
+        try:
+            txt = editor.get('sel.first', 'sel.last')
+        except Exception:
+            txt = editor.get('1.0', 'end')
+        mx = _re.search(r'\{[^}\n]+\}', txt)
+        ma = _re.search(r'\[\s*\d+\s*,\s*[A-Za-z]{2}[^\]\n]*\]', txt)
+        if not mx or not ma:
+            status_lbl.config(text="No {} / [] pair found — select the two lines first")
+            return
+        name = simpledialog.askstring("Save voice preset",
+                                      "Name for this voice:", parent=f)
+        if not name:
+            return
+        data = _load_presets()
+        data[name.strip()] = {'xtts': mx.group(0), 'audio': ma.group(0)}
+        try:
+            with open(PRESET_FILE, 'w', encoding='utf-8') as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            _refresh_presets(); v_preset.set(name.strip())
+            status_lbl.config(text=f"Preset '{name.strip()}' saved")
+        except Exception as e:
+            status_lbl.config(text=f"Save failed: {e}")
+
+    def _insert_preset():
+        d = _load_presets().get(v_preset.get())
+        if not d:
+            status_lbl.config(text="No preset selected")
+            return
+        _insert(f"{d['xtts']}\n{d['audio']}")
+
+    def _delete_preset():
+        import json
+        data = _load_presets(); name = v_preset.get()
+        if name not in data:
+            return
+        if not messagebox.askyesno("Delete preset", f"Delete '{name}'?", parent=f):
+            return
+        del data[name]
+        with open(PRESET_FILE, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        _refresh_presets(); status_lbl.config(text=f"Preset '{name}' deleted")
+
+    tk.Label(ins_bar2, text="Voice preset:", fg='#444').pack(side='left', padx=(0, 4))
+    cb_preset = ttk.Combobox(ins_bar2, textvariable=v_preset, width=22, state='readonly')
+    cb_preset.pack(side='left', padx=2)
+    tk.Button(ins_bar2, text="Insert", command=_insert_preset,
+              width=7).pack(side='left', padx=2)
+    tk.Button(ins_bar2, text="Save current", command=_save_preset,
+              width=12).pack(side='left', padx=2)
+    tk.Button(ins_bar2, text="Delete", command=_delete_preset,
+              width=7).pack(side='left', padx=2)
+    tk.Label(ins_bar2, text="(saves the {} / [] pair — select the two lines, "
+                            "or leave unselected to take the first pair)",
+             fg='grey', font=("Arial", 8)).pack(side='left', padx=(8, 0))
+    _refresh_presets()
+
     # ── Editor area with line numbers ─────────────────────────────────────
     editor_container = tk.Frame(editor_frame)
-    editor_container.grid(row=1, column=0, sticky='nsew', padx=4, pady=2)
+    editor_container.grid(row=3, column=0, sticky='nsew', padx=4, pady=2)
     editor_container.grid_columnconfigure(1, weight=1)
     editor_container.grid_rowconfigure(0, weight=1)
 
@@ -481,7 +673,7 @@ def tab_generator(nb):
     editor.grid(row=0, column=1, sticky='nsew')
 
     scroll_e = ttk.Scrollbar(editor_frame, orient='vertical')
-    scroll_e.grid(row=1, column=1, sticky='ns')
+    scroll_e.grid(row=3, column=1, sticky='ns')
 
     def sync_scroll(*args):
         editor.yview(*args)
@@ -692,7 +884,7 @@ def tab_generator(nb):
     status_var = tk.StringVar(value="Ready  |  Ctrl+S: Save  |  Ctrl+H: Find/Replace  |  Ctrl+G: Go to line  |  Right-click: menu")
     status_lbl = tk.Label(editor_frame, textvariable=status_var,
                           anchor='w', font=('Arial', 8), fg='gray')
-    status_lbl.grid(row=2, column=0, columnspan=2, sticky='ew', padx=4)
+    status_lbl.grid(row=4, column=0, columnspan=2, sticky='ew', padx=4)
 
     def update_cursor_pos(event=None):
         pos  = editor.index('insert')
@@ -776,7 +968,7 @@ def tab_auto(nb):
 
     def add_auto_row():
         v_path = tk.StringVar()
-        v_lang = tk.StringVar(value='FR')
+        v_lang = tk.StringVar(value=DEFAULT_LANG)
         row_f = tk.Frame(voices_frame)
         row_f.pack(fill='x', padx=4, pady=2)
         tk.Label(row_f, text=f"V{len(auto_rows)+1}", width=3).pack(side='left')
@@ -987,7 +1179,7 @@ def tab_analyser(nb):
         if num is None:
             num = len(voice_rows) + 1
         v_path    = tk.StringVar()
-        v_lang    = tk.StringVar(value='FR')
+        v_lang    = tk.StringVar(value=DEFAULT_LANG)
         v_num     = tk.IntVar(value=num)
         v_seed    = tk.IntVar(value=0)
         v_precise  = tk.BooleanVar(value=False)
@@ -1057,12 +1249,16 @@ def tab_analyser(nb):
     add_voice_row(2)
     TARGETS['ana_voice1'] = voice_rows[0][0]   # Curation -> Analyser hand-off
 
+    v_emit_sugg = tk.BooleanVar(value=False)
+
     # Add button + precise option
     ctrl_frame = tk.Frame(f)
     ctrl_frame.grid(row=1, column=0, columnspan=3, sticky='w', padx=6, pady=2)
     tk.Button(ctrl_frame, text="+ Add voice",
         command=lambda: add_voice_row(),
         bg='#444', fg='white', width=14).pack(side='left', padx=4)
+    tk.Checkbutton(ctrl_frame, text="Emit NR/comp/de-ess suggestions",
+                   variable=v_emit_sugg).pack(side='left', padx=6)
     tk.Label(ctrl_frame, text="Prec = precise mode  |  F0: auto/crepe/pyin  |  Analysis: Praat / Librosa",
              fg='gray', font=('Arial',8)).pack(side='left', padx=6)
 
@@ -1082,6 +1278,8 @@ def tab_analyser(nb):
                 cmd += ['--f0-engine', vf0eng]
             if vanalysis == 'Librosa':
                 cmd.append('--no-praat')
+            if v_emit_sugg.get():
+                cmd.append('--emit-suggestions')
             cmd += ['--start-num', str(vnum)]
             if vseed != 0:
                 cmd += ['--seed', str(vseed)]
@@ -1300,7 +1498,7 @@ def tab_extract(nb):
     frm_keep.grid(row=2, column=1, sticky='w', padx=4)
     ttk.Combobox(frm_keep, textvariable=v_keep, width=14, state='readonly',
         values=['female','male','overlap','all','female,male','vocals only']).pack(side='left')
-    tk.Checkbutton(frm_keep, text="Split F+M  (genere _female + _male)",
+    tk.Checkbutton(frm_keep, text="Split F+M  (writes _female + _male)",
                    variable=v_split).pack(side='left', padx=10)
 
     # row 3 : Silence
@@ -1312,14 +1510,14 @@ def tab_extract(nb):
     frm_thr = tk.Frame(f)
     frm_thr.grid(row=4, column=1, sticky='w', padx=4)
     tk.Entry(frm_thr, textvariable=v_thr, width=8).pack(side='left')
-    tk.Label(frm_thr, text="  (femme >= seuil, homme < seuil)", fg='grey').pack(side='left')
+    tk.Label(frm_thr, text="  (female >= threshold, male < threshold)", fg='grey').pack(side='left')
 
     # row 5 : Overlap range
     tk.Label(f, text="Overlap range (Hz)", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
     frm_ov = tk.Frame(f)
     frm_ov.grid(row=5, column=1, sticky='w', padx=4)
     tk.Entry(frm_ov, textvariable=v_ovrange, width=8).pack(side='left')
-    tk.Label(frm_ov, text="  (augmenter si voix H classees overlap)", fg='grey').pack(side='left')
+    tk.Label(frm_ov, text="  (raise if male voices land in overlap)", fg='grey').pack(side='left')
 
     # row 6 : Min silence
     tk.Label(f, text="Min silence (s)", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
@@ -1330,7 +1528,7 @@ def tab_extract(nb):
     frm_mindur = tk.Frame(f)
     frm_mindur.grid(row=7, column=1, sticky='w', padx=4)
     tk.Entry(frm_mindur, textvariable=v_mindur, width=8).pack(side='left')
-    tk.Label(frm_mindur, text="  (0.5-1.0 pour ignorer les bribes)", fg='grey').pack(side='left')
+    tk.Label(frm_mindur, text="  (0.5-1.0 to drop fragments)", fg='grey').pack(side='left')
 
     # row 8 : Dereverberation
     tk.Label(f, text="Dereverberation", anchor='w', width=20).grid(row=8, column=0, sticky='w', padx=6, pady=3)
@@ -1393,14 +1591,14 @@ def tab_extract(nb):
     tk.Label(frm_mp3, text="(only used if output is .mp3)", fg='grey').pack(side='left')
 
     # row 14 : Methode
-    tk.Label(f, text="Methode", anchor='w', width=20).grid(row=14, column=0, sticky='w', padx=6, pady=3)
+    tk.Label(f, text="Method", anchor='w', width=20).grid(row=14, column=0, sticky='w', padx=6, pady=3)
     frm_method = tk.Frame(f)
     frm_method.grid(row=14, column=1, sticky='w', padx=4)
     ttk.Combobox(frm_method, textvariable=v_method, width=12, state='readonly',
         values=['f0', 'ecapa', 'sepformer', 'pyannote']).pack(side='left')
     tk.Label(frm_method, text="(ecapa = by speaker, not pitch)", fg='grey').pack(side='left', padx=(6, 0))
     tk.Label(frm_method,
-             text="  f0=rapide  |  sepformer=separation reelle  |  pyannote=diarisation",
+             text="  f0=fast  |  ecapa=by speaker  |  sepformer=true separation  |  pyannote=diarisation",
              fg='grey').pack(side='left')
 
     # row 15 : console
@@ -1626,10 +1824,10 @@ def tab_validator(nb):
     nb.add(f, text="[Val] Validator")
 
     v_val_voices  = tk.StringVar()
-    v_val_lang    = tk.StringVar(value='FR')
+    v_val_lang    = tk.StringVar(value=DEFAULT_LANG)
     v_val_param   = tk.StringVar(value='seed')
     v_val_values  = tk.StringVar(value='0 7 13 42 100 200')
-    v_val_text    = tk.StringVar(value="Bonjour, ceci est un test de validation de la voix.")
+    v_val_text    = tk.StringVar(value="")
     v_val_output  = tk.StringVar()
     v_val_xtts    = tk.StringVar()   # {} block from voice_analyser
     v_val_audio   = tk.StringVar()   # [] block from voice_analyser
@@ -1656,6 +1854,7 @@ def tab_validator(nb):
     frm_lang = tk.Frame(f)
     frm_lang.grid(row=row, column=1, sticky='w', padx=4)
     ttk.Combobox(frm_lang, textvariable=v_val_lang, values=LANGS, width=8, state='readonly').pack(side='left')
+    _bind_default_text(v_val_lang, v_val_text)
 
     v_fill_mode = tk.StringVar(value='default')
     tk.Radiobutton(frm_lang, text="Default", variable=v_fill_mode, value='default').pack(side='left', padx=(10,2))
@@ -1891,9 +2090,9 @@ def tab_optimize(nb):
     f.grid_columnconfigure(1, weight=1)
 
     v_opt_voices = tk.StringVar()
-    v_opt_lang   = tk.StringVar(value='FR')
+    v_opt_lang   = tk.StringVar(value=DEFAULT_LANG)
     v_opt_xtts   = tk.StringVar()
-    v_opt_text   = tk.StringVar(value="Bonjour, ceci est une phrase de test pour régler la voix avec soin.")
+    v_opt_text   = tk.StringVar(value="")
     v_opt_seeds  = tk.StringVar(value='0 42 100 200')
     v_opt_budget = tk.StringVar(value='60')
     v_opt_wacc   = tk.StringVar(value='0.6')
@@ -1910,6 +2109,7 @@ def tab_optimize(nb):
 
     tk.Label(f, text="Language", anchor='w', width=20).grid(row=1, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_opt_lang, values=LANGS, width=8, state='readonly').grid(row=1, column=1, sticky='w', padx=4)
+    _bind_default_text(v_opt_lang, v_opt_text)
 
     tk.Label(f, text="XTTS params {}", anchor='w', width=20).grid(row=2, column=0, sticky='w', padx=6, pady=3)
     tk.Entry(f, textvariable=v_opt_xtts).grid(row=2, column=1, sticky='ew', padx=4)
@@ -2118,10 +2318,10 @@ def tab_comparator(nb):
     f.grid_columnconfigure(1, weight=1)
 
     v_cmp_ref      = tk.StringVar()
-    v_cmp_lang     = tk.StringVar(value='FR')
+    v_cmp_lang     = tk.StringVar(value=DEFAULT_LANG)
     v_cmp_xtts     = tk.StringVar()
     v_cmp_audio    = tk.StringVar()
-    v_cmp_text     = tk.StringVar(value="Bonjour, voici un court test de comparaison de voix.")
+    v_cmp_text     = tk.StringVar(value="")
     v_cmp_output   = tk.StringVar()
     v_cmp_opt_out  = tk.StringVar()
     TARGETS['cmp_xtts']  = v_cmp_xtts
@@ -2143,6 +2343,7 @@ def tab_comparator(nb):
     row += 1
     tk.Label(f, text="Language", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_cmp_lang, values=LANGS, width=8, state="readonly").grid(row=row, column=1, sticky="w", padx=4)
+    _bind_default_text(v_cmp_lang, v_cmp_text)
 
     row += 1
     tk.Label(f, text="XTTS params {}", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)
@@ -2167,7 +2368,18 @@ def tab_comparator(nb):
     cmp_editor_frame.grid_columnconfigure(0, weight=1)
     cmp_editor = scrolledtext.ScrolledText(cmp_editor_frame, height=5, font=("Courier", 9), wrap="word", undo=True)
     cmp_editor.pack(fill="both", expand=True)
-    cmp_editor.insert("1.0", "Bonjour, voici un court test de comparaison de voix.\n[pause=1s]\nLa voix doit être naturelle et fluide.")
+    def _cmp_prefill(*_):
+        """Pre-fill the comparator editor in the selected language, but only
+        while it still holds an untouched built-in default."""
+        cur = cmp_editor.get("1.0", "end").strip()
+        if cur and cur not in _BUILTIN_TEXTS:
+            return
+        new = _default_text(v_cmp_lang.get()) + "\n[pause=1s]"
+        _BUILTIN_TEXTS.add(new)
+        cmp_editor.delete("1.0", "end")
+        cmp_editor.insert("1.0", new)
+    v_cmp_lang.trace_add('write', _cmp_prefill)
+    _cmp_prefill()
 
     row += 1
     tk.Label(f, text="Clone output", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)

@@ -99,7 +99,9 @@ def main():
     p.add_argument('reference')
     p.add_argument('voice_refs', nargs='*')
     p.add_argument('--xtts-block', required=True)
-    p.add_argument('--text', default="Bonjour, ceci est une phrase de test pour régler la voix avec soin.")
+    p.add_argument('--text', default=None,
+                   help='Sentence used for the search (default: a built-in sentence '
+                        'in the target language — see probe_texts.py)')
     p.add_argument('--text-file', default=None)
     p.add_argument('--seeds', default=None, help='Optional seeds to screen, e.g. "0 42 100"')
     p.add_argument('--method', default='rsm', choices=['rsm', 'coord'],
@@ -124,6 +126,10 @@ def main():
                         'so a seed that is great on one phrase and poor on others loses')
     p.add_argument('--seed-mean', dest='seed_robust', action='store_false',
                    help='Rank seeds on the mean score (legacy behaviour)')
+    p.add_argument('--beam-width', type=int, default=3,
+                   help='Beam width for --probe-beams (default: 3). Beam search '
+                        'multiplies the GPT KV cache by this factor — use 2 on a '
+                        '4 GB card, and expect the stage to be skipped if VRAM runs out.')
     p.add_argument('--probe-beams', action='store_true',
                    help='After the winner is found, probe beam-search decoding '
                         '(num_beams=3, activates length_penalty) and greedy '
@@ -156,15 +162,9 @@ def main():
     # the honest one, and the gap search->holdout measures how much the seed was
     # overfitted to the test phrase (the main methodological hole of a 1-2
     # sentence search).
-    PROBES = [
-        text,
-        "Le soleil se couche doucement derrière les collines lointaines.",
-        "Respire profondément et laisse partir toutes les tensions.",
-    ]
-    HOLDOUT = [
-        "Chaque expiration relâche un peu plus les épaules et la mâchoire.",
-        "Quarante-huit personnes attendaient déjà sur le quai numéro trois.",
-    ]
+    from probe_texts import probe_texts as _probes, holdout_texts as _holdout
+    PROBES = [text] + [t for t in _probes(lang, 3) if t != text]
+    HOLDOUT = _holdout(lang, 2)
     n_probe = max(1, min(3, args.probe_texts))
     probe_texts = PROBES[:n_probe]
     holdout_texts = [] if args.no_holdout else HOLDOUT[:max(1, min(2, args.holdout_texts))]
@@ -388,19 +388,53 @@ def main():
         if args.probe_beams:
             print("\n" + "-" * 64 + "\n  Stage 4 — decode-mode probe (beam search / greedy)\n" + "-" * 64)
             b0 = best['score']
-            pb = dict(P(best['temp']), num_beams=3)
-            r = evaluate(best['seed'], pb, probe_texts)
-            if r:
-                print(f"  beam(3): score {r['score']:.3f} (fr {r['french']:.3f} id {r['identity']:.3f})")
-                if r['score'] > b0 + 1e-6:
-                    best = r
-            pg = dict(P(best['temp']), do_sample=False)
-            rg = evaluate(best['seed'], pg, probe_texts)
-            if rg:
-                print(f"  greedy : score {rg['score']:.3f} (fr {rg['french']:.3f} id {rg['identity']:.3f})")
-                if rg['score'] > best['score'] + 1e-6:
-                    print("  (greedy wins on score — verify by ear, greedy can sound flat)")
-                    best = rg
+
+            def _free():
+                if device == 'cuda':
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+
+            # Deterministic beam search: num_beams>1 with do_sample=True routes
+            # HF to beam_sample, which crashes XTTS with a CUDA device-side
+            # assert (inf/nan probabilities). length_penalty only acts here.
+            # Beam search also multiplies the GPT KV cache by the beam width, so
+            # on a small card this legitimately runs out of memory — that is a
+            # hardware limit, not a failure, and must not abort the whole run.
+            _free()
+            bw = max(2, int(args.beam_width))
+            try:
+                pb = dict(P(best['temp']), num_beams=bw, do_sample=False)
+                r = evaluate(best['seed'], pb, probe_texts)
+                if r:
+                    print(f"  beam({bw}): score {r['score']:.3f} "
+                          f"(fr {r['french']:.3f} id {r['identity']:.3f})")
+                    if r['score'] > b0 + 1e-6:
+                        best = r
+            except Exception as e:
+                msg = str(e).lower()
+                _free()
+                if 'out of memory' in msg:
+                    print(f"  beam({bw}): SKIPPED — not enough VRAM on this GPU.")
+                    print(f"  Beam search multiplies the GPT KV cache by {bw}; try "
+                          f"--beam-width 2, or run this stage on a larger card.")
+                else:
+                    print(f"  beam({bw}): skipped ({type(e).__name__}: {e})")
+
+            _free()
+            try:
+                pg = dict(P(best['temp']), do_sample=False)
+                rg = evaluate(best['seed'], pg, probe_texts)
+                if rg:
+                    print(f"  greedy : score {rg['score']:.3f} "
+                          f"(fr {rg['french']:.3f} id {rg['identity']:.3f})")
+                    if rg['score'] > best['score'] + 1e-6:
+                        print("  (greedy wins on score — verify by ear, greedy can sound flat)")
+                        best = rg
+            except Exception as e:
+                _free()
+                print(f"  greedy : skipped ({type(e).__name__}: {e})")
 
         # Pareto front: french vs identity, so you can pick the tradeoff yourself
         vals = list(cache.values())
@@ -429,6 +463,19 @@ def main():
     if n_tied:
         print(f"  ('=' marks the {n_tied} candidate(s) statistically indistinguishable "
               f"from the best — the ranking between them is noise, pick by ear)")
+    # Actionable diagnostic: when most of the shortlist is tied, the run did not
+    # have the resolution to rank anything. More probe sentences is the only fix
+    # that helps — a bigger budget just adds more indistinguishable candidates.
+    shortlist = min(8, len(ranked))
+    if shortlist >= 4 and n_tied >= shortlist // 2:
+        n_now = len(probe_texts)
+        need = min(5, n_now + 1)
+        cut = (1 - (n_now / need) ** 0.5) * 100
+        print(f"\n  [!] {n_tied} of the top {shortlist} are indistinguishable: this run "
+              f"cannot rank them.")
+        print(f"  [!] Measurement noise scales as 1/sqrt(sentences). Re-run with "
+              f"--probe-texts {need} to cut it by ~{cut:.0f}%,")
+        print(f"  [!] rather than raising --budget, which only adds more ties.")
 
     # Winner block: inherit ALL non-searched fields (trim/fade/gpt_cond_len/...)
     # from the input {} — only the searched axes are overwritten.

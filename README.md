@@ -49,6 +49,20 @@ conda create -n xtts python=3.10
 conda activate xtts
 ```
 
+### Interface language
+
+Test sentences and the language selectors default to your own language rather
+than a hardcoded one: an explicit override wins, otherwise the system locale
+when built-in sentences exist for it, otherwise English.
+
+```bash
+XTTS_STUDIO_LANG=DE python xtts_studio.py    # force German
+```
+
+Built-in sentence sets: en, fr, es, de, it, nl, pt (`probe_texts.py`). For any
+other language the tools warn and fall back to English — pass `--text` with a
+sentence in your language, otherwise the accent score is meaningless.
+
 ### Step 3 — Install dependencies
 
 ```bash
@@ -655,7 +669,11 @@ Method `rsm`, four stages, matched to the structure of each axis:
    unless they move the score beyond the noise.
 4. **Decode-mode probe** (`--probe-beams`, optional) — `num_beams=3` beam search
    and greedy decoding. Beam search is the only mode where `length_penalty` does
-   anything at all; at `num_beams=1` that field is dead.
+   anything at all; at `num_beams=1` that field is dead. Beam search is forced
+   DETERMINISTIC: `num_beams>1` combined with `do_sample=True` routes HF to
+   `beam_sample`, which yields inf/nan probabilities on the XTTS GPT and kills
+   the process with a CUDA device-side assert. `xtts_clone.generate` clamps that
+   combination, so the crash cannot be reached from any caller.
 
 The Pareto front (french vs identity) is printed so the accent/timbre trade-off
 is yours to make, not the weighted sum's.

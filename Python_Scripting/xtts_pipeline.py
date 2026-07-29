@@ -91,6 +91,8 @@ def main():
     p.add_argument('--optimise-audio', default='none', choices=['none','nelder','de'],
                    help='Comparator: derivative-free optimisation of the audio block '
                         'against ECAPA identity (validated on an unseen sentence)')
+    p.add_argument('--beam-width', type=int, default=3,
+                   help='Beam width for --probe-beams (2 on a 4 GB card)')
     p.add_argument('--probe-beams', action='store_true',
                    help='Optimiser: also probe beam-search/greedy decoding on the winner')
     p.add_argument('--whisper-model', default='small')
@@ -149,7 +151,7 @@ def main():
                '--w-accent', str(args.w_accent), '--w-identity', str(args.w_identity),
                '--whisper-model', args.whisper_model]
         if args.probe_beams:
-            cmd += ['--probe-beams']
+            cmd += ['--probe-beams', '--beam-width', str(args.beam_width)]
         if args.device:
             cmd += ['--device', args.device]
         rc, out = run_stream(cmd, f'V{n} 3/4 OPTIMISE')

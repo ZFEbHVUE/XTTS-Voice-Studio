@@ -80,6 +80,15 @@ def generate(model, text, lang, latents, out_path,
     if seed is not None:
         set_seed(seed)
     gpt_cond_latent, speaker_embedding = latents
+    nb = int(num_beams)
+    ds = bool(do_sample)
+    if nb > 1 and ds:
+        # num_beams>1 together with do_sample=True routes HF to `beam_sample`
+        # (sampled beam search), which produces inf/nan probabilities with the
+        # XTTS GPT and triggers an unrecoverable CUDA device-side assert.
+        # Beam search is meaningful DETERMINISTIC anyway — that is the only mode
+        # where length_penalty does anything — so force it.
+        ds = False
     out = model.inference(
         text, lang.lower().split('-')[0],
         gpt_cond_latent, speaker_embedding,
@@ -88,8 +97,8 @@ def generate(model, text, lang, latents, out_path,
         repetition_penalty=float(repetition_penalty),
         top_k=int(top_k),
         top_p=float(top_p),
-        do_sample=bool(do_sample),
-        num_beams=int(num_beams),
+        do_sample=ds,
+        num_beams=nb,
         speed=float(speed),
         enable_text_splitting=bool(enable_text_splitting),
     )

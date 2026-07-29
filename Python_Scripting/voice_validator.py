@@ -31,7 +31,7 @@ import time
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
-DEFAULT_TEXT = "Bonjour, ceci est un test de validation de la voix."
+DEFAULT_TEXT = None   # resolved from the language via probe_texts.py
 SILENCE_MS   = 800   # silence between variations
 LABEL_PAUSE  = 400   # silence after spoken label
 
@@ -131,7 +131,8 @@ def main():
     parser.add_argument('--values', action='append', dest='values_list', nargs='+',
                         help='Values for the corresponding --param (can be repeated)')
     parser.add_argument('--text', default=DEFAULT_TEXT,
-                        help=f'Sentence to generate (default: "{DEFAULT_TEXT}")')
+                        help='Sentence to generate (default: a built-in sentence in '
+                             'the target language — see probe_texts.py)')
     parser.add_argument('--output', default=None,
                         help='Output WAV file (default: validation_<param>.wav)')
     parser.add_argument('--lang', default=None,
@@ -257,6 +258,9 @@ def main():
     for p, vals in param_value_pairs:
         print(f"  {p:<12}: {vals}")
     print(f"  Combinations: {len(all_combos)}")
+    if not args.text:
+        from probe_texts import default_text as _dt
+        args.text = _dt(lang)
     print(f"  Text       : {args.text}")
     print(f"  Output     : {output_file}")
     print(f"{'='*60}\n")

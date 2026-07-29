@@ -119,7 +119,8 @@ def _pyin_worker(args):
     return f0c[:frames_main], vc[:frames_main]
 
 
-def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
+def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True,
+                  emit_suggestions=False, meditation_pace=None):
     """
     Analyse an XTTS reference WAV file.
 
@@ -297,13 +298,28 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
         print(f"\n   [!] Very few voiced frames detected ({len(f0_voiced)}) "
               f"-- file may be too short or mostly unvoiced. "
               f"Falling back to neutral defaults (150 Hz / tenor).")
-        f0_median, f0_std, f0_jitter, voiced_ratio = 150.0, 20.0, 0.15, 0.5
+        f0_median, f0_std, f0_cv, voiced_ratio = 150.0, 20.0, 0.15, 0.5
+        f0_p10, f0_p90 = 135.0, 175.0
     else:
         f0_median    = float(np.median(f0_voiced))
         f0_std       = float(np.std(f0_voiced))
-        f0_jitter    = f0_std / f0_median if f0_median > 0 else 0.15
+        # Percentiles: robust to pyin octave errors, which DO happen (a halved
+        # F0 on a few frames wrecks a standard deviation but barely moves p10/p90).
+        # Drop octave jumps (a halved/doubled F0 on some frames) BEFORE taking
+        # percentiles: without this guard the p10/p90 ratio is far MORE fragile
+        # to octave errors than the old std-based formula, not less.
+        _m = f0_median
+        _clean = f0_voiced[(f0_voiced > _m / 1.5) & (f0_voiced < _m * 1.5)]
+        if len(_clean) < 20:
+            _clean = f0_voiced
+        f0_p10       = float(np.percentile(_clean, 10))
+        f0_p90       = float(np.percentile(_clean, 90))
+        # Coefficient of variation of F0 — a PROSODY measure. This is NOT
+        # jitter: jitter is cycle-to-cycle period perturbation (Praat, in %).
+        # Both used to be printed as 'jitter' in the same run.
+        f0_cv        = f0_std / f0_median if f0_median > 0 else 0.15
         voiced_ratio = float(np.mean(voiced_flag))
-    step(f"F0={f0_median:.0f}Hz  std={f0_std:.0f}Hz  jitter={f0_jitter:.3f}  voiced={voiced_ratio:.0%}", t0)
+    step(f"F0={f0_median:.0f}Hz  std={f0_std:.0f}Hz  F0cv={f0_cv:.3f}  voiced={voiced_ratio:.0%}", t0)
 
     # -- 2b. Parselmouth (Praat) acoustic measurements ----------------------
     # HNR, shimmer, jitter — more accurate than librosa estimates.
@@ -322,9 +338,26 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
             _snd   = parselmouth.Sound(_y60.astype('float64'), sr)
             # HNR
             _hnr_obj   = _snd.to_harmonicity()
-            _hnr_vals  = _hnr_obj.values[_hnr_obj.values > -200]
-            if len(_hnr_vals) > 0:
-                praat_hnr = float(np.mean(_hnr_vals))
+            # HNR must be averaged over VOICED frames only. Praat marks frames
+            # with no detected periodicity as -200 dB, but unvoiced consonants,
+            # breaths and quiet background sit around -5..+3 dB and were being
+            # averaged in: the result then tracked the voiced RATIO more than
+            # voice quality, and crushed every voice into 9-11 dB (normal modal
+            # speech is 15-25 dB). Keep frames where harmonics dominate noise.
+            _all  = _hnr_obj.values[_hnr_obj.values > -200]
+            _vals = _all[_all > 0.0]
+            if len(_vals) > 0:
+                # Median, not mean: unvoiced frames with slightly positive
+                # harmonicity still leak past the 0 dB gate and drag a mean
+                # down by ~2 dB. The median is immune to that tail.
+                praat_hnr = float(np.median(_vals))
+                _frac = len(_vals) / max(1, len(_all))
+                if _frac < 0.2:
+                    print(f"   [!] HNR from only {_frac:.0%} of frames — the source "
+                          f"may be very noisy or mostly unvoiced.")
+            elif len(_all) > 0:
+                praat_hnr = float(np.mean(_all))
+                print("   [!] No frame with positive harmonicity — HNR unreliable.")
             # Shimmer + Jitter (on voiced segment only)
             _pp = parselmouth.praat.call(_snd, 'To PointProcess (periodic, cc)', 75, 600)
             praat_shimmer = parselmouth.praat.call(
@@ -348,28 +381,40 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
         print("   [*] parselmouth not installed — using librosa estimates (pip install praat-parselmouth)")
 
     # -- 2c. Tempo estimation (syllable rate) ---------------------------------
-    # Estimate syllable rate from voiced pulse count / voiced duration
-    # Used to derive speed parameter more accurately
+    # Syllable NUCLEI in the energy envelope — the standard acoustic estimator.
+    # The previous version divided the glottal period count by 3.2, which is
+    # just F0/3.2 (it returned ~42 syl/s on a 148 Hz voice) and was rejected as
+    # an outlier on every run. A syllable at 5/s on a 148 Hz voice contains
+    # about 30 glottal pulses, not 3.2 — the quantity had no relation to tempo.
     praat_tempo = None
-    if _HAS_PARSELMOUTH and use_praat:
-        try:
-            _y60  = y[:int(min(60, duration) * sr)]
-            _snd2 = parselmouth.Sound(_y60.astype('float64'), sr)
-            _pp2  = parselmouth.praat.call(_snd2, 'To PointProcess (periodic, cc)', 75, 600)
-            _n_periods = parselmouth.praat.call(_pp2, 'Get number of periods', 0, 0, 0.0001, 0.02, 1.3)
-            # Use actual voiced duration = total duration × voiced_ratio
-            _voiced_dur = min(60, duration) * max(voiced_ratio, 0.1)
-            if _voiced_dur > 0 and _n_periods > 0:
-                # ~3.2 glottal pulses per syllable average for French speech
-                _tempo = _n_periods / _voiced_dur / 3.2
-                # Sanity check: speech is 2-8 syl/s, reject outliers
+    try:
+        from scipy.signal import find_peaks
+        _hop = max(1, int(0.010 * sr))                 # 10 ms frames
+        _fr = np.array([np.sqrt(np.mean(y[i:i + _hop] ** 2))
+                        for i in range(0, len(y) - _hop, _hop)])
+        _db = 20.0 * np.log10(_fr + 1e-10)
+        # Smooth over ~50 ms: syllable nuclei are slower than phoneme detail.
+        _k = np.hanning(5); _k /= _k.sum()
+        _sm = np.convolve(_db, _k, mode='same')
+        _speech = _sm > (np.median(_sm[_sm > _sm.max() - 40]) - 6.0)
+        if _speech.sum() > 10:
+            # A nucleus needs a real dip on both sides (prominence) and cannot
+            # follow the previous one closer than ~120 ms (max ~8 syl/s).
+            _pk, _ = find_peaks(_sm, prominence=2.5,
+                                distance=max(1, int(0.12 / 0.010)))
+            _pk = [p for p in _pk if _speech[p]]
+            _speech_dur = _speech.sum() * 0.010
+            if _speech_dur > 1.0 and len(_pk) > 3:
+                _tempo = len(_pk) / _speech_dur
                 if 1.5 <= _tempo <= 9.0:
                     praat_tempo = _tempo
-                    print(f"   [*] Syllable rate: {praat_tempo:.2f} syl/s")
+                    print(f"   [*] Syllable rate: {praat_tempo:.2f} syl/s "
+                          f"({len(_pk)} nuclei over {_speech_dur:.1f}s of speech)")
                 else:
-                    print(f"   [*] Syllable rate: {_tempo:.2f} syl/s (out of range, ignored)")
-        except Exception:
-            pass
+                    print(f"   [*] Syllable rate: {_tempo:.2f} syl/s "
+                          f"(out of range, ignored)")
+    except Exception as _e:
+        print(f"   [*] Syllable rate unavailable ({_e})")
 
     # Voice type classification
     if f0_median < 110:
@@ -460,9 +505,10 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
     elif sib_ratio > 0.35: _deess = 0.3
     else:                  _deess = 0.2
     deesser_sugg = round(min(_deess, 0.3), 2)
-    deesser = 0   # emitted neutral — add by ear only if the clone is sibilant
+    deesser = deesser_sugg if emit_suggestions else 0
     if deesser_sugg > 0:
-        print(f"   [*] de-ess suggestion {deesser_sugg} (not emitted; add by ear)")
+        print(f"   [*] de-ess suggestion {deesser_sugg}"
+              f"{' (EMITTED — unvalidated heuristic, test it)' if emit_suggestions else ' (not emitted; add by ear)'}")
 
     # -- 5. Level -> volume boost -------------------------------------------
     rms_global  = float(np.sqrt(np.mean(y ** 2)))
@@ -507,9 +553,15 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
         print(f"   [*] Breathy voice detected (flatness={breathiness:.3f}) "
               f"-> NR boosted to {noise_reduction:.2f}")
     noise_reduction_sugg = round(min(noise_reduction, 0.3), 2)
-    noise_reduction = 0   # emitted neutral — add by ear only if the clone is noisy
+    # Emitted neutral by default: these mappings (HNR->NR, APQ5->comp) are
+    # heuristics that were never validated against a measured outcome, and the
+    # clone is synthetic — there is usually no noise to remove, only voice to
+    # damage. --emit-suggestions puts them in the block so they can be TESTED
+    # (comparator --screen-audio, then a blind listening test).
+    noise_reduction = noise_reduction_sugg if emit_suggestions else 0
     if noise_reduction_sugg > 0:
-        print(f"   [*] NR suggestion {noise_reduction_sugg} (not emitted; add by ear)")
+        print(f"   [*] NR suggestion {noise_reduction_sugg}"
+              f"{' (EMITTED — unvalidated heuristic, test it)' if emit_suggestions else ' (not emitted; add by ear)'}")
 
     # -- 7. Dynamics -> compression -----------------------------------------
     peak            = float(np.max(np.abs(y)))
@@ -534,9 +586,10 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
     if breathiness > 0.20:
         compression = min(0.8, compression + 0.1)
     compression_sugg = round(min(compression, 0.3), 2)
-    compression = 0   # emitted neutral — add by ear only if the clone is too dynamic
+    compression = compression_sugg if emit_suggestions else 0
     if compression_sugg > 0:
-        print(f"   [*] comp suggestion {compression_sugg} (not emitted; add by ear)")
+        print(f"   [*] comp suggestion {compression_sugg}"
+              f"{' (EMITTED — unvalidated heuristic, test it)' if emit_suggestions else ' (not emitted; add by ear)'}")
 
     step(f"Levels   RMS={rms_db:.1f}dBFS  SNR={snr:.0f}dB  crest={crest_factor_db:.0f}dB  sib={sib_ratio:.2f}", t0)
 
@@ -545,11 +598,25 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
     # derived slowdown only makes the clone sluggish. The measured syllable rate
     # is reported as a suggestion — set speed by ear in the [] block if you
     # actually want the clone faster/slower.
+    # Now that the syllable rate is a real measurement, speed can be DERIVED
+    # instead of invented: speed = target_pace / measured_pace. The target is
+    # an editorial choice (a guided meditation is spoken slowly, ~3.5 syl/s);
+    # the derivation from it is measured. Emitted only on request, and clamped
+    # — heavy rubberband stretching audibly smears the voice.
     speed = 1.0
     if praat_tempo is not None:
         hint = ("fast" if praat_tempo > 5.5 else "slow" if praat_tempo < 3.0 else "normal")
-        print(f"   [*] Syllable rate {praat_tempo:.2f}/s ({hint}) "
-              f"-> speed suggestion only (emitted as 1.0)")
+        sp = float(np.clip(meditation_pace / praat_tempo, 0.80, 1.0)) if meditation_pace else 1.0
+        if meditation_pace:
+            speed = round(sp, 2)
+            print(f"   [*] Syllable rate {praat_tempo:.2f}/s ({hint}) -> speed "
+                  f"{speed} for a {meditation_pace:.1f}/s meditation pace (EMITTED; "
+                  f"target is an editorial choice, the ratio is measured)")
+        else:
+            sugg = round(float(np.clip(3.5 / praat_tempo, 0.80, 1.0)), 2)
+            print(f"   [*] Syllable rate {praat_tempo:.2f}/s ({hint}) -> speed {sugg} "
+                  f"would give a 3.5/s meditation pace (not emitted; "
+                  f"--meditation-pace to apply)")
 
     # -- 9. XTTS params ----------------------------------------------------
     # Monotone (small pitch spread) -> lower temp; expressive -> higher temp.
@@ -559,15 +626,26 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
     # they don't measure how melodic/expressive the speaker is; pitch spread
     # does. Works identically in Praat and librosa modes (uses f0_median/std).
     # This is a PRIOR: the optimiser's least-squares temp surface refines it.
-    st_spread = 12.0 * np.log2((f0_median + f0_std) / f0_median) if f0_median > 0 else 2.5
-    temperature = float(np.clip(0.55 + 0.035 * st_spread, 0.55, 0.72))
+    # TRUE prosodic range, p10 to p90, in semitones, computed after removing
+    # octave jumps. The previous formula, 12*log2((median+std)/median), was a
+    # one-sided HALF range: it reported 2.4 semitones where the real range is
+    # ~5.7 — not comparable to any published pitch-range figure. Note the
+    # percentile ratio is only robust BECAUSE of the octave filter above:
+    # measured on raw pyin output it drifts +3.4 semitones at 10% octave errors,
+    # against +0.4 for the old formula.
+    if f0_median > 0 and f0_p10 > 0:
+        st_spread = 12.0 * np.log2(f0_p90 / f0_p10)
+    else:
+        st_spread = 6.0
+    # Rescaled so the prior lands where it used to for a typical voice.
+    temperature = float(np.clip(0.55 + 0.013 * st_spread, 0.55, 0.72))
     temperature = round(temperature, 2)
     # top_k / top_p / rep_pen measured as near-inert on XTTS output (optimiser
     # inertness probe) -> sane fixed defaults instead of pseudo-precise ladders.
     top_k, top_p, repetition_penalty = 50, 0.85, 5.0
-    hint = ("monotone" if st_spread < 1.5 else "normal" if st_spread < 3.0 else
-            "expressive" if st_spread < 5.0 else "very expressive")
-    print(f"   [*] F0 spread {st_spread:.1f} semitones ({hint}) -> temp prior {temperature}")
+    hint = ("monotone" if st_spread < 4.0 else "normal" if st_spread < 8.0 else
+            "expressive" if st_spread < 12.0 else "very expressive")
+    print(f"   [*] F0 range p10-p90 {st_spread:.1f} semitones ({hint}) -> temp prior {temperature}")
 
     # length_penalty: DEAD at num_beams=1 (the default). XTTS passes it to
     # HF generate(), which only uses it in beam-search mode — the runtime warns
@@ -650,7 +728,7 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True):
         snr             = snr,
         crest_factor_db = crest_factor_db,
         voiced_ratio    = voiced_ratio,
-        f0_jitter       = f0_jitter,
+        f0_jitter       = f0_cv,
         sib_ratio       = sib_ratio,
         breathiness     = breathiness,
         duration        = duration,
@@ -687,6 +765,15 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
                   p['reverb'], p['noise_gate'], p['pan'], p['limiter']]
     audio_str = f"{N}, {lang}, " + ', '.join(fmt(v) for v in audio_vals)
 
+    _audio_note = ("""#    speed=1.0, eq_*/vol=0 (fitted by voice_comparator.py). hp/lp are safe
+  #    rumble/hiss guards. NR/comp/de-ess carry the MEASURED SUGGESTIONS
+  #    (--emit-suggestions): unvalidated heuristics — verify them with the
+  #    comparator's --screen-audio and a blind listening test before trusting."""
+        if (p['noise_reduction'] or p['compression'] or p['deesser'])
+        else """#    Neutral by design: speed=1.0, eq_*/vol=0 (fitted by voice_comparator.py),
+  #    NR/comp/de-ess=0. Only hp/lp are set (safe rumble/hiss guards). Measured
+  #    suggestions for these are printed above; --emit-suggestions puts them in.""")
+
     print(f"\n{'='*62}")
     if wav_file:
         print(f"  [*] RESULTS -> voice #{N} [{lang}]  :  {os.path.basename(wav_file)}")
@@ -696,7 +783,7 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
   ACOUSTIC ANALYSIS
      Voice type     : {s['voice_type']}
      F0 median      : {s['f0_median']:.0f} Hz
-     F0 jitter      : {s['f0_jitter']:.3f}  (expressiveness)
+     F0 variation   : {s['f0_jitter']:.3f}  (std/median — prosody, not jitter)
      RMS level      : {s['rms_db']:.1f} dBFS
      Estimated SNR  : {s['snr']:.1f} dB
      Crest factor   : {s['crest_factor_db']:.1f} dB
@@ -718,9 +805,7 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
   {{{xtts_str}}}
 
   # -- Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
-  #    Neutral by design: speed=1.0, eq_*/vol=0 (fitted by voice_comparator.py),
-  #    NR/comp/de-ess=0. Only hp/lp are set (safe rumble/hiss guards). Measured
-  #    suggestions for these are printed above; add them by ear only if needed.
+  {_audio_note}
   [{audio_str}]
 
   ==================================================================""")
@@ -745,6 +830,23 @@ def main():
     precise  = '--precise' in args
     args     = [a for a in args if a not in ('--precise', '--fast')]
     fast     = not precise
+
+    # --emit-suggestions : put the measured NR/comp/de-ess into the [] block
+    # instead of zeros. Unvalidated heuristics — emit them to TEST them.
+    emit_sugg = '--emit-suggestions' in args
+    args      = [a for a in args if a != '--emit-suggestions']
+
+    # --meditation-pace RATE : emit a measured speed so the clone lands on the
+    # given syllable rate (3.5/s is a calm guided-meditation pace).
+    meditation_pace = None
+    if '--meditation-pace' in args:
+        _i = args.index('--meditation-pace')
+        if _i + 1 < len(args):
+            try:
+                meditation_pace = float(args[_i + 1].replace(',', '.'))
+            except ValueError:
+                meditation_pace = 3.5
+            args = [a for j, a in enumerate(args) if j != _i and j != _i + 1]
 
     # --no-praat : disable Praat analysis, use librosa only
     use_praat = '--no-praat' not in args
@@ -824,7 +926,7 @@ def main():
         try:
             if len(valid_wavs) == 1:
                 # Single reference — analyse normally
-                params, stats = analyse_voice(valid_wavs[0], fast=fast, f0_engine=f0_engine, use_praat=use_praat)
+                params, stats = analyse_voice(valid_wavs[0], fast=fast, f0_engine=f0_engine, use_praat=use_praat, emit_suggestions=emit_sugg, meditation_pace=meditation_pace)
                 seed = get_seed(idx - start_num)
                 display_results(params, stats, voice_num=idx,
                                 wav_file=valid_wavs[0], language=lang, seed=seed,
@@ -837,7 +939,7 @@ def main():
                 all_stats  = []
                 for wav_file in valid_wavs:
                     print(f"   [*] Analysing {os.path.basename(wav_file)}...")
-                    p, s = analyse_voice(wav_file, fast=fast, f0_engine=f0_engine, use_praat=use_praat)
+                    p, s = analyse_voice(wav_file, fast=fast, f0_engine=f0_engine, use_praat=use_praat, emit_suggestions=emit_sugg, meditation_pace=meditation_pace)
                     all_params.append(p)
                     all_stats.append(s)
 
