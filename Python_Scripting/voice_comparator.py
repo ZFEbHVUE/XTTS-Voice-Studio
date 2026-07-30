@@ -238,6 +238,11 @@ def main():
     p.add_argument('--optimise-budget', type=int, default=400,
                    help='Max objective evaluations for --optimise-audio (default: 400; '
                         'each one is just post-processing + an embedding)')
+    p.add_argument('--save-preset', action='store_true',
+                   help='Store the resulting {} / [] pair in voice_presets.json, '
+                        'reusable from the [Gen] editor')
+    p.add_argument('--preset-name', default=None, metavar='NAME',
+                   help='Name to store it under (default: from the reference file)')
     p.add_argument('--no-identity-check', action='store_true',
                    help='Skip the extra generation that measures identity on UNSEEN '
                         'text (the figure that matches real usage)')
@@ -695,6 +700,22 @@ def main():
 
     # GUI hook: this exact prefix updates the Audio [] field in xtts_studio.py
     print(f"  Next []    : {opt_audio_str}")
+
+    if getattr(args, 'save_preset', False) or getattr(args, 'preset_name', None):
+        try:
+            import voice_presets as VP
+            _sc = {}
+            for _k, _v in (('identity', locals().get('_fit_id')),
+                           ('identity_unseen', locals().get('_unseen_id'))):
+                if _v is not None:
+                    _sc[_k] = _v
+            nm = VP.save(args.preset_name or VP.name_from_reference(args.reference),
+                         xtts_str, opt_audio_str,
+                         reference=args.reference, source='comparator',
+                         scores=_sc or None)
+            print(f"  Preset '{nm}' saved to {os.path.basename(VP.PRESET_DIR)}/")
+        except Exception as e:
+            print(f"  [!] Preset save failed: {e}")
 
     # ── Render outputs ────────────────────────────────────────────────────────
     out_clone = args.output or os.path.join(tmpdir, 'clone.wav')

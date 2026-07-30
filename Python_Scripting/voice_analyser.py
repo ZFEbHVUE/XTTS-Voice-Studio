@@ -742,7 +742,8 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True,
 # -----------------------------------------------------------------------------
 
 def display_results(params, stats, voice_num=1, wav_file=None, language='FR', seed=0,
-                    fast=True, f0_engine='auto', use_praat=True):
+                    fast=True, f0_engine='auto', use_praat=True, save_preset=False,
+                    preset_name=None):
     p    = params
     s    = stats
     N    = voice_num
@@ -810,6 +811,24 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
 
   ==================================================================""")
 
+    if save_preset:
+        try:
+            import voice_presets as VP
+            # Name per voice: an explicit base is numbered, otherwise each
+            # voice is named after its own reference file.
+            _nm = (f"{preset_name} v{voice_num}" if (preset_name and voice_num > 1)
+                   else preset_name or VP.name_from_reference(wav_file))
+            _ac = (f"{s['voice_type']} | F0 {s['f0_median']:.0f} Hz | "
+                   f"{s['voiced_ratio']:.0%} voiced | {s['rms_db']:.1f} dBFS | "
+                   f"SNR {s['snr']:.0f} dB")
+            nm = VP.save(_nm,
+                         '{' + xtts_str + '}', '[' + audio_str + ']',
+                         reference=wav_file, source='analyser', acoustics=_ac,
+                         note='priors only — audio block not fitted yet')
+            print(f"  [*] Preset '{nm}' saved (priors; run the comparator to fit [])")
+        except Exception as e:
+            print(f"  [!] Preset save failed: {e}")
+
 
 
 
@@ -846,6 +865,22 @@ def main():
                 meditation_pace = float(args[_i + 1].replace(',', '.'))
             except ValueError:
                 meditation_pace = 3.5
+            args = [a for j, a in enumerate(args) if j != _i and j != _i + 1]
+
+    # --save-preset NAME : store the priors. Marked as such — the audio block
+    # is NEUTRAL at this stage, so it is a starting point, not a finished voice.
+    # --save-preset            : save each analysed voice, name from its file
+    # --preset-name NAME       : use NAME as the base instead (implies saving)
+    # With several voices at once each one gets its own entry, so a multi-voice
+    # run never collapses into a single overwritten preset.
+    save_preset = '--save-preset' in args
+    args = [a for a in args if a != '--save-preset']
+    preset_name = None
+    if '--preset-name' in args:
+        _i = args.index('--preset-name')
+        if _i + 1 < len(args):
+            preset_name = args[_i + 1]
+            save_preset = True
             args = [a for j, a in enumerate(args) if j != _i and j != _i + 1]
 
     # --no-praat : disable Praat analysis, use librosa only
@@ -928,7 +963,7 @@ def main():
                 # Single reference — analyse normally
                 params, stats = analyse_voice(valid_wavs[0], fast=fast, f0_engine=f0_engine, use_praat=use_praat, emit_suggestions=emit_sugg, meditation_pace=meditation_pace)
                 seed = get_seed(idx - start_num)
-                display_results(params, stats, voice_num=idx,
+                display_results(params, stats, voice_num=idx, save_preset=save_preset, preset_name=preset_name,
                                 wav_file=valid_wavs[0], language=lang, seed=seed,
                                 fast=fast, f0_engine=f0_engine, use_praat=use_praat)
                 results.append((valid_wavs[0], lang, params, stats, seed))
@@ -962,7 +997,7 @@ def main():
 
                 seed = get_seed(idx - start_num)
                 print(f"\n[*] Averaged parameters for voice #{idx} ({len(valid_wavs)} refs):")
-                display_results(avg_params, avg_stats, voice_num=idx,
+                display_results(avg_params, avg_stats, voice_num=idx, save_preset=save_preset, preset_name=preset_name,
                                 wav_file=valid_wavs[0], language=lang, seed=seed,
                                 fast=fast, f0_engine=f0_engine, use_praat=use_praat)
                 results.append((valid_wavs[0], lang, avg_params, avg_stats, seed))

@@ -581,26 +581,42 @@ def tab_generator(nb):
     ins_bar2 = tk.Frame(editor_frame)
     ins_bar2.grid(row=2, column=0, columnspan=2, sticky='w', padx=4, pady=(0, 2))
 
-    PRESET_FILE = os.path.join(XTTS_ROOT, 'voice_presets.json')
+    # Shared with the tools: the pipeline writes here automatically, so a run
+    # finished in the console shows up in this list without any copy-paste.
+    try:
+        import voice_presets as VP
+    except Exception:
+        VP = None
 
-    def _load_presets():
+    def _status(msg):
+        """Write to the status bar if it exists yet. The preset bar is created
+        before it, so its callbacks must not assume it is there."""
         try:
-            import json
-            with open(PRESET_FILE, 'r', encoding='utf-8') as fh:
-                return json.load(fh)
-        except Exception:
-            return {}
+            status_var.set(msg)
+        except NameError:
+            pass
 
     def _refresh_presets():
-        names = sorted(_load_presets().keys())
+        names = sorted(VP.load().keys()) if VP else []
         cb_preset['values'] = names
         if names and v_preset.get() not in names:
             v_preset.set(names[0])
+        _show_preset_info()
+
+    def _show_preset_info(*_):
+        """Show provenance and scores: several runs of the same voice differ,
+        and two lines of text alone would not say which is which."""
+        if not VP or not v_preset.get():
+            return
+        d = VP.describe(v_preset.get())
+        if d:
+            _status(f"{v_preset.get()} — {d}")
 
     def _save_preset():
-        """Store the {} and [] currently in the editor selection, or the first
-        pair found in the script, under a name."""
-        import json, re as _re
+        """Store the {} and [] currently selected, or the first pair found."""
+        if not VP:
+            _status("voice_presets.py not importable"); return
+        import re as _re
         try:
             txt = editor.get('sel.first', 'sel.last')
         except Exception:
@@ -608,40 +624,35 @@ def tab_generator(nb):
         mx = _re.search(r'\{[^}\n]+\}', txt)
         ma = _re.search(r'\[\s*\d+\s*,\s*[A-Za-z]{2}[^\]\n]*\]', txt)
         if not mx or not ma:
-            status_lbl.config(text="No {} / [] pair found — select the two lines first")
+            _status("No {} / [] pair found — select the two lines first")
             return
         name = simpledialog.askstring("Save voice preset",
                                       "Name for this voice:", parent=f)
         if not name:
             return
-        data = _load_presets()
-        data[name.strip()] = {'xtts': mx.group(0), 'audio': ma.group(0)}
         try:
-            with open(PRESET_FILE, 'w', encoding='utf-8') as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=2)
-            _refresh_presets(); v_preset.set(name.strip())
-            status_lbl.config(text=f"Preset '{name.strip()}' saved")
+            saved = VP.save(name.strip(), mx.group(0), ma.group(0), source='gui')
+            _refresh_presets(); v_preset.set(saved)
+            _status(f"Preset '{saved}' saved")
         except Exception as e:
-            status_lbl.config(text=f"Save failed: {e}")
+            _status(f"Save failed: {e}")
 
     def _insert_preset():
-        d = _load_presets().get(v_preset.get())
+        d = VP.get(v_preset.get()) if VP else None
         if not d:
-            status_lbl.config(text="No preset selected")
+            _status("No preset selected")
             return
         _insert(f"{d['xtts']}\n{d['audio']}")
 
     def _delete_preset():
-        import json
-        data = _load_presets(); name = v_preset.get()
-        if name not in data:
+        if not VP or v_preset.get() not in VP.load():
             return
-        if not messagebox.askyesno("Delete preset", f"Delete '{name}'?", parent=f):
+        if not messagebox.askyesno("Delete preset", f"Delete '{v_preset.get()}'?",
+                                   parent=f):
             return
-        del data[name]
-        with open(PRESET_FILE, 'w', encoding='utf-8') as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
-        _refresh_presets(); status_lbl.config(text=f"Preset '{name}' deleted")
+        n = v_preset.get()
+        VP.delete(n); _refresh_presets()
+        _status(f"Preset '{n}' deleted")
 
     tk.Label(ins_bar2, text="Voice preset:", fg='#444').pack(side='left', padx=(0, 4))
     cb_preset = ttk.Combobox(ins_bar2, textvariable=v_preset, width=22, state='readonly')
@@ -652,10 +663,36 @@ def tab_generator(nb):
               width=12).pack(side='left', padx=2)
     tk.Button(ins_bar2, text="Delete", command=_delete_preset,
               width=7).pack(side='left', padx=2)
-    tk.Label(ins_bar2, text="(saves the {} / [] pair — select the two lines, "
-                            "or leave unselected to take the first pair)",
+    def _browse_preset():
+        """Open any preset file, from Voice_Presets/ or anywhere else — presets
+        are plain files, so one received by mail or kept in another folder
+        inserts just the same."""
+        if not VP:
+            return
+        init = VP.PRESET_DIR if os.path.isdir(VP.PRESET_DIR) else XTTS_ROOT
+        p = filedialog.askopenfilename(
+            title="Open a voice preset",
+            filetypes=[("Voice preset", "*.txt"), ("All", "*.*")],
+            initialdir=init)
+        if not p:
+            return
+        e = VP.read_file(p)
+        if not e:
+            _status(f"No {{}} / [] pair in {os.path.basename(p)}")
+            return
+        _insert(f"{e['xtts']}\n{e['audio']}")
+        bits = [e.get('source', ''), e.get('date', ''), e.get('scores_text', '')]
+        _status(f"{e.get('name', os.path.basename(p))} — "
+                + '  |  '.join(b for b in bits if b))
+
+    tk.Button(ins_bar2, text="Browse...", command=_browse_preset,
+              width=9).pack(side='left', padx=2)
+    tk.Button(ins_bar2, text="Refresh", command=lambda: _refresh_presets(),
+              width=8).pack(side='left', padx=2)
+    tk.Label(ins_bar2, text="(saved in Voice_Presets/ — the pipeline writes "
+                            "there; Refresh after a run)",
              fg='grey', font=("Arial", 8)).pack(side='left', padx=(8, 0))
-    _refresh_presets()
+    cb_preset.bind('<<ComboboxSelected>>', _show_preset_info)
 
     # ── Editor area with line numbers ─────────────────────────────────────
     editor_container = tk.Frame(editor_frame)
@@ -886,6 +923,8 @@ def tab_generator(nb):
                           anchor='w', font=('Arial', 8), fg='gray')
     status_lbl.grid(row=4, column=0, columnspan=2, sticky='ew', padx=4)
 
+    _refresh_presets()          # now that the status bar can receive messages
+
     def update_cursor_pos(event=None):
         pos  = editor.index('insert')
         line, col = pos.split('.')
@@ -969,6 +1008,7 @@ def tab_auto(nb):
     def add_auto_row():
         v_path = tk.StringVar()
         v_lang = tk.StringVar(value=DEFAULT_LANG)
+        v_pname = tk.StringVar()        # empty = do not save this voice
         row_f = tk.Frame(voices_frame)
         row_f.pack(fill='x', padx=4, pady=2)
         tk.Label(row_f, text=f"V{len(auto_rows)+1}", width=3).pack(side='left')
@@ -980,12 +1020,14 @@ def tab_auto(nb):
             if p:
                 v_path.set(p)
         tk.Button(row_f, text="...", command=browse).pack(side='left', padx=1)
+        tk.Label(row_f, text="save as").pack(side='left', padx=(6, 1))
+        tk.Entry(row_f, textvariable=v_pname, width=14).pack(side='left', padx=1)
         ttk.Combobox(row_f, textvariable=v_lang, values=LANGS, width=7,
                      state='readonly').pack(side='left', padx=2)
         def remove():
             row_f.destroy(); auto_rows.remove(entry)
         tk.Button(row_f, text="✕", command=remove).pack(side='left', padx=1)
-        entry = (v_path, v_lang, row_f)
+        entry = (v_path, v_lang, row_f, v_pname)
         auto_rows.append(entry)
 
     add_auto_row()
@@ -1039,21 +1081,34 @@ def tab_auto(nb):
     tk.Label(frm_c, text="(empty = match reference; -20 = production level)",
              fg='grey', font=("Arial", 8)).pack(side='left', padx=(4, 0))
 
+    frm_d = tk.Frame(f)
+    frm_d.grid(row=5, column=0, columnspan=3, sticky='w', padx=6, pady=2)
+    # No global save switch: the per-row 'save as' field already carries the
+    # intent — a named row is stored, an empty one is not. A second control
+    # could only contradict it.
+    v_a_hist = tk.BooleanVar(value=False)
+    tk.Checkbutton(frm_d, text="Keep previous preset as '(2)' instead of overwriting",
+                   variable=v_a_hist).pack(side='left', padx=6)
+    tk.Label(frm_d, text="(fill 'save as' on a voice row to store it; empty rows "
+                         "are processed but not saved)",
+             fg='grey', font=("Arial", 8)).pack(side='left', padx=(8, 0))
+
     tk.Label(f, text="Runs curate → analyse → optimise → tone-fit for each voice and"
                      " prints the final {} / [] blocks to paste. LISTEN to each"
                      " *_pipeline_clone.wav before generating — scores don't hear"
                      " naturalness.",
              fg='gray', font=("Arial", 8), justify='left', wraplength=560,
-             anchor='w').grid(row=5, column=0, columnspan=3, sticky='w', padx=8)
+             anchor='w').grid(row=6, column=0, columnspan=3, sticky='w', padx=8)
 
-    console = add_console(f, 7)
+    console = add_console(f, 8)
 
     def lancer(btn, stop_btn=None):
-        voices = [(v.get().strip(), l.get()) for v, l, _ in auto_rows if v.get().strip()]
+        voices = [(v.get().strip(), l.get(), p.get().strip())
+                  for v, l, _, p in auto_rows if v.get().strip()]
         if not voices:
             log(console, "[ERR] At least one voice required."); return
         cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'xtts_pipeline.py')]
-        for path, lg in voices:
+        for path, lg, _pn in voices:
             cmd += ['--voice', path, lg]
         cmd += ['--seeds', v_a_seeds.get().strip() or '0 42 100 180 200']
         cmd += ['--budget', v_a_budget.get().strip() or '60']
@@ -1073,9 +1128,16 @@ def tab_auto(nb):
             cmd += ['--optimise-audio', v_a_optaud.get()]
         if v_a_target.get().strip():
             cmd += ['--target-dbfs', v_a_target.get().strip()]
+        if not any(pn for _, _, pn in voices):
+            cmd += ['--no-save-preset']
+        else:
+            for _p, _l, pn in voices:
+                cmd += ['--preset-name', pn or '-']
+        if v_a_hist.get():
+            cmd += ['--keep-preset-history']
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Run full pipeline", lancer, 6)
+    make_btn(f, ">  Run full pipeline", lancer, 7)
 
 
 # ── Tab: Curation ─────────────────────────────────────────────────────────────
@@ -1185,6 +1247,7 @@ def tab_analyser(nb):
         v_precise  = tk.BooleanVar(value=False)
         v_f0       = tk.StringVar(value='auto')
         v_analysis = tk.StringVar(value='Praat')
+        v_pname    = tk.StringVar()      # empty = do not save this voice
 
         row_f = tk.Frame(voices_frame)
         row_f.pack(fill='x', padx=4, pady=2)
@@ -1205,6 +1268,11 @@ def tab_analyser(nb):
         tk.Button(row_f, text="Browse", width=8,
             command=browse_multi_refs).pack(side='left', padx=1)
 
+        # Preset name for THIS voice. Empty means: analyse but save nothing —
+        # so a multi-voice run saves exactly the voices you named, no more.
+        tk.Label(row_f, text="save as").pack(side='left', padx=(6, 1))
+        tk.Entry(row_f, textvariable=v_pname, width=14).pack(side='left', padx=1)
+
         ttk.Combobox(row_f, textvariable=v_lang, values=LANGS,
                      width=6, state='readonly').pack(side='left', padx=1)
         tk.Label(row_f, text="Seed:").pack(side='left', padx=(4,0))
@@ -1223,7 +1291,7 @@ def tab_analyser(nb):
                                    width=7, state='readonly')
         cb_analysis.pack(side='left', padx=2)
 
-        entry = (v_path, v_lang, v_num, v_seed, v_precise, row_f, v_f0, v_analysis)
+        entry = (v_path, v_lang, v_num, v_seed, v_precise, row_f, v_f0, v_analysis, v_pname)
 
         def remove(e=entry):
             e[5].destroy()
@@ -1259,19 +1327,24 @@ def tab_analyser(nb):
         bg='#444', fg='white', width=14).pack(side='left', padx=4)
     tk.Checkbutton(ctrl_frame, text="Emit NR/comp/de-ess suggestions",
                    variable=v_emit_sugg).pack(side='left', padx=6)
+    tk.Label(ctrl_frame, text="|  'save as' per voice: fill it to store that "
+                              "voice as a preset, leave empty to skip",
+             fg='grey', font=('Arial', 8)).pack(side='left', padx=(10, 0))
     tk.Label(ctrl_frame, text="Prec = precise mode  |  F0: auto/crepe/pyin  |  Analysis: Praat / Librosa",
              fg='gray', font=('Arial',8)).pack(side='left', padx=6)
 
     console = add_console(f, 2)
 
     def lancer(btn, stop_btn=None):
-        valids = [(vp.get(), vl.get(), vn.get(), vs.get(), vpr.get(), vf0.get(), van.get())
-                  for vp, vl, vn, vs, vpr, _, vf0, van in voice_rows if vp.get().strip()]
+        valids = [(vp.get(), vl.get(), vn.get(), vs.get(), vpr.get(), vf0.get(),
+                   van.get(), vpn.get().strip())
+                  for vp, vl, vn, vs, vpr, _, vf0, van, vpn in voice_rows
+                  if vp.get().strip()]
         if not valids:
             log(console, "[ERR] Add at least one voice."); return
 
         cmds = []
-        for vpath, vlang, vnum, vseed, vprec, vf0eng, vanalysis in valids:
+        for vpath, vlang, vnum, vseed, vprec, vf0eng, vanalysis, vpname in valids:
             cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'voice_analyser.py')]
             if vprec:
                 cmd.append('--precise')
@@ -1280,6 +1353,8 @@ def tab_analyser(nb):
                 cmd.append('--no-praat')
             if v_emit_sugg.get():
                 cmd.append('--emit-suggestions')
+            if vpname:
+                cmd += ['--save-preset', '--preset-name', vpname]
             cmd += ['--start-num', str(vnum)]
             if vseed != 0:
                 cmd += ['--seed', str(vseed)]

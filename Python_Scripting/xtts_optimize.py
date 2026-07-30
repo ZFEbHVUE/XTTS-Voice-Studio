@@ -76,7 +76,10 @@ def format_xtts_block(seed, p):
     return '{' + ', '.join(fmt(v) for v in order) + '}'
 
 
-def read_text(args):
+def read_text(args, lang='en'):
+    """Sentence used for the search. --text wins, then --text-file, then the
+    built-in sentence FOR THAT LANGUAGE. Never returns None: an unresolved
+    default reached XTTS as an empty prompt and crashed inside inference()."""
     if args.text_file and os.path.exists(args.text_file):
         with open(args.text_file, encoding='utf-8') as fh:
             raw = fh.read()
@@ -91,7 +94,10 @@ def read_text(args):
         t = ' '.join(lines).strip()
         if t:
             return t
-    return args.text
+    if args.text:
+        return args.text
+    from probe_texts import default_text as _dt
+    return _dt(lang)
 
 
 def main():
@@ -150,7 +156,7 @@ def main():
     speaker_wav = refs if len(refs) > 1 else refs[0]
 
     xtts = parse_xtts_block(args.xtts_block)
-    text = read_text(args)
+    text = read_text(args, lang)
     block_seed = int(xtts.get('seed', 0))
     seeds = [int(s) for s in re.findall(r'-?\d+', args.seeds)] if args.seeds else [block_seed]
 

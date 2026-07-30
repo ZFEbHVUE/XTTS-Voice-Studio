@@ -85,6 +85,15 @@ def main():
     p.add_argument('--fit-identity', action='store_true',
                    help='Comparator: also search post-processing settings that raise '
                         'ECAPA identity (not just spectral tone)')
+    p.add_argument('--no-save-preset', action='store_true',
+                   help='Do not store the final blocks in Voice_Presets/')
+    p.add_argument('--preset-name', action='append', default=None, metavar='NAME',
+                   help="Preset name for the corresponding --voice, in order. "
+                        "Repeat it once per voice; pass '-' to skip that voice. "
+                        "Default: derived from each reference file.")
+    p.add_argument('--keep-preset-history', action='store_true',
+                   help="Keep the previous preset for this voice as '<name> (2)' "
+                        "instead of overwriting — useful to compare two runs")
     p.add_argument('--screen-audio', action='store_true',
                    help='Comparator: sensitivity screening of each audio parameter '
                         '(which knobs move identity for this voice)')
@@ -136,6 +145,27 @@ def main():
         cmd = [py, S('voice_analyser.py'), '--precise', '--f0-engine', 'pyin',
                '--start-num', str(n), work, lang]
         rc, out = run_stream(cmd, f'V{n} 2/4 ANALYSE')
+        # Same one-line voice description the analyser writes into a preset, so
+        # a pipeline-saved preset identifies the speaker just as well.
+        def _grab(pat, cast=str, default=None):
+            m = re.search(pat, out)
+            try:
+                return cast(m.group(1)) if m else default
+            except Exception:
+                return default
+        _vt = _grab(r'Voice type\s*:\s*(.+)')
+        _f0 = _grab(r'F0 median\s*:\s*([\d.]+)', float)
+        _vr = _grab(r'Voiced ratio\s*:\s*(\d+)%', int)
+        _rm = _grab(r'RMS level\s*:\s*(-?[\d.]+)', float)
+        _sn = _grab(r'Estimated SNR\s*:\s*([\d.]+)', float)
+        _acoustics = None
+        if _vt:
+            _bits = [_vt.strip()]
+            if _f0 is not None: _bits.append(f"F0 {_f0:.0f} Hz")
+            if _vr is not None: _bits.append(f"{_vr}% voiced")
+            if _rm is not None: _bits.append(f"{_rm:.1f} dBFS")
+            if _sn is not None: _bits.append(f"SNR {_sn:.0f} dB")
+            _acoustics = ' | '.join(_bits)
         xb = RE_XTTS.findall(out)
         ab = RE_AUDIO.findall(out)
         if rc != 0 or not xb or not ab:
@@ -155,6 +185,17 @@ def main():
         if args.device:
             cmd += ['--device', args.device]
         rc, out = run_stream(cmd, f'V{n} 3/4 OPTIMISE')
+        # Keep the HONEST figures (hold-out), not the search ones.
+        _sc = {}
+        _m = re.search(r'HELD-OUT score\s+([\d.]+).*?french\s+([\d.]+),\s*identity\s+([\d.]+)',
+                       out, re.S)
+        if _m:
+            _sc = {'held_out': float(_m.group(1)), 'french': float(_m.group(2)),
+                   'identity': float(_m.group(3))}
+        else:
+            _m = re.search(r'Best on the search sentences: score\s+([\d.]+)', out)
+            if _m:
+                _sc = {'search': float(_m.group(1))}
         xb = RE_XTTS.findall(out)
         if rc != 0 or not xb:
             sys.exit(f"[ERR] Optimisation failed for voice {n}")
@@ -186,9 +227,15 @@ def main():
             sys.exit(f"[ERR] Comparator failed for voice {n}")
         audio_fit = m.group(1)
 
+        # Identity on UNSEEN text, if the comparator measured it: that is the
+        # figure matching real usage, so it belongs in the preset.
+        _mu = re.search(r'([\d.]+) on UNSEEN text', out)
+        if _mu:
+            _sc['identity_unseen'] = float(_mu.group(1))
         results.append(dict(n=n, lang=lang, ref=ref, clone=clone_out,
                             xtts=renumber(xtts_win, n),
-                            audio=set_lang(renumber(audio_fit, n), lang)))
+                            audio=set_lang(renumber(audio_fit, n), lang),
+                            scores=_sc, acoustics=_acoustics))
 
     # ── Final recap ───────────────────────────────────────────────────────────
     print(f"\n\n{'='*70}\n  [*] PIPELINE COMPLETE — READY TO PASTE\n{'='*70}")
@@ -197,6 +244,31 @@ def main():
         print(f"  {r['xtts']}")
         print(f"  {r['audio']}")
         print(f"  # Listen before generating: {r['clone']}")
+    # ── Save each voice into the preset library ──────────────────────────────
+    # This is the natural moment: the blocks are complete and the scores are
+    # known. Without it the result lives only in a console you will close.
+    if not args.no_save_preset:
+        try:
+            import voice_presets as VP
+            print(f"\n  Saved to {os.path.basename(VP.PRESET_DIR)}/:")
+            names = args.preset_name or []
+            for i, r in enumerate(results):
+                # One name per voice, in --voice order. '-' skips that voice,
+                # so a multi-voice run stores exactly the ones you named.
+                nm = names[i].strip() if i < len(names) else ''
+                if nm == '-':
+                    continue
+                if not nm:
+                    nm = VP.name_from_reference(r['ref'])
+                saved = VP.save(nm, r['xtts'], r['audio'], reference=r['ref'],
+                                source='pipeline', scores=r.get('scores'),
+                                acoustics=r.get('acoustics'),
+                                overwrite=not args.keep_preset_history)
+                print(f"    '{saved}'  {VP.describe(saved)}")
+            print(f"    (insert them in the [Gen] editor via the Voice preset bar)")
+        except Exception as e:
+            print(f"  [!] Preset save failed: {e}")
+
     print(f"\n  Scores are proxies (accent/identity) — they don't hear naturalness.")
     print(f"  LISTEN to each *_pipeline_clone.wav; if diction/naturalness is off,")
     print(f"  sweep temp ±1 step around the winner in the Validator and trust your ear.")
