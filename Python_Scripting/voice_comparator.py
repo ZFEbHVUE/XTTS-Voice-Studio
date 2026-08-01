@@ -131,6 +131,26 @@ def load_mono(path, target_sr=None):
 
 # ── Post-processing ───────────────────────────────────────────────────────────
 
+
+def _encoder(device):
+    """SpeakerEncoder on `device`, falling back to CPU when VRAM is short.
+    XTTS alone fills a 4 GB card, so asking for a second GPU model there
+    aborted whole stages with an out-of-memory error."""
+    from speaker_identity import SpeakerEncoder
+    try:
+        return SpeakerEncoder(device=device)
+    except Exception as exc:
+        if 'out of memory' not in str(exc).lower():
+            raise
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print("   [!] Not enough VRAM for ECAPA — running it on CPU.")
+        return SpeakerEncoder(device='cpu')
+
+
 def _quiet_post(raw_path, out_path, audio, xtts, lang, gen_path):
     """apply_post with the generator's per-render logging suppressed.
     The screening and the optimiser call it hundreds of times; without this,
@@ -238,6 +258,11 @@ def main():
     p.add_argument('--optimise-budget', type=int, default=400,
                    help='Max objective evaluations for --optimise-audio (default: 400; '
                         'each one is just post-processing + an embedding)')
+    p.add_argument('--eq-weighting', default='a', choices=['a', 'voice', 'blend'],
+                   help="Where EQ errors count. 'a' = equal-loudness (default), "
+                        "'voice' = the reference's own spectrum, 'blend' = both. "
+                        "On a low voice 'a' discounts the fundamental ~4.6x, so "
+                        "'voice' or 'blend' track a bass speaker more closely.")
     p.add_argument('--save-preset', action='store_true',
                    help='Store the resulting {} / [] pair in voice_presets.json, '
                         'reusable from the [Gen] editor')
@@ -361,6 +386,7 @@ def main():
         cy, _ = load_mono(cand, target_sr=ref_sr)
         _, cd = L.compute_ltas(cy, ref_sr)
         fit  = L.fit_eq_ls(f_grid, ref_db, cd, fs=ref_sr,
+                           weighting=args.eq_weighting,
                            cur_hp=opt.get('hp', 0), cur_lp=opt.get('lp', 0))
         if args.target_dbfs is not None:
             dvol = L.level_to_target_db(cy, args.target_dbfs, cur_vol=0)
@@ -369,8 +395,13 @@ def main():
         step = max(abs(fit['eq_low']), abs(fit['eq_mid']), abs(fit['eq_high']), abs(dvol))
         print(f"  pass {it}: residual {fit['residual_before']:.2f}->{fit['residual_after']:.2f} dB"
               f"  | Δeq=({fit['eq_low']:+.1f},{fit['eq_mid']:+.1f},{fit['eq_high']:+.1f}) Δvol={dvol:+d}")
-        if it > 1 and step >= prev_step:
-            print("  no further improvement — stopping")
+        # Stop on the OBJECTIVE, not on the size of the proposed correction:
+        # a correction can stay large while the residual still falls, and it
+        # can shrink while the residual stagnates. The residual is what the fit
+        # minimises, so it is what decides.
+        if it > 1 and fit['residual_after'] >= prev_residual - 0.01:
+            print(f"  residual no longer improving "
+                  f"({prev_residual:.2f} -> {fit['residual_after']:.2f} dB) — stopping")
             break
         opt['eq_low']  = round(opt['eq_low']  + fit['eq_low'], 1)
         opt['eq_mid']  = round(opt['eq_mid']  + fit['eq_mid'], 1)
@@ -382,6 +413,7 @@ def main():
             opt['hp'] = fit['hp']; opt['lp'] = fit['lp']
         opt['vol'] = int(np.clip(opt['vol'] + dvol, -18, 18))
         prev_step = step
+        prev_residual = fit['residual_after']
         if step < args.conv_threshold:
             print(f"  converged (largest change {step:.2f} dB < {args.conv_threshold} dB)")
             break
@@ -442,7 +474,7 @@ def main():
         print(f"\n{'-'*64}\n  Identity-driven post-processing search (ECAPA)\n{'-'*64}")
         try:
             from speaker_identity import SpeakerEncoder
-            enc = SpeakerEncoder(device=args.device)
+            enc = _encoder(args.device)
             ref_emb = enc.embed(args.reference)
 
             def ident_of(block):
@@ -503,6 +535,9 @@ def main():
             print(f"   To find out whether ANY audio parameter can move identity for "
                   f"this voice, re-run with --screen-audio.)")
 
+    _measured_noise = [None]      # filled by the screening, used by the gate
+    _adopted = [False]            # True when the identity search replaced the block
+
     # ── Sensitivity screening (which knobs matter at all?) ────────────────────
     # The Optimetrics reflex: screen BEFORE optimising. One factor at a time
     # across its full musical range, measuring how much ECAPA identity actually
@@ -512,7 +547,7 @@ def main():
         print(f"\n{'-'*64}\n  Sensitivity screening (one factor at a time, ECAPA identity)\n{'-'*64}")
         try:
             from speaker_identity import SpeakerEncoder
-            enc_s = SpeakerEncoder(device=args.device)
+            enc_s = _encoder(args.device)
             ref_s = enc_s.embed(args.reference)
 
             def ident_blk(blk):
@@ -528,6 +563,7 @@ def main():
                 float(enc_s.cosine(ref_s, enc_s.embed(cy_h[:hh], sr=csr_h))) -
                 float(enc_s.cosine(ref_s, enc_s.embed(cy_h[hh:], sr=csr_h)))) / 2.0)
             print(f"  baseline identity {base_s:.4f}   noise floor ±{noise_s:.4f}\n")
+            _measured_noise[0] = noise_s      # reused by the transfer gate below
 
             GRID = [('vol',    [-12, -6, 0, 6, 12]),
                     ('eq_low', [-6, -3, 0, 3, 6]),
@@ -585,7 +621,7 @@ def main():
             import numpy as _np
             from scipy.optimize import differential_evolution, minimize
             from speaker_identity import SpeakerEncoder
-            enc = SpeakerEncoder(device=args.device)
+            enc = _encoder(args.device)
             ref_emb = enc.embed(args.reference)
 
             # Bounds kept musically sane: outside these the result stops being
@@ -674,15 +710,25 @@ def main():
 
             gain_fit = best_id - base_id
             gain_out = h_best - h_base
-            if gain_out > 0.01 and gain_out > 0.4 * gain_fit:
+            # Threshold from the MEASURED noise floor, not a constant: a change
+            # worth adopting must clear the measurement noise by a clear margin,
+            # because adopting it discards the tone-fitted block.
+            nz = _measured_noise[0]
+            need = (2.0 * nz) if nz else 0.02
+            if gain_out > need and gain_out > 0.4 * gain_fit:
                 for k, _, _ in AXES:
                     opt[k] = (round(best_blk[k]) if k in ('vol', 'hp', 'lp')
                               else round(best_blk[k], 2))
-                print(f"\n  ADOPTED: the gain transfers to unseen speech "
-                      f"({gain_out:+.4f}).")
+                _adopted[0] = True
+                print(f"\n  ADOPTED: held-out gain {gain_out:+.4f} clears 2x the "
+                      f"measured noise ({need:.4f}) and transfers.")
+                print(f"  NOTE: this REPLACES the tone-fitted block — the table "
+                      f"below now describes an identity-optimised block.")
             else:
-                print(f"\n  REJECTED: the gain does NOT transfer "
-                      f"(fit {gain_fit:+.4f} vs held-out {gain_out:+.4f}).")
+                print(f"\n  REJECTED: held-out gain {gain_out:+.4f} does not clear "
+                      f"2x the measured noise ({need:.4f})"
+                      + (f", or does not transfer (fit {gain_fit:+.4f})."
+                         if gain_out <= 0.4 * gain_fit else "."))
                 print(f"  That is metric hacking — settings tuned to flatter ECAPA on "
                       f"one clip, not to make the voice more like the person.")
                 print(f"  Keeping the tone-fitted block.")
@@ -733,6 +779,62 @@ def main():
     res_opt  = float(np.sqrt(np.mean((ref_shape - (od - od.mean())) ** 2)))
     print(f"  LTAS residual vs reference: base {res_base:.2f} dB -> optimised {res_opt:.2f} dB")
 
+    # ── Side-by-side diagnostic ──────────────────────────────────────────────
+    # A single residual says how far the clone is, not IN WHAT. This table
+    # shows where the difference actually sits, so a surprising fitted value
+    # can be traced to the measurement that produced it.
+    try:
+        from scipy.signal import welch
+
+        def _hnr(y, sr):
+            """Harmonics-to-noise ratio over voiced frames — the husky/veiled
+            component of a voice. A neural vocoder reconstructs the harmonic
+            structure well and smooths the aperiodic part, so a breathy speaker
+            can lose exactly what makes her recognisable. Returns nan if Praat
+            is unavailable."""
+            try:
+                import parselmouth
+                snd = parselmouth.Sound(np.asarray(y[:sr * 60], dtype='float64'), sr)
+                v = snd.to_harmonicity().values
+                v = v[v > -200]
+                v = v[v > 0.0]
+                return float(np.median(v)) if len(v) else float('nan')
+            except Exception:
+                return float('nan')
+
+        def _probe(y, sr):
+            f, psd = welch(y, sr, nperseg=1024)
+            tot = float(np.sum(psd)) + 1e-12
+            rms = 20 * np.log10(np.sqrt(np.mean(y ** 2)) + 1e-12)
+            pk = float(np.max(np.abs(y)) + 1e-12)
+            band = lambda lo, hi: float(np.sum(psd[(f >= lo) & (f < hi)]) / tot * 100)
+            return {
+                'RMS (dBFS)': rms,
+                'Centroid (Hz)': float(np.sum(f * psd) / tot),
+                'Crest (dB)': 20 * np.log10(pk) - rms,
+                'Low 0-300 Hz (%)': band(0, 300),
+                'Mid 0.3-3 kHz (%)': band(300, 3000),
+                'High 3-8 kHz (%)': band(3000, 8000),
+                'Sibilance (dB)': L.sibilance_db(y, sr),
+                'HNR (dB)': _hnr(y, sr),
+            }
+
+        ry, _ = load_mono(args.reference, target_sr=ref_sr)
+        pr, pc = _probe(ry, ref_sr), _probe(oy, ref_sr)
+        print(f"\n  {'':<20}{'reference':>11}{'clone':>10}{'delta':>10}")
+        for k in pr:
+            if pr[k] != pr[k] or pc[k] != pc[k]:        # nan: Praat missing
+                continue
+            d = pc[k] - pr[k]
+            flag = ''
+            if k == 'HNR (dB)' and d > 3.0:
+                flag = '   <- clone is SMOOTHER: a husky voice loses its grain here'
+            print(f"  {k:<20}{pr[k]:>11.1f}{pc[k]:>10.1f}{d:>+10.1f}{flag}")
+        _which = ("identity-optimised" if _adopted[0] else "tone-fitted")
+        print(f"  (clone measured after the {_which} [] — delta is what remains)")
+    except Exception as _e:
+        print(f"  [!] Comparison table unavailable ({_e})")
+
     # ── Identity on UNSEEN text — the figure that matches real usage ──────────
     # With --auto-text the fit runs on the reference's OWN words, and identity
     # measured there is systematically optimistic: the clone repeats sentences
@@ -743,9 +845,17 @@ def main():
     if not args.no_identity_check:
         try:
             from speaker_identity import SpeakerEncoder
-            _enc = SpeakerEncoder(device=args.device)
+            # ECAPA on CPU here: XTTS already fills a 4 GB card, and this is a
+            # single embedding on a few seconds of audio — about a second of
+            # CPU time, against an OOM that skipped the check entirely.
+            _enc = _encoder('cpu')
             _ref = _enc.embed(args.reference)
             _fit_id = float(_enc.cosine(_ref, _enc.embed(out_opt)))
+            try:
+                import torch as _t
+                _t.cuda.empty_cache()          # the 4 GB card OOMs here otherwise
+            except Exception:
+                pass
             UNSEEN = ("Installe-toi confortablement et laisse le silence "
                       "prendre sa place.")
             _raw2 = os.path.join(tmpdir, 'clone_unseen_raw.wav')

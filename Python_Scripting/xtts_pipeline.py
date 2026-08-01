@@ -92,8 +92,25 @@ def main():
                         "Repeat it once per voice; pass '-' to skip that voice. "
                         "Default: derived from each reference file.")
     p.add_argument('--keep-preset-history', action='store_true',
-                   help="Keep the previous preset for this voice as '<name> (2)' "
-                        "instead of overwriting — useful to compare two runs")
+                   help="Never overwrite: a re-run of the same voice is stored as "
+                        "'<name> (2)', '(3)'... so two runs can be compared. "
+                        "Without it, the previous preset for that name is replaced.")
+    p.add_argument('--precise', action='store_true', default=True,
+                   help='Analyser: pyin precise mode (default). --fast disables it.')
+    p.add_argument('--fast', dest='precise', action='store_false',
+                   help='Analyser: quick F0 estimation instead of the precise pass')
+    p.add_argument('--f0-engine', default='pyin', choices=['auto', 'crepe', 'pyin'],
+                   help='Analyser: F0 estimator (default: pyin)')
+    p.add_argument('--analysis', default='praat', choices=['praat', 'librosa'],
+                   help='Analyser: Praat metrics (HNR/shimmer/jitter/formants) or '
+                        'librosa only')
+    p.add_argument('--emit-suggestions', action='store_true',
+                   help='Analyser: put the measured NR/comp/de-ess into the [] '
+                        'instead of zeros (unvalidated heuristics — test them)')
+    p.add_argument('--eq-weighting', default='a', choices=['a', 'voice', 'blend'],
+                   help="Comparator: where EQ errors count. 'a' = equal-loudness "
+                        "(default), 'voice' = the reference's own spectrum — better "
+                        "on a deep voice, whose fundamental 'a' discounts ~4.6x.")
     p.add_argument('--screen-audio', action='store_true',
                    help='Comparator: sensitivity screening of each audio parameter '
                         '(which knobs move identity for this voice)')
@@ -142,8 +159,15 @@ def main():
                     sys.exit(f"[ERR] Curation failed for voice {n}")
 
         # ── 2. Analysis (priors) ──────────────────────────────────────────────
-        cmd = [py, S('voice_analyser.py'), '--precise', '--f0-engine', 'pyin',
-               '--start-num', str(n), work, lang]
+        cmd = [py, S('voice_analyser.py'), '--f0-engine', args.f0_engine,
+               '--start-num', str(n)]
+        if args.precise:
+            cmd += ['--precise']
+        if args.analysis == 'librosa':
+            cmd += ['--no-praat']
+        if args.emit_suggestions:
+            cmd += ['--emit-suggestions']
+        cmd += [work, lang]
         rc, out = run_stream(cmd, f'V{n} 2/4 ANALYSE')
         # Same one-line voice description the analyser writes into a preset, so
         # a pipeline-saved preset identifies the speaker just as well.
@@ -215,6 +239,8 @@ def main():
             cmd += ['--target-dbfs', str(args.target_dbfs)]
         if args.fit_identity:
             cmd += ['--fit-identity']
+        if args.eq_weighting != 'a':
+            cmd += ['--eq-weighting', args.eq_weighting]
         if args.screen_audio:
             cmd += ['--screen-audio']
         if args.optimise_audio != 'none':

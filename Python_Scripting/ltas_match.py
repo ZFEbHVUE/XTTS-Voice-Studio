@@ -25,8 +25,15 @@ from scipy.signal import welch
 from scipy.optimize import least_squares
 
 # Generator EQ band definitions — must mirror apply_eq() in the generator.
+# eq_low sits at 120 Hz, not 200: a bell centred at 200 Hz delivers only ~19%
+# of its gain at 80 Hz, so on a deep voice it could not reach the fundamental
+# at all — correcting a 3 dB low-end deficit would have needed +16 dB. At
+# 120 Hz it delivers 4.3 dB there. FFmpeg's `bass` shelf would reach lower
+# still, but its width_type=q parameterisation does not match either standard
+# RBJ formula (0.55-0.80 dB model error measured), and an unmodelled filter
+# breaks the least-squares fit. This bell is exact to 0.006 dB.
 EQ_BANDS = [
-    ("eq_low",  200.0,  200.0),   # f0, BW(Hz)
+    ("eq_low",  120.0,  160.0),   # f0, BW(Hz)
     ("eq_mid",  1500.0, 2000.0),
     ("eq_high", 5000.0, 3000.0),
 ]
@@ -150,7 +157,7 @@ def level_match_db(ref_y, clone_y, cur_vol=0, lo=-18, hi=18):
     return int(np.clip(round(cur_vol + (r - c)), lo, hi))
 
 
-def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000,
+def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000, weighting='a',
               g_bounds=(-6.0, 6.0), cur_hp=0, cur_lp=0):
     """Fit [g_low, g_mid, g_high] minimising ‖(clone_shape + EQ) − ref_shape‖²
     over the speech band, using the EXACT generator EQ responses.
@@ -161,14 +168,29 @@ def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000,
     gains, derived hp/lp, and the weighted RMS residual (dB) before/after.
     """
     D = ref_db - clone_db                       # dB the clone must gain at each f
-    # Perceptual weight: IEC A-weighting (closed form), floored so the vocal
-    # low end still counts. Errors are penalised where the ear actually hears
-    # them (~1–5 kHz) instead of uniformly — replaces the old ad-hoc step.
+    # Weighting decides WHERE an error counts, and the right answer depends on
+    # the goal:
+    #   'a'     IEC A-weighting — equal-loudness. Correct for balance, but it
+    #           discounts 80 Hz by ~22 dB, i.e. the fundamental of a bass voice
+    #           weighs 4.6x less than the mid-range.
+    #   'voice' the reference's OWN spectrum — errors count where this speaker
+    #           actually has energy. Better when the goal is to resemble a
+    #           particular person rather than to sound evenly loud.
+    #   'blend' geometric mean of both: keeps the ear's emphasis without
+    #           erasing the speaker's low end.
     f2 = np.maximum(f_grid, 1.0) ** 2
     ra = (12194.0**2 * f2**2) / ((f2 + 20.6**2)
          * np.sqrt((f2 + 107.7**2) * (f2 + 737.9**2)) * (f2 + 12194.0**2))
     a_db = 20.0 * np.log10(np.maximum(ra, 1e-12)) + 2.0
-    w = np.maximum(10.0 ** (a_db / 20.0), 0.25)
+    w_a = np.maximum(10.0 ** (a_db / 20.0), 0.25)
+    if weighting in ('voice', 'blend'):
+        # Energy share of the reference, floored so quiet bands are not ignored
+        # entirely (an EQ band with zero weight is unconstrained and can drift).
+        e = 10.0 ** (np.asarray(ref_db, float) / 20.0)
+        w_v = np.maximum(e / (e.max() + 1e-12), 0.10)
+        w = np.sqrt(w_a * w_v) if weighting == 'blend' else w_v
+    else:
+        w = w_a
     w = w / w.mean()
     sw = np.sqrt(w)
 
@@ -183,6 +205,17 @@ def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000,
 
     sol = least_squares(residual, x0, bounds=(lo, hi), method='trf')
     _c, gl, gm, gh = sol.x
+
+    # The three gains must describe a SHAPE, not a level. The model is EQ + c,
+    # and a constant offset applied to all three bands is indistinguishable
+    # from c, so least squares happily drifts them together until they hit the
+    # bounds — producing blocks like (+11.5, +11.0, +11.5), i.e. +11 dB of
+    # plain gain immediately cancelled by vol, correcting nothing. Re-centre
+    # them and let the volume carry the level.
+    mean_g = (gl + gm + gh) / 3.0
+    if abs(mean_g) > 0.05:
+        gl, gm, gh = gl - mean_g, gm - mean_g, gh - mean_g
+        _c = _c + mean_g
 
     res_before = float(np.sqrt(np.average((D - np.average(D, weights=w)) ** 2, weights=w)))
     res_after  = float(np.sqrt(np.average(residual(sol.x) ** 2)))

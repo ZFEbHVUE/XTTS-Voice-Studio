@@ -1069,10 +1069,26 @@ def tab_auto(nb):
                    variable=v_a_autotx).pack(side='left', padx=6)
     tk.Checkbutton(frm_b, text="Probe beam/greedy decoding",
                    variable=v_a_beams).pack(side='left', padx=6)
+    # Same analyser controls as the [Ana] tab: the pipeline used to hardcode
+    # precise+pyin+Praat, so a voice analysed one way here and another there.
+    v_a_prec = tk.BooleanVar(value=True)
+    v_a_f0   = tk.StringVar(value='pyin')
+    v_a_ana  = tk.StringVar(value='Praat')
+    tk.Checkbutton(frm_b, text="Precise", variable=v_a_prec).pack(side='left', padx=(12, 2))
+    tk.Label(frm_b, text="F0").pack(side='left')
+    ttk.Combobox(frm_b, textvariable=v_a_f0, values=['auto', 'crepe', 'pyin'],
+                 width=6, state='readonly').pack(side='left', padx=2)
+    tk.Label(frm_b, text="Analysis").pack(side='left', padx=(8, 2))
+    ttk.Combobox(frm_b, textvariable=v_a_ana, values=['Praat', 'Librosa'],
+                 width=8, state='readonly').pack(side='left')
 
     frm_c = tk.Frame(f); frm_c.grid(row=4, column=0, columnspan=3, sticky='w', padx=6, pady=2)
     tk.Checkbutton(frm_c, text="Screen audio params (which knobs move identity)",
                    variable=v_a_screen).pack(side='left', padx=6)
+    tk.Label(frm_c, text="EQ weighting").pack(side='left', padx=(10, 2))
+    v_a_eqw = tk.StringVar(value='a')
+    ttk.Combobox(frm_c, textvariable=v_a_eqw, values=['a', 'voice', 'blend'],
+                 width=6, state='readonly').pack(side='left')
     tk.Label(frm_c, text="Optimise audio").pack(side='left', padx=(10, 2))
     ttk.Combobox(frm_c, textvariable=v_a_optaud, values=['none', 'nelder', 'de'],
                  width=7, state='readonly').pack(side='left')
@@ -1087,7 +1103,8 @@ def tab_auto(nb):
     # intent — a named row is stored, an empty one is not. A second control
     # could only contradict it.
     v_a_hist = tk.BooleanVar(value=False)
-    tk.Checkbutton(frm_d, text="Keep previous preset as '(2)' instead of overwriting",
+    tk.Checkbutton(frm_d, text="Never overwrite: save re-runs as 'name (2)', "
+                                "'name (3)'...",
                    variable=v_a_hist).pack(side='left', padx=6)
     tk.Label(frm_d, text="(fill 'save as' on a voice row to store it; empty rows "
                          "are processed but not saved)",
@@ -1122,6 +1139,14 @@ def tab_auto(nb):
             cmd += ['--no-auto-text']
         if v_a_beams.get():
             cmd += ['--probe-beams']
+        if not v_a_prec.get():
+            cmd += ['--fast']
+        if v_a_f0.get() != 'pyin':
+            cmd += ['--f0-engine', v_a_f0.get()]
+        if v_a_ana.get() == 'Librosa':
+            cmd += ['--analysis', 'librosa']
+        if v_a_eqw.get() != 'a':
+            cmd += ['--eq-weighting', v_a_eqw.get()]
         if v_a_screen.get():
             cmd += ['--screen-audio']
         if v_a_optaud.get() != 'none':
@@ -2484,6 +2509,15 @@ def tab_comparator(nb):
     v_cmp_conv = tk.StringVar(value='0.5')
     tk.Entry(frm_iter, textvariable=v_cmp_conv, width=5).pack(side='left')
     tk.Label(frm_iter, text="or [] unchanged", fg='gray', font=('Arial',8)).pack(side='left', padx=6)
+    # Where EQ errors count. 'a' (equal-loudness) discounts 80 Hz by ~22 dB, so
+    # on a deep voice it under-corrects the fundamental; 'voice' weights by the
+    # reference's own spectrum.
+    tk.Label(frm_iter, text="  EQ weighting").pack(side='left', padx=(12, 2))
+    v_cmp_eqw = tk.StringVar(value='a')
+    ttk.Combobox(frm_iter, textvariable=v_cmp_eqw, values=['a', 'voice', 'blend'],
+                 width=6, state='readonly').pack(side='left')
+    tk.Label(frm_iter, text="(a=loudness, voice=this speaker's spectrum)",
+             fg='gray', font=('Arial', 8)).pack(side='left', padx=6)
 
     row += 1
     console = add_console(f, row)
@@ -2522,6 +2556,8 @@ def tab_comparator(nb):
             cmd += ["--output-optimised", out_opt]
             cmd += ["--iterations", str(max_iter)]
             cmd += ["--conv-threshold", str(conv)]
+            if v_cmp_eqw.get() != 'a':
+                cmd += ["--eq-weighting", v_cmp_eqw.get()]
             return cmd
 
         def _on_line(txt):

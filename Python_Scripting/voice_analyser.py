@@ -432,11 +432,21 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True,
 
     print(f"   Voice type: {voice_type}")
 
-    # Refine highpass using formant F1 if available
+    # Refine highpass using formant F1 if available.
+    # HARD LIMIT: the high-pass must stay clear of the FUNDAMENTAL. The formant
+    # refinement can only raise it, and on a low voice it climbed onto F0 —
+    # e.g. F0 80 Hz with F1 677 Hz gave hp 75 Hz, filtering the speaker's own
+    # fundamental and stripping the low end the comparator then cannot restore.
     if praat_f1 is not None:
         hp_formant = max(50, int(praat_f1 * 0.15))  # 15% of F1
-        highpass   = max(highpass, min(hp_formant, highpass + 20))
-        print(f"   [*] F1={praat_f1:.0f}Hz F2={praat_f2:.0f}Hz -> hp refined to {highpass}Hz")
+        proposed   = max(highpass, min(hp_formant, highpass + 20))
+        hp_ceiling = max(40, int(0.7 * f0_median)) if f0_median > 0 else proposed
+        highpass   = min(proposed, hp_ceiling)
+        note = ("" if highpass == proposed else
+                f" (capped from {proposed} Hz: 0.7 x F0={f0_median:.0f} Hz — "
+                f"never filter the fundamental)")
+        print(f"   [*] F1={praat_f1:.0f}Hz F2={praat_f2:.0f}Hz -> hp refined to "
+              f"{highpass}Hz{note}")
 
     # -- 3. Spectral analysis -> EQ -----------------------------------------
     step("Spectral analysis (EQ, sibilance, breathiness)")
