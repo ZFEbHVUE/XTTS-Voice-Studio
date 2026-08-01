@@ -264,7 +264,7 @@ def apply_eq(audio_segment, graves_db=0, mediums_db=0, aigus_db=0):
         audio_segment.export(temp_in.name, format='wav')
 
         filters = []
-        if graves_db  != 0: filters.append(f"equalizer=f=200:t=h:width=200:g={graves_db}")
+        if graves_db  != 0: filters.append(f"equalizer=f=120:t=h:width=160:g={graves_db}")
         if mediums_db != 0: filters.append(f"equalizer=f=1500:t=h:width=2000:g={mediums_db}")
         if aigus_db   != 0: filters.append(f"equalizer=f=5000:t=h:width=3000:g={aigus_db}")
 
@@ -559,8 +559,15 @@ def process_audio(audio_segment, config, xtts_params):
 
 
 def apply_speed_rubberband(audio_segment, speed,
-                               temp_input="/tmp/rb_in.wav",
-                               temp_output="/tmp/rb_out.wav"):
+                           temp_input=None, temp_output=None):
+    """Scratch files come from tempfile, not fixed /tmp names: two runs at once
+    overwrote each other's scratch, and a crash left the files behind."""
+    import tempfile
+    _fi, _pi = tempfile.mkstemp(prefix='rb_in_', suffix='.wav')
+    _fo, _po = tempfile.mkstemp(prefix='rb_out_', suffix='.wav')
+    os.close(_fi); os.close(_fo)
+    temp_input  = temp_input  or _pi
+    temp_output = temp_output or _po
     """Time-stretch audio using rubberband (preserves pitch)."""
     audio_segment.export(temp_input, format="wav")
     time_stretch = 1.0 / speed
