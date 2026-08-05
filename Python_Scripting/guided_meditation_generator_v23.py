@@ -281,6 +281,28 @@ def apply_eq(audio_segment, graves_db=0, mediums_db=0, aigus_db=0):
             if os.path.exists(f): os.unlink(f)
 
 
+def _trailing_silence_ms(seg, floor_db=-45.0, max_ms=1200):
+    """Milliseconds of near-silence at the end of a segment.
+
+    Used to bound trim_end so it can never cut into speech. The threshold is
+    relative to the segment's own peak, so it works on quiet and loud renders
+    alike.
+    """
+    try:
+        step = 10
+        limit = min(int(max_ms), max(0, len(seg) - 10))
+        thresh = seg.max_dBFS + floor_db
+        silent = 0
+        while silent < limit:
+            chunk = seg[len(seg) - silent - step: len(seg) - silent]
+            if len(chunk) == 0 or chunk.dBFS > thresh:
+                break
+            silent += step
+        return int(silent)
+    except Exception:
+        return int(max_ms)
+
+
 def apply_filters(audio_segment, highpass_hz=0, lowpass_hz=0):
     """Apply high-pass and low-pass filters."""
     if highpass_hz > 0: audio_segment = audio_segment.high_pass_filter(highpass_hz)
@@ -478,6 +500,17 @@ def process_audio(audio_segment, config, xtts_params):
     # 1. Trim XTTS artifacts
     trim_start = int(xtts_params['trim_start'])
     trim_end   = int(xtts_params['trim_end'])
+
+    # trim_end used to cut blindly. That was safe while tts_to_file left a
+    # generous silent tail; the low-level path leaves much less, so the same
+    # block started eating the last syllable. Never cut into speech.
+    if trim_end > 0:
+        _tail_ms = _trailing_silence_ms(audio_segment)
+        if _tail_ms < trim_end:
+            print(f"      [*]  trim_end {trim_end}ms reduced to {_tail_ms}ms "
+                  f"(only {_tail_ms}ms of trailing silence — cutting more "
+                  f"would clip the last word)")
+            trim_end = _tail_ms
 
     if trim_start == 0 and trim_end == 0:
         print(f"      [*]  No trim (trim_start=0, trim_end=0)")

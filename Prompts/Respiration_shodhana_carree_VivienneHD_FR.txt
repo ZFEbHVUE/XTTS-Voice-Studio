@@ -3,7 +3,8 @@
 
   # Voice [FR]  tenor / mezzo-soprano  205 Hz
   # -- XTTS params  {N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen}
-  {1, 42, 0, 320, 100, 250, 0.68, 50, 0.85, 5, 1, 45, 4, 0}
+  #{1, 42, 0, 320, 100, 250, 0.68, 50, 0.85, 5, 1, 45, 4, 0}
+  {1, 42, 0, 0, 100, 250, 0.68, 50, 0.85, 5, 1, 45, 4, 0}
 
   # -- Audio params  [N, LANG, speed, vol(dB), eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]
   [1, FR, 0.88, 3, -5, 1, -2, 95, 8000, 0.25, 0.35, 0.7, 0, 0, 0, 1]
