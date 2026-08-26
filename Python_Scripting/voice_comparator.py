@@ -24,6 +24,18 @@ Usage:
       [--max-ref-len 30] [--output clone.wav] [--output-optimised clone_opt.wav]
 """
 
+
+# Windows consoles default to cp1252 and raise UnicodeEncodeError on any
+# non-ASCII character in output — a run that computed correctly then died on a
+# print. Force UTF-8 where the interpreter allows it.
+try:
+    import sys as _sys
+    if hasattr(_sys.stdout, 'reconfigure'):
+        _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 import os
 import sys
 import re
@@ -147,7 +159,7 @@ def _encoder(device):
             torch.cuda.empty_cache()
         except Exception:
             pass
-        print("   [!] Not enough VRAM for ECAPA — running it on CPU.")
+        print("   [!] Not enough VRAM for ECAPA -- running it on CPU.")
         return SpeakerEncoder(device='cpu')
 
 
@@ -308,7 +320,7 @@ def main():
             text = auto
             print(f"[OK] Fitting on: \"{text[:70]}{'...' if len(text) > 70 else ''}\"")
         else:
-            print("[!] Transcription too short — keeping the provided text.")
+            print("[!] Transcription too short -- keeping the provided text.")
             text = clean_text(args.text, lang)
     elif args.text_file and os.path.exists(args.text_file):
         with open(args.text_file, encoding='utf-8') as fh:
@@ -319,12 +331,12 @@ def main():
     seed = int(xtts.get('seed', 0))
 
     print("=" * 64)
-    print("  XTTS Voice Comparator — closed-loop EQ/vol fit (LTAS, least squares)")
+    print("  XTTS Voice Comparator -- closed-loop EQ/vol fit (LTAS, least squares)")
     print("=" * 64)
     print(f"  Reference : {os.path.basename(args.reference)}")
     print(f"  Language  : {lang}")
     print(f"  Text      : {text[:58]}{'...' if len(text) > 58 else ''}")
-    print(f"  Seed      : {seed} (frozen — set it with the Validator)")
+    print(f"  Seed      : {seed} (frozen -- set it with the Validator)")
     print("=" * 64)
 
     gen_path = os.path.join(SCRIPT_DIR, 'guided_meditation_generator_v23.py')
@@ -562,7 +574,7 @@ def main():
             noise_s = max(0.004, abs(
                 float(enc_s.cosine(ref_s, enc_s.embed(cy_h[:hh], sr=csr_h))) -
                 float(enc_s.cosine(ref_s, enc_s.embed(cy_h[hh:], sr=csr_h)))) / 2.0)
-            print(f"  baseline identity {base_s:.4f}   noise floor ±{noise_s:.4f}\n")
+            print(f"  baseline identity {base_s:.4f}   noise floor +/-{noise_s:.4f}\n")
             _measured_noise[0] = noise_s      # reused by the transfer gate below
 
             GRID = [('vol',    [-12, -6, 0, 6, 12]),
@@ -597,7 +609,7 @@ def main():
                   f"{', '.join(live) if live else 'NONE'}")
             if dead:
                 print(f"  Knobs measurably inert here: {', '.join(dead)}")
-            print(f"  (screening only — use --optimise-audio to search the live axes "
+            print(f"  (screening only -- use --optimise-audio to search the live axes "
                   f"jointly, interactions included)")
         except Exception as e:
             print(f"  [!] Screening unavailable ({e})")
@@ -722,14 +734,14 @@ def main():
                 _adopted[0] = True
                 print(f"\n  ADOPTED: held-out gain {gain_out:+.4f} clears 2x the "
                       f"measured noise ({need:.4f}) and transfers.")
-                print(f"  NOTE: this REPLACES the tone-fitted block — the table "
+                print(f"  NOTE: this REPLACES the tone-fitted block -- the table "
                       f"below now describes an identity-optimised block.")
             else:
                 print(f"\n  REJECTED: held-out gain {gain_out:+.4f} does not clear "
                       f"2x the measured noise ({need:.4f})"
                       + (f", or does not transfer (fit {gain_fit:+.4f})."
                          if gain_out <= 0.4 * gain_fit else "."))
-                print(f"  That is metric hacking — settings tuned to flatter ECAPA on "
+                print(f"  That is metric hacking -- settings tuned to flatter ECAPA on "
                       f"one clip, not to make the voice more like the person.")
                 print(f"  Keeping the tone-fitted block.")
             apply_post(raw, cand, opt, xtts, lang, gen_path)
@@ -831,7 +843,7 @@ def main():
                 flag = '   <- clone is SMOOTHER: a husky voice loses its grain here'
             print(f"  {k:<20}{pr[k]:>11.1f}{pc[k]:>10.1f}{d:>+10.1f}{flag}")
         _which = ("identity-optimised" if _adopted[0] else "tone-fitted")
-        print(f"  (clone measured after the {_which} [] — delta is what remains)")
+        print(f"  (clone measured after the {_which} [] -- delta is what remains)")
     except Exception as _e:
         print(f"  [!] Comparison table unavailable ({_e})")
 

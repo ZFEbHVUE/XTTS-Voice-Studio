@@ -273,12 +273,21 @@ def apply_eq(audio_segment, graves_db=0, mediums_db=0, aigus_db=0):
             check=True, capture_output=True
         )
         return AudioSegment.from_wav(temp_out.name)
+    except FileNotFoundError:
+        print("  [!]  ffmpeg not found in PATH -- effect skipped, "
+              "audio kept unprocessed (install ffmpeg or restart the app "
+              "after adding it to PATH)")
+        return audio_segment
     except subprocess.CalledProcessError as e:
         print(f"  [!]  EQ error: {e}")
         return audio_segment
     finally:
         for f in (temp_in.name, temp_out.name):
-            if os.path.exists(f): os.unlink(f)
+            if os.path.exists(f):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass    # Windows keeps the file locked while it is open
 
 
 def _trailing_silence_ms(seg, floor_db=-45.0, max_ms=1200):
@@ -329,13 +338,21 @@ def apply_noise_reduction(audio_segment, force=0.8):
             check=True, capture_output=True
         )
         return AudioSegment.from_wav(temp_out.name)
+    except FileNotFoundError:
+        print("  [!]  ffmpeg not found in PATH -- effect skipped, "
+              "audio kept unprocessed (install ffmpeg or restart the app "
+              "after adding it to PATH)")
+        return audio_segment
     except subprocess.CalledProcessError as e:
         print(f"  [!]  Noise reduction error: {e}")
         return audio_segment
     finally:
         for f in (temp_in.name, temp_out.name):
-            if os.path.exists(f): os.unlink(f)
-
+            if os.path.exists(f):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass    # Windows keeps the file locked while it is open
 
 def apply_compression(audio_segment, ratio=0.5):
     """
@@ -373,12 +390,21 @@ def apply_deesser(audio_segment, force=0.3):
             check=True, capture_output=True
         )
         return AudioSegment.from_wav(temp_out.name)
+    except FileNotFoundError:
+        print("  [!]  ffmpeg not found in PATH -- effect skipped, "
+              "audio kept unprocessed (install ffmpeg or restart the app "
+              "after adding it to PATH)")
+        return audio_segment
     except subprocess.CalledProcessError as e:
         print(f"  [!]  De-esser error: {e}")
         return audio_segment
     finally:
         for f in (temp_in.name, temp_out.name):
-            if os.path.exists(f): os.unlink(f)
+            if os.path.exists(f):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass    # Windows keeps the file locked while it is open
 
 
 
@@ -409,12 +435,21 @@ def apply_reverb(audio_segment, wet=0.3):
             check=True, capture_output=True
         )
         return AudioSegment.from_wav(temp_out.name)
+    except FileNotFoundError:
+        print("  [!]  ffmpeg not found in PATH -- effect skipped, "
+              "audio kept unprocessed (install ffmpeg or restart the app "
+              "after adding it to PATH)")
+        return audio_segment
     except subprocess.CalledProcessError as e:
         print(f"  [!]  Reverb error: {e}")
         return audio_segment
     finally:
         for f in (temp_in.name, temp_out.name):
-            if os.path.exists(f): os.unlink(f)
+            if os.path.exists(f):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass    # Windows keeps the file locked while it is open
 
 
 def apply_noise_gate(audio_segment, threshold_db=-40):
@@ -440,12 +475,21 @@ def apply_noise_gate(audio_segment, threshold_db=-40):
             check=True, capture_output=True
         )
         return AudioSegment.from_wav(temp_out.name)
+    except FileNotFoundError:
+        print("  [!]  ffmpeg not found in PATH -- effect skipped, "
+              "audio kept unprocessed (install ffmpeg or restart the app "
+              "after adding it to PATH)")
+        return audio_segment
     except subprocess.CalledProcessError as e:
         print(f"  [!]  Noise gate error: {e}")
         return audio_segment
     finally:
         for f in (temp_in.name, temp_out.name):
-            if os.path.exists(f): os.unlink(f)
+            if os.path.exists(f):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass    # Windows keeps the file locked while it is open
 
 
 def apply_pan(audio_segment, pan_value=0.0):
@@ -480,12 +524,21 @@ def apply_limiter(audio_segment):
             check=True, capture_output=True
         )
         return AudioSegment.from_wav(temp_out.name)
+    except FileNotFoundError:
+        print("  [!]  ffmpeg not found in PATH -- effect skipped, "
+              "audio kept unprocessed (install ffmpeg or restart the app "
+              "after adding it to PATH)")
+        return audio_segment
     except subprocess.CalledProcessError as e:
         print(f"  [!]  Limiter error: {e}")
         return audio_segment
     finally:
         for f in (temp_in.name, temp_out.name):
-            if os.path.exists(f): os.unlink(f)
+            if os.path.exists(f):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass    # Windows keeps the file locked while it is open
 
 
 def process_audio(audio_segment, config, xtts_params):
@@ -613,6 +666,11 @@ def apply_speed_rubberband(audio_segment, speed,
         for f in (temp_input, temp_output):
             if os.path.exists(f): os.remove(f)
         return result
+    except FileNotFoundError:
+        print("  [!]  ffmpeg not found in PATH -- effect skipped, "
+              "audio kept unprocessed (install ffmpeg or restart the app "
+              "after adding it to PATH)")
+        return audio_segment
     except subprocess.CalledProcessError as e:
         print(f"  [!]  Rubberband error: {e}")
         return audio_segment
@@ -1046,8 +1104,16 @@ def generate_sentence_audio(clean, voice_num, voice_files, tts_instances,
         audio = apply_speed_rubberband(audio, config['speed'])
         audio = audio + config['volume']
         return audio
+    except FileNotFoundError as e:
+        # An external tool is missing (almost always ffmpeg or rubberband).
+        # Returning None here drops the sentence, and dropping every sentence
+        # produced a silent, zero-length render with no visible cause.
+        print(f"  [!]  Missing external tool: {e}")
+        print("  [!]  ffmpeg/rubberband not found on PATH. If you just added it, "
+              "RESTART the app: a running process keeps its old PATH.")
+        return None
     except Exception as e:
-        print(f"  [!]  Error generating sentence audio: {e}")
+        print(f"  [!]  Error generating sentence audio: {type(e).__name__}: {e}")
         return None
 
 

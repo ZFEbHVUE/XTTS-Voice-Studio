@@ -201,6 +201,105 @@ def remove_music_demucs(input_file, demucs_model='htdemucs_ft', device='cpu', sh
 _TEMPO = 1.0   # global time-stretch factor (pitch preserved); set from --tempo
 
 
+
+# Age presets, in semitones of pitch shift.
+#
+# What actually reads as age is the FORMANT position (vocal-tract length), not
+# the fundamental. The obvious approach would be to move the two independently
+# — but the rubberband CLI has no --formantscale: it offers only --formant,
+# which PRESERVES the formants during a pitch shift. Moving them deliberately
+# is not available from the command line.
+#
+# So the presets do the opposite of --formant: they let the pitch shift carry
+# the formants with it, which is exactly what makes a voice sound younger or
+# older. The chipmunk effect people associate with this comes from EXCESSIVE
+# shifts (+8, +12 st); at +2 or +3 the vocal tract simply reads as smaller and
+# the result is plausible. That is why every value below stays under 4 st.
+#
+# Female and male differ: their starting F0 and tract length are not the same,
+# so the same shift does not read the same way.
+AGE_PRESETS = {
+    # Rejuvenating: kept, but they only convince at small amplitudes. A young
+    # voice is not an adult voice transposed — it also has a higher HNR, less
+    # jitter and a different attack, none of which a pitch shift provides.
+    'child':      {'F': +3.5, 'M': +4.5},
+    'teen':       {'F': +2.0, 'M': +2.5},
+    'younger':    {'F': +1.0, 'M': +1.5},
+    # Ageing: this direction works, so it gets the finer steps. Going DOWN
+    # lengthens the tract virtually, which stays physically plausible, and the
+    # shifts needed are small.
+    'older':      {'F': -1.0, 'M': -1.0},
+    'mature':     {'F': -1.75, 'M': -1.75},
+    'much_older': {'F': -2.0, 'M': -2.5},
+    'elderly':    {'F': -3.0, 'M': -3.5},
+}
+
+# Rejuvenating a male voice does not work as well, and the reason is physical.
+# An adult male sits near 110-130 Hz, a teenager near 160-180: covering that
+# needs 5-7 semitones, well past the point where a pitch shift still sounds
+# like a person. A female voice only has to travel 205 -> 230 Hz, so +2 does it
+# and stays clean. On top of that, the male break is a change of LARYNX, not of
+# pitch — no amount of shifting reproduces it. Warn instead of pretending.
+def age_warning(semitones, f0_hint=None):
+    """Return a warning string when the requested shift is not believable."""
+    if semitones >= 3.0 and f0_hint and f0_hint < 155:
+        target = f0_hint * (2 ** (semitones / 12.0))
+        return (f"the source is a low voice ({f0_hint:.0f} Hz) and {semitones:+g} st "
+                f"only reaches {target:.0f} Hz -- halfway to a young voice, so it "
+                f"tends to read as 'shifted' rather than 'younger'. A real change "
+                f"of age across the male break needs RVC, not a pitch shift.")
+    if abs(semitones) > 4.0:
+        return (f"{semitones:+g} st is past the range where the vocal tract stays "
+                f"plausible; expect an audibly processed result.")
+    return None
+
+
+def shift_age(y, sr, semitones=0.0, preserve_formants=False):
+    """Re-age a voice by shifting pitch, formants following along.
+
+    preserve_formants=True adds --formant, which keeps the original timbre —
+    useful to change the pitch WITHOUT changing the apparent speaker size, but
+    it defeats the age effect. Left False by default for that reason.
+    """
+    if abs(semitones) < 1e-3:
+        return y
+    import shutil, subprocess, tempfile as _tf
+    y = np.asarray(y, dtype=np.float32)
+    rb = shutil.which('rubberband')
+    if not rb:
+        print("   [!] 'rubberband' NOT FOUND -> age shift SKIPPED (audio unchanged).")
+        print("   [!] Install it: apt install rubberband-cli / brew install rubberband")
+        return y
+    try:
+        vp = subprocess.run([rb, '--version'], capture_output=True, text=True)
+        ver = (vp.stderr or '') + (vp.stdout or '')
+        m = re.search(r'(\d+)\.', ver)
+        major = int(m.group(1)) if m else 2
+        fi = _tf.NamedTemporaryFile(suffix='.wav', delete=False).name
+        fo = _tf.NamedTemporaryFile(suffix='.wav', delete=False).name
+        sf.write(fi, y, sr)
+        cmd = [rb, '--pitch', f'{semitones:g}']
+        if preserve_formants:
+            cmd.append('--formant')
+        if major >= 3:
+            cmd.append('--fine')            # R3 engine: much cleaner on speech
+        cmd += [fi, fo]
+        subprocess.run(cmd, check=True, capture_output=True)
+        out, _ = sf.read(fo, dtype='float32')
+        for f in (fi, fo):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+        print(f"   [*] Age shift: pitch {semitones:+g} st"
+              f"{' (formants preserved)' if preserve_formants else ' (formants follow)'}"
+              f" via rubberband {'R3' if major >= 3 else 'R2'}")
+        return out
+    except Exception as e:
+        print(f"   [!] Age shift failed ({e}) -> audio unchanged")
+        return y
+
+
 def _time_stretch(y, sr, rate):
     """Time-stretch preserving pitch/timbre. rate>1 faster, rate<1 slower.
     Engine order: rubberband CLI (R3 '--fine' when available — best for voice),
@@ -241,6 +340,83 @@ def _time_stretch(y, sr, rate):
              for c in range(y.shape[1])]
     n = min(len(c) for c in chans)
     return np.stack([c[:n] for c in chans], axis=1)
+
+
+
+def shorten_silences(y, sr, target_ms=500, min_gap_ms=600, floor_db=-42.0,
+                     fade_ms=20):
+    """Shorten the silent gaps WITHOUT cutting anything out of the speech.
+
+    The segment pipeline solves a different problem: it splits the file, judges
+    each piece and drops the ones that fail. On a source with long pauses that
+    is the wrong tool — every cut is a chance to lose a syllable, which is why
+    tightening the settings never worked: the loss came from the discarding, not
+    from the thresholds.
+
+    Here nothing is ever discarded. Every sample of speech is kept in order, and
+    only the gaps between words are compressed to `target_ms`. A short crossfade
+    at each junction avoids the click a hard splice would make.
+
+    The threshold is relative to the material: it is placed `floor_db` below the
+    signal's own loud level, so it adapts to a quiet recording instead of
+    assuming a fixed dBFS.
+    """
+    import numpy as _np
+    if y is None or len(y) == 0:
+        return y
+    hop = max(1, int(0.010 * sr))                      # 10 ms resolution
+    frames = _np.array([_np.sqrt(_np.mean(y[i:i + hop] ** 2))
+                        for i in range(0, len(y) - hop, hop)])
+    if len(frames) < 3:
+        return y
+    db = 20.0 * _np.log10(frames + 1e-10)
+    loud = _np.percentile(db, 90)                       # the speech level
+    thresh = loud + floor_db
+    speech = db > thresh
+
+    target = max(0, int(target_ms * sr / 1000))
+    min_gap = max(1, int(min_gap_ms / 10))              # in frames
+    fade = max(1, int(fade_ms * sr / 1000))
+
+    out, i, n_short, saved = [], 0, 0, 0
+    while i < len(speech):
+        if speech[i]:
+            j = i
+            while j < len(speech) and speech[j]:
+                j += 1
+            out.append(y[i * hop: min(len(y), j * hop)])
+            i = j
+        else:
+            j = i
+            while j < len(speech) and not speech[j]:
+                j += 1
+            gap_frames = j - i
+            gap = y[i * hop: min(len(y), j * hop)]
+            if gap_frames >= min_gap and len(gap) > target:
+                # Keep the quietest `target` samples of the gap: the room tone
+                # stays, the dead air goes.
+                half = target // 2
+                out.append(_np.concatenate([gap[:half], gap[-(target - half):]])
+                           if target else gap[:0])
+                n_short += 1
+                saved += len(gap) - target
+            else:
+                out.append(gap)                          # short pause: untouched
+            i = j
+
+    if not out:
+        return y
+    merged = _np.concatenate(out)
+    # Smooth the junctions so shortened gaps do not click.
+    if fade > 1 and len(merged) > 2 * fade:
+        ramp = _np.linspace(0.0, 1.0, fade, dtype=merged.dtype)
+        merged[:fade] *= ramp
+        merged[-fade:] *= ramp[::-1]
+    print(f"   [*] Silences shortened: {n_short} gap(s) >= {min_gap_ms}ms "
+          f"reduced to {target_ms}ms  ({saved / sr:.1f}s removed, "
+          f"{len(y) / sr:.1f}s -> {len(merged) / sr:.1f}s)")
+    print(f"   [*] No speech was cut: every voiced sample is kept in order.")
+    return merged
 
 
 def save_audio(y, sr, output_file, mp3_bitrate=192, mp3_mode='cbr'):
@@ -1345,6 +1521,29 @@ if __name__ == "__main__":
     p.add_argument("--demucs-shifts", type=int, default=2,
                    help="demucs test-time augmentation passes (1=fast, 2=default, "
                         "5=best quality; separation time scales with it)")
+    p.add_argument("--age", default=None,
+                   choices=list(AGE_PRESETS.keys()),
+                   help="Re-age the voice: child | teen | younger | older | "
+                        "much_older. Moves the fundamental AND the formants "
+                        "(vocal-tract length), which is what actually reads as "
+                        "age — a pitch shift alone just sounds speeded up.")
+    p.add_argument("--age-sex", default='F', choices=['F', 'M'],
+                   help="Which preset table to use (default F). The same shift "
+                        "does not read the same way on a female and a male voice.")
+    p.add_argument("--pitch-shift", type=float, default=None, metavar='ST',
+                   help="Manual fundamental shift in semitones, overrides --age")
+    p.add_argument("--preserve-formants", action='store_true',
+                   help="Keep the original timbre while shifting pitch. This "
+                        "CANCELS the age effect (the formants carry it) — use it "
+                        "only to retune a voice without changing who it sounds like.")
+    p.add_argument("--shorten-silences", type=float, default=None, metavar='MS',
+                   help="Shorten silent gaps to MS milliseconds instead of "
+                        "splitting the file into segments. Nothing is discarded, "
+                        "so no speech can be cut — use this on a source with long "
+                        "pauses (e.g. --shorten-silences 500).")
+    p.add_argument("--shorten-min-gap", type=float, default=600.0, metavar='MS',
+                   help="Only gaps at least this long are shortened (default 600 ms), "
+                        "so natural breaths are left alone.")
     p.add_argument("--tempo", type=float, default=1.0,
                    help="Time-stretch factor, pitch preserved (e.g. 0.85 slower, "
                         "1.25 faster; 1.0 = unchanged)")
@@ -1372,6 +1571,58 @@ if __name__ == "__main__":
     # Mode analyse
     if args.analyze:
         analyze(args.input, args.threshold, args.overlap_range, args.min_silence, args.device)
+
+    # Shorten silences: keep the whole take, compress only the gaps. Runs
+    # instead of the segment pipeline, because the two answer different needs —
+    # segmenting sorts speakers, shortening cleans up a talky source.
+    elif args.shorten_silences is not None:
+        import soundfile as _sf
+        _y, _sr = librosa.load(args.input, sr=None, mono=True)
+        print(f"[*]  {args.input}")
+        print(f"   [*] Source: {len(_y) / _sr:.1f}s")
+        _out = shorten_silences(_y, _sr,
+                                target_ms=args.shorten_silences,
+                                min_gap_ms=args.shorten_min_gap)
+        _dest = args.output
+        if _dest and not os.path.splitext(_dest)[1]:
+            _dest += '.wav'
+            print(f"   [!] No extension given -> saving as {os.path.basename(_dest)}")
+        save_audio(_out, _sr, _dest, args.mp3_bitrate, args.mp3_mode)
+        print("[OK] Done.")
+
+    # Age shift: a straight transform of the whole take, no segmenting.
+    elif args.age or args.pitch_shift is not None:
+        _y, _sr = librosa.load(args.input, sr=None, mono=True)
+        print(f"[*]  {args.input}")
+        if args.age:
+            _st = AGE_PRESETS[args.age][args.age_sex]
+            print(f"   [*] Preset '{args.age}' ({args.age_sex}): pitch {_st:+g} st")
+        else:
+            _st = 0.0
+        if args.pitch_shift is not None:
+            _st = args.pitch_shift
+        _f0h = None
+        try:
+            _f0, _vf, _ = librosa.pyin(_y[:int(30 * _sr)], fmin=60, fmax=400, sr=_sr)
+            _fv = _f0[_vf & ~np.isnan(_f0)]
+            if len(_fv):
+                _f0h = float(np.median(_fv))
+                print(f"   [*] Source F0: {_f0h:.0f} Hz")
+        except Exception:
+            pass
+        _w = age_warning(_st, _f0h)
+        if _w:
+            print(f"   [!] {_w}")
+        _out = shift_age(_y, _sr, semitones=_st,
+                         preserve_formants=args.preserve_formants)
+        _dest = args.output
+        if _dest and not os.path.splitext(_dest)[1]:
+            _dest += '.wav'
+            print(f"   [!] No extension given -> saving as {os.path.basename(_dest)}")
+        save_audio(_out, _sr, _dest, args.mp3_bitrate, args.mp3_mode)
+        print("   [*] LISTEN before cloning: past about 3 semitones the vocal "
+              "tract stops sounding plausible.")
+        print("[OK] Done.")
 
     # Méthode SepFormer (séparation neuronale réelle)
     elif args.method == 'sepformer':

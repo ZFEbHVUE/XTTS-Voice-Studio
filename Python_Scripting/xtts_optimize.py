@@ -24,6 +24,18 @@ Usage:
       [--w-accent 0.6 --w-identity 0.4] [--max-ref-len 30] [--device cuda]
 """
 
+
+# Windows consoles default to cp1252 and raise UnicodeEncodeError on any
+# non-ASCII character in output — a run that computed correctly then died on a
+# print. Force UTF-8 where the interpreter allows it.
+try:
+    import sys as _sys
+    if hasattr(_sys.stdout, 'reconfigure'):
+        _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 import os
 import re
 import argparse
@@ -176,10 +188,10 @@ def main():
     holdout_texts = [] if args.no_holdout else HOLDOUT[:max(1, min(2, args.holdout_texts))]
 
     print("=" * 64)
-    print(f"  XTTS Sampling Optimiser — method: {args.method}  (accent + identity)")
+    print(f"  XTTS Sampling Optimiser -- method: {args.method}  (accent + identity)")
     print("=" * 64)
     print(f"  Reference : {os.path.basename(args.reference)}   lang {lang}")
-    print(f"  Objective : {args.w_accent:.2f}·french + {args.w_identity:.2f}·identity")
+    print(f"  Objective : {args.w_accent:.2f}.french + {args.w_identity:.2f}.identity")
     print(f"  Budget    : {args.budget} gens   seeds {seeds}   probe-texts {max(1, min(3, args.probe_texts))}")
     print("=" * 64)
 
@@ -378,7 +390,7 @@ def main():
         if rbest is None or tie(rbest, best):
             noise = max(0.01, np.hypot(best.get('sem', 0.0),
                                        rbest.get('sem', 0.0) if rbest else 0.0))
-            print(f"  rep_pen/top_p inert here (max Δ {spread:.3f} <= noise {noise:.3f}) "
+            print(f"  rep_pen/top_p inert here (max delta  {spread:.3f} <= noise {noise:.3f}) "
                   f"-> frozen at rep_pen={rep0}, top_p={topp0}")
         else:
             print(f"  sensitivity {spread:.3f} (above noise); best probe "
@@ -422,7 +434,7 @@ def main():
                 msg = str(e).lower()
                 _free()
                 if 'out of memory' in msg:
-                    print(f"  beam({bw}): SKIPPED — not enough VRAM on this GPU.")
+                    print(f"  beam({bw}): SKIPPED -- not enough VRAM on this GPU.")
                     print(f"  Beam search multiplies the GPT KV cache by {bw}; try "
                           f"--beam-width 2, or run this stage on a larger card.")
                 else:
@@ -436,7 +448,7 @@ def main():
                     print(f"  greedy : score {rg['score']:.3f} "
                           f"(fr {rg['french']:.3f} id {rg['identity']:.3f})")
                     if rg['score'] > best['score'] + 1e-6:
-                        print("  (greedy wins on score — verify by ear, greedy can sound flat)")
+                        print("  (greedy wins on score -- verify by ear, greedy can sound flat)")
                         best = rg
             except Exception as e:
                 _free()

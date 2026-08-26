@@ -23,6 +23,18 @@ Examples:
     python voice_validator.py Elo.wav Elo2.wav Elo3.wav FR --param seed --values 0 7 42
 """
 
+
+# Windows consoles default to cp1252 and raise UnicodeEncodeError on any
+# non-ASCII character in output — a run that computed correctly then died on a
+# print. Force UTF-8 where the interpreter allows it.
+try:
+    import sys as _sys
+    if hasattr(_sys.stdout, 'reconfigure'):
+        _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 import argparse
 import os
 import sys
@@ -392,7 +404,7 @@ def main():
             do_score = False
 
     if all_audio:
-        print(f"[*] All audio params — generating base audio once\n")
+        print(f"[*] All audio params -- generating base audio once\n")
         base_wav = os.path.join(tmpdir, 'base.wav')
         gen_variant(base_params, base_wav)
         base_audio_raw = AudioSegment.from_wav(base_wav)
@@ -563,7 +575,7 @@ def main():
     print(f"\n[*] Saving {output_file}...")
     final_audio.export(output_file, format='wav')
     duration = len(final_audio) / 1000
-    print(f"[OK] Done — {duration:.1f}s total ({len(all_combos)} combinations)")
+    print(f"[OK] Done -- {duration:.1f}s total ({len(all_combos)} combinations)")
     print(f"[*] Output: {os.path.abspath(output_file)}")
 
     # Cleanup

@@ -24,6 +24,18 @@ Usage:
       [--no-curate] [--no-auto-text] [--start-num 1] [--device cuda]
 """
 
+
+# Windows consoles default to cp1252 and raise UnicodeEncodeError on any
+# non-ASCII character in output — a run that computed correctly then died on a
+# print. Force UTF-8 where the interpreter allows it.
+try:
+    import sys as _sys
+    if hasattr(_sys.stdout, 'reconfigure'):
+        _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 import os
 import re
 import sys
@@ -295,9 +307,9 @@ def main():
         except Exception as e:
             print(f"  [!] Preset save failed: {e}")
 
-    print(f"\n  Scores are proxies (accent/identity) — they don't hear naturalness.")
+    print(f"\n  Scores are proxies (accent/identity) -- they don't hear naturalness.")
     print(f"  LISTEN to each *_pipeline_clone.wav; if diction/naturalness is off,")
-    print(f"  sweep temp ±1 step around the winner in the Validator and trust your ear.")
+    print(f"  sweep temp +/-1 step around the winner in the Validator and trust your ear.")
     print("[OK] Done.")
 
 

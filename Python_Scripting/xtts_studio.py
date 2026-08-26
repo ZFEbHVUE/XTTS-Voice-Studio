@@ -105,6 +105,7 @@ def play_toggle(path, btn=None):
     try:
         proc = subprocess.Popen(
             ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', p],
+            **_no_window(),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
         try:
@@ -150,6 +151,23 @@ def add_row(parent, label, var, row, filetypes=None, save=False, multi=False, in
         tk.Button(parent, text="Browse", width=9,
             command=lambda: browse_file(var, filetypes, save, initialdir)).grid(
             row=row, column=col, padx=4, pady=3)
+
+
+
+# On Windows every subprocess.Popen opens its own console window. During an
+# optimisation run that spawns hundreds of renders, they flash on screen
+# constantly. This flag hides them; it is ignored on Linux and macOS.
+def _no_window():
+    import subprocess as _sp
+    if os.name == 'nt':
+        try:
+            si = _sp.STARTUPINFO()
+            si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+            return {'startupinfo': si,
+                    'creationflags': getattr(_sp, 'CREATE_NO_WINDOW', 0)}
+        except Exception:
+            pass
+    return {}
 
 
 def add_console(parent, start_row):
@@ -254,7 +272,7 @@ def run_cmd(cmd, console, btn, stop_btn=None, line_callback=None):
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, env=env,
-                start_new_session=False)  # keep in same session for killpg
+                start_new_session=False, **_no_window())  # keep in same session for killpg
             proc_holder[0] = proc
             for line in proc.stdout:
                 txt = line.rstrip()
@@ -610,7 +628,7 @@ def tab_generator(nb):
             return
         d = VP.describe(v_preset.get())
         if d:
-            _status(f"{v_preset.get()} — {d}")
+            _status(f"{v_preset.get()} -- {d}")
 
     def _save_preset():
         """Store the {} and [] currently selected, or the first pair found."""
@@ -624,7 +642,7 @@ def tab_generator(nb):
         mx = _re.search(r'\{[^}\n]+\}', txt)
         ma = _re.search(r'\[\s*\d+\s*,\s*[A-Za-z]{2}[^\]\n]*\]', txt)
         if not mx or not ma:
-            _status("No {} / [] pair found — select the two lines first")
+            _status("No {} / [] pair found -- select the two lines first")
             return
         name = simpledialog.askstring("Save voice preset",
                                       "Name for this voice:", parent=f)
@@ -705,7 +723,7 @@ def tab_generator(nb):
                         cursor='arrow', takefocus=False)
     line_nums.grid(row=0, column=0, sticky='ns')
 
-    editor = tk.Text(editor_container, height=12, font=('Courier', 9),
+    editor = tk.Text(editor_container, height=20, font=('Courier', 9),
                      wrap='word', undo=True)
     editor.grid(row=0, column=1, sticky='nsew')
 
@@ -955,8 +973,13 @@ def tab_generator(nb):
     # Console output
     console_frame = ttk.LabelFrame(f, text="Console")
     console_frame.grid(row=8, column=0, columnspan=3, sticky='ew', padx=6, pady=4)
+    # Row 7 (the editor) is the only one that grows when the window is resized:
+    # the two toolbars above it are fixed height, and log reading needs less
+    # room than writing a meditation script.
+    f.grid_rowconfigure(7, weight=1)
+    f.grid_rowconfigure(8, weight=0)
     console_frame.grid_columnconfigure(0, weight=1)
-    console = scrolledtext.ScrolledText(console_frame, height=10, bg='#1e1e1e',
+    console = scrolledtext.ScrolledText(console_frame, height=6, bg='#1e1e1e',
                                          fg='#d4d4d4', font=('Courier', 9), state='normal')
     console.grid(row=0, column=0, sticky='ew', padx=4, pady=4)
     _make_readonly(console)
@@ -1411,7 +1434,7 @@ def tab_analyser(nb):
                     log(console, "\n> " + " ".join(str(c) for c in cmd))
                     proc = subprocess.Popen(
                         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1)
+                        text=True, bufsize=1, **_no_window())
                     proc_holder[0] = proc
                     voice_lines = []
                     for line in proc.stdout:
@@ -1619,9 +1642,22 @@ def tab_extract(nb):
     tk.Entry(frm_ov, textvariable=v_ovrange, width=8).pack(side='left')
     tk.Label(frm_ov, text="  (raise if male voices land in overlap)", fg='grey').pack(side='left')
 
-    # row 6 : Min silence
+    # row 6 : Min silence  +  Shorten silences (a different mode entirely)
     tk.Label(f, text="Min silence (s)", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
-    tk.Entry(f, textvariable=v_minsilence, width=8).grid(row=6, column=1, sticky='w', padx=4)
+    frm_sil6 = tk.Frame(f)
+    frm_sil6.grid(row=6, column=1, sticky='w', padx=4)
+    tk.Entry(frm_sil6, textvariable=v_minsilence, width=8).pack(side='left')
+    # Shortening does NOT split the file: every voiced sample is kept and only
+    # the gaps are compressed, so no speech can be cut. Segmenting sorts
+    # speakers; shortening cleans up a source with long pauses.
+    v_shorten = tk.StringVar(value='')
+    v_shorten_gap = tk.StringVar(value='600')
+    tk.Label(frm_sil6, text="   Shorten silences to (ms)").pack(side='left')
+    tk.Entry(frm_sil6, textvariable=v_shorten, width=6).pack(side='left', padx=2)
+    tk.Label(frm_sil6, text="min gap (ms)").pack(side='left', padx=(6, 2))
+    tk.Entry(frm_sil6, textvariable=v_shorten_gap, width=6).pack(side='left')
+    tk.Label(frm_sil6, text="  (fill to shorten instead of splitting -- nothing is cut)",
+             fg='grey', font=('Arial', 8)).pack(side='left', padx=(6, 0))
 
     # row 7 : Min dur segment
     tk.Label(f, text="Min dur segment (s)", anchor='w', width=20).grid(row=7, column=0, sticky='w', padx=6, pady=3)
@@ -1653,8 +1689,35 @@ def tab_extract(nb):
 
     v_vox_tempo = tk.StringVar(value='1.0')
     tk.Label(f, text="Tempo × (pitch kept)", anchor='w', width=20).grid(row=15, column=0, sticky='w', padx=6, pady=3)
-    ttk.Combobox(f, textvariable=v_vox_tempo, width=8,
-        values=['0.70','0.80','0.85','0.90','1.0','1.10','1.25','1.5']).grid(row=15, column=1, sticky='w', padx=4)
+    frm_tempo = tk.Frame(f)
+    frm_tempo.grid(row=15, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_tempo, textvariable=v_vox_tempo, width=8,
+        values=['0.70','0.80','0.85','0.90','1.0','1.10','1.25','1.5']).pack(side='left')
+
+    # Age shift. Pitch alone gives the chipmunk effect: what reads as age is the
+    # FORMANT position, i.e. vocal-tract length. rubberband moves the two
+    # independently, so the presets set both. Female and male need different
+    # amounts because their starting F0 and tract length differ.
+    v_vox_age = tk.StringVar(value='none')
+    v_vox_agesex = tk.StringVar(value='F')
+    tk.Label(frm_tempo, text="   Age").pack(side='left')
+    ttk.Combobox(frm_tempo, textvariable=v_vox_age, width=11, state='readonly',
+                 values=['none', 'child', 'teen', 'younger',
+                         'older', 'mature', 'much_older',
+                         'elderly']).pack(side='left', padx=2)
+    ttk.Combobox(frm_tempo, textvariable=v_vox_agesex, width=3, state='readonly',
+                 values=['F', 'M']).pack(side='left', padx=2)
+    # Free semitone value next to the presets, same idea as the tempo box.
+    # It OVERRIDES the preset when set, so the two never fight.
+    v_vox_pitch = tk.StringVar(value='')
+    tk.Label(frm_tempo, text="  or st").pack(side='left')
+    ttk.Combobox(frm_tempo, textvariable=v_vox_pitch, width=6,
+                 values=['', '-4', '-3', '-2.5', '-2', '-1.5', '-1', '-0.5',
+                         '+0.5', '+1', '+1.5', '+2', '+2.5', '+3', '+4',
+                         '+5']).pack(side='left', padx=2)
+    tk.Label(frm_tempo, text="  (semitones -- overrides the preset; formants "
+                             "follow, which is what reads as age)",
+             fg='grey', font=('Arial', 8)).pack(side='left', padx=(4, 0))
 
     # row 11 : Remove music
     def on_remove_music_toggle(*args):
@@ -1720,6 +1783,19 @@ def tab_extract(nb):
         if v_debug.get():
             cmd.append('--debug')
         cmd += ['--device', v_vox_device.get()]
+        # Shortening replaces the segment pipeline: the other split/keep options
+        # do not apply to it, so it is passed on its own.
+        if v_shorten.get().strip():
+            cmd += ['--shorten-silences', v_shorten.get().strip().replace(',', '.')]
+            if v_shorten_gap.get().strip():
+                cmd += ['--shorten-min-gap',
+                        v_shorten_gap.get().strip().replace(',', '.')]
+        # A free semitone value wins over the preset; either one alone works.
+        _pitch = v_vox_pitch.get().strip().replace(',', '.').lstrip('+')
+        if _pitch:
+            cmd += ['--pitch-shift', _pitch]
+        elif v_vox_age.get() != 'none':
+            cmd += ['--age', v_vox_age.get(), '--age-sex', v_vox_agesex.get()]
         if v_vox_tempo.get().strip() not in ('', '1.0', '1'):
             cmd += ['--tempo', v_vox_tempo.get().strip()]
         cmd += ['--mp3-bitrate', v_mp3_bitrate.get(), '--mp3-mode', v_mp3_mode.get()]
@@ -2412,6 +2488,30 @@ def tab_rvc(nb):
     make_btn(f, ">  3. Measure identity (before/after)", lancer_measure, 16)
 
 
+
+def tab_brainwave(nb):
+    """Brainwave Studio as a tab.
+
+    The generator lives in its own module and keeps working standalone; here it
+    is simply given a notebook tab instead of a window, so binaural/isochronic
+    beds can be built next to the meditation that will sit on top of them
+    without switching applications.
+    """
+    f = ttk.Frame(nb)
+    nb.add(f, text="[Wav] Brainwave")
+    try:
+        import brainwave_studio as _bw
+        _bw.BrainwaveStudio(f)
+    except Exception as e:
+        msg = (f"Brainwave Studio could not be loaded:\n\n{type(e).__name__}: {e}\n\n"
+               "It lives in brainwave_studio.py, expected next to this script.\n"
+               "Audio preview also needs pygame (pip install pygame); export\n"
+               "works without it.")
+        tk.Label(f, text=msg, justify='left', anchor='nw',
+                 fg='#a00', padx=16, pady=16).pack(fill='both', expand=True)
+    return f
+
+
 def tab_comparator(nb):
     f = tk.Frame(nb)
     nb.add(f, text="[Cmp] Comparator")
@@ -2623,6 +2723,7 @@ def main():
     tab_optimize(nb)
     tab_comparator(nb)
     tab_rvc(nb)
+    tab_brainwave(nb)
 
     def on_close():
         _stop_player()       # stop audio player if running

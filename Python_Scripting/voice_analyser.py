@@ -41,6 +41,18 @@ Dependencies:
   pip install librosa numpy scipy
 """
 
+
+# Windows consoles default to cp1252 and raise UnicodeEncodeError on any
+# non-ASCII character in output — a run that computed correctly then died on a
+# print. Force UTF-8 where the interpreter allows it.
+try:
+    import sys as _sys
+    if hasattr(_sys.stdout, 'reconfigure'):
+        _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 import sys
 import os
 import time
@@ -353,11 +365,11 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True,
                 praat_hnr = float(np.median(_vals))
                 _frac = len(_vals) / max(1, len(_all))
                 if _frac < 0.2:
-                    print(f"   [!] HNR from only {_frac:.0%} of frames — the source "
+                    print(f"   [!] HNR from only {_frac:.0%} of frames -- the source "
                           f"may be very noisy or mostly unvoiced.")
             elif len(_all) > 0:
                 praat_hnr = float(np.mean(_all))
-                print("   [!] No frame with positive harmonicity — HNR unreliable.")
+                print("   [!] No frame with positive harmonicity -- HNR unreliable.")
             # Shimmer + Jitter (on voiced segment only)
             _pp = parselmouth.praat.call(_snd, 'To PointProcess (periodic, cc)', 75, 600)
             praat_shimmer = parselmouth.praat.call(
@@ -376,9 +388,9 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True,
                 praat_f1, praat_f2 = None, None
             step(f"Praat   HNR={praat_hnr:.1f}dB  shimmer={praat_shimmer*100:.1f}%  jitter={praat_jitter*100:.2f}%  APQ5={praat_apq5*100:.1f}%  F1={praat_f1:.0f}Hz  F2={praat_f2:.0f}Hz", t0)
         except Exception as e:
-            print(f"   [!] Praat analysis failed: {e} — using librosa fallback")
+            print(f"   [!] Praat analysis failed: {e} -- using librosa fallback")
     else:
-        print("   [*] parselmouth not installed — using librosa estimates (pip install praat-parselmouth)")
+        print("   [*] parselmouth not installed -- using librosa estimates (pip install praat-parselmouth)")
 
     # -- 2c. Tempo estimation (syllable rate) ---------------------------------
     # Syllable NUCLEI in the energy envelope — the standard acoustic estimator.
@@ -979,7 +991,7 @@ def main():
                 results.append((valid_wavs[0], lang, params, stats, seed))
             else:
                 # Multiple references — analyse each and average params
-                print(f"\n[*] Voice #{idx}: {len(valid_wavs)} references — averaging parameters")
+                print(f"\n[*] Voice #{idx}: {len(valid_wavs)} references -- averaging parameters")
                 all_params = []
                 all_stats  = []
                 for wav_file in valid_wavs:
