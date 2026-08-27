@@ -938,8 +938,12 @@ def process_sepformer(input_file, output_file, keep_set=None, silence_mode='auto
                                                    sr=sr, frame_length=fl, hop_length=hp)
                         fv = f0r[vr & ~np.isnan(f0r)] if vr is not None else []
                         return f"{np.median(fv):.0f}" if len(fv) >= 2 else "?"
+                    # A conditional cannot live inside a format spec:
+                    # f"{f0:.0f if f0 else '?'}" raises ValueError, so sepformer
+                    # + --debug crashed every time. Format first, then insert.
+                    _f0s = f"{f0:.0f}" if f0 is not None else "?"
                     print(f"   {start:6.1f}-{end:6.1f}s  {kind:12s}  "
-                          f"F0 mix={f0:.0f if f0 else '?'}  "
+                          f"F0 mix={_f0s}  "
                           f"src1={_mf0(src1)}Hz  src2={_mf0(src2)}Hz  "
                           f"-> {'src1' if np.array_equal(chosen, src1) else 'src2'}")
             except Exception as e:
@@ -1115,6 +1119,7 @@ def cluster_speakers(y, sr, segs, ov_range=80, device='cpu'):
 
     # -- Collecte F0 median par segment --------------------------------------
     seg_f0 = []   # (seg_idx, f0_median, voiced_ratio)
+    n_overlap = 0
     for i, (start, end) in enumerate(segs):
         seg = y[int(start * sr):int(end * sr)]
         if len(seg) < 1024:
@@ -1136,11 +1141,28 @@ def cluster_speakers(y, sr, segs, ov_range=80, device='cpu'):
             continue
 
         med = float(np.median(f0v))
+        # A segment whose F0 sweeps a wide range in a short time is the sign
+        # of two speakers inside ONE segment (one finishes, the other starts,
+        # with less gap between them than min_silence). classify() already
+        # rejects this case as 'overlap' -- cluster_speakers() computed the
+        # same range but never checked it, so a mixed segment got a median F0
+        # that looks clean and was written whole into one output file, voices
+        # and all. ov_range is the same threshold classify() uses.
+        rng = float(np.percentile(f0v, 90) - np.percentile(f0v, 10)) if len(f0v) >= 4 else 0.0
+        if rng > ov_range:
+            seg_f0.append((i, None, vr))
+            n_overlap += 1
+            print(f"   [*] Collecte F0: {i+1}/{len(segs)}\r", end="", flush=True)
+            continue
         seg_f0.append((i, med, vr))
 
         print(f"   [*] Collecte F0: {i+1}/{len(segs)}\r", end="", flush=True)
 
     print()
+    if n_overlap:
+        print(f"   [*] {n_overlap}/{len(segs)} segment(s) rejected: F0 range wider "
+              f"than {ov_range} Hz, i.e. two speakers inside one segment. "
+              f"Lower --min-silence to cut between them instead of dropping them.")
 
     # -- Filtrer les segments avec F0 valide ---------------------------------
     valid = [(i, f0) for i, f0, vr in seg_f0 if f0 is not None]
@@ -1326,6 +1348,19 @@ def process(input_file, output_file, keep_set=None, silence_mode='auto',
             print("[OK] Dereverberation terminée. Sauvegarde directe.")
             save_audio(y, sr, output_file, mp3_bitrate, mp3_mode)
             return
+
+    # 'vocals only' asks for the whole vocal track, not a speaker. classify()
+    # only ever returns female_solo / male_solo / overlap / silence, so a
+    # keep_set of {'vocals_only'} matches NOTHING and the run always ended on
+    # "Aucun segment gardé !". It only appeared to work when --remove-music or
+    # --dereverberate returned earlier. Handle it for what it means: keep the
+    # audio as it is.
+    if keep_set == {'vocals_only'}:
+        print("   [*] 'vocals only' with no music removal and no dereverberation:")
+        print("       nothing to separate -- saving the audio unchanged.")
+        print("       (add --remove-music to actually strip the backing track)")
+        save_audio(y, sr, output_file, mp3_bitrate, mp3_mode)
+        return
 
     # -- Détection segments ---------------------------------------------------
     segs = detect_segments(y, sr, min_silence=min_silence)

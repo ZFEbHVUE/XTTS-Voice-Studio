@@ -532,14 +532,29 @@ def tab_generator(nb):
     v_amb_vol   = tk.StringVar(value='-12')
     v_preset    = tk.StringVar()
 
-    def _insert(tag, newline=True):
-        """Insert a tag on its own line at the caret, keeping the script tidy."""
+    def _insert(tag, newline=True, inline=False):
+        """Insert at the CARET.
+
+        Two kinds of tag, two behaviours:
+        - inline=True  -> dropped exactly where the caret sits. A pause belongs
+          in the middle of a sentence, so it must not jump to the end of the
+          line (which is what this did before: it inserted at 'insert lineend'
+          whenever the line had text, so a pause placed mid-sentence landed
+          after the full stop).
+        - inline=False -> the tag gets a line of its own. If the caret is
+          mid-line the line is split there, because a directive such as
+          ambient_volume= takes effect from that point onwards.
+        """
         try:
-            line_start = editor.index('insert linestart')
-            cur_line = editor.get(line_start, f'{line_start} lineend')
-            prefix = '' if (not cur_line.strip()) else '\n'
-            editor.insert('insert lineend' if cur_line.strip() else 'insert',
-                          f"{prefix}{tag}" + ('\n' if newline else ''))
+            if inline:
+                editor.insert('insert', tag)
+            else:
+                pos      = editor.index('insert')
+                at_start = pos == editor.index('insert linestart')
+                at_end   = pos == editor.index('insert lineend')
+                before = '' if at_start else '\n'
+                after  = '\n' if (newline or not at_end) else ''
+                editor.insert('insert', before + tag + after)
             editor.focus_set()
             update_line_numbers()
         except Exception as e:
@@ -562,10 +577,12 @@ def tab_generator(nb):
     tk.Label(ins_bar, text="s").pack(side='left')
     tk.Entry(ins_bar, textvariable=v_pause_dur, width=4).pack(side='left', padx=(0, 4))
     tk.Button(ins_bar, text="Pause",
-              command=lambda: _insert(f"[pause={_num(v_pause_dur, '2')}s]"),
+              command=lambda: _insert(f"[pause={_num(v_pause_dur, '2')}s]",
+                                      inline=True),
               width=7).pack(side='left', padx=2)
     tk.Button(ins_bar, text="Paced pause",
-              command=lambda: _insert(f"[pause={_num(v_pause_dur, '2')}s,start]"),
+              command=lambda: _insert(f"[pause={_num(v_pause_dur, '2')}s,start]",
+                                      inline=True),
               width=12).pack(side='left', padx=2)
 
     ttk.Separator(ins_bar, orient='vertical').pack(side='left', fill='y', padx=6, pady=2)
@@ -592,7 +609,8 @@ def tab_generator(nb):
                   f"{_num(v_music_dur, '16')}s,{_signed(v_music_vol, '-15')}"),
               width=8).pack(side='left', padx=2)
     tk.Button(ins_bar, text="Trigger",
-              command=lambda: _insert(f"[music={v_music_num.get().strip() or '1'}]"),
+              command=lambda: _insert(f"[music={v_music_num.get().strip() or '1'}]",
+                                      inline=True),
               width=8).pack(side='left', padx=2)
 
     # ── Voice presets: save the {} / [] pair once, paste it into any script ──
