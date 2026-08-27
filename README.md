@@ -49,6 +49,36 @@ conda create -n xtts python=3.10
 conda activate xtts
 ```
 
+### macOS
+
+The toolkit runs on macOS; only the launcher and the system packages differ.
+
+```bash
+brew install ffmpeg rubberband
+conda create -n xtts python=3.10 && conda activate xtts
+pip install torch torchaudio          # no CUDA index on macOS
+pip install -r requirements.txt
+```
+
+Then double-click **Launch XTTS Studio.command** in the Finder — it locates the
+conda environment itself, checks the dependencies, and reports what is missing
+instead of opening a window that would crash. First run only:
+
+```bash
+chmod +x "Launch XTTS Studio.command"
+xattr -d com.apple.quarantine "Launch XTTS Studio.command"   # if Gatekeeper blocks it
+```
+
+Use a different environment name with `XTTS_ENV=myenv`.
+
+**Expect CPU speed.** There is no CUDA on macOS: a clone that takes 15 s on an
+NVIDIA card takes 1–3 minutes here. The Apple MPS backend is unreliable for
+XTTS (missing operators, occasionally corrupted output), so the launcher sets
+`PYTORCH_ENABLE_MPS_FALLBACK=1` and generation stays on the CPU. Editing,
+listening tests and preset work are unaffected; heavy runs (optimiser,
+pipeline, full meditations) are better left to a machine with an NVIDIA GPU —
+`git pull` keeps both in sync.
+
 ### Interface language
 
 Test sentences and the language selectors default to your own language rather
@@ -137,6 +167,16 @@ Generates guided meditation audio from a text script with pause markers and voic
 - Ambient music and punctual sound cue inputs
 - MP3/FLAC/OGG output options
 
+### The insert bar writes at the caret
+
+Inline tags — pause, paced pause, music trigger — are inserted **exactly where
+the caret is**, so a pause placed mid-sentence stays mid-sentence. Directives
+and preset blocks take a line of their own, splitting the current line at the
+caret since that is where they take effect.
+
+(Previously everything jumped to the end of the current line, which put a pause
+after the full stop.)
+
 ### [Auto] Pipeline
 
 One-shot mode: add your voices (each with its own language), press Run, and the
@@ -200,6 +240,78 @@ Separates vocal stems from mixed audio or video sources.
 - Pitch-preserving tempo via rubberband (R3 `--fine` engine when rubberband≥3
   is installed; loud warning if only the metallic librosa fallback is available)
 
+#### Age shift
+
+Re-age a voice by shifting its fundamental, formants following along — which is
+what actually reads as age, since the formants encode vocal-tract length.
+
+| Preset | F | M | A 205 Hz voice becomes |
+|---|---|---|---|
+| `child` | +3.5 | +4.5 | 251 Hz |
+| `teen` | +2.0 | +2.5 | 230 Hz |
+| `younger` | +1.0 | +1.5 | 217 Hz |
+| `older` | −1.0 | −1.0 | 193 Hz |
+| `mature` | −1.75 | −1.75 | 185 Hz |
+| `much_older` | −2.0 | −2.5 | 183 Hz |
+| `elderly` | −3.0 | −3.5 | 172 Hz |
+
+Or a free semitone value, which overrides the preset.
+
+**Ageing works better than rejuvenating**, and the reason is physical: going
+down lengthens the tract virtually, which stays plausible, and needs only 1–3
+semitones. Going up far enough to cross the male break needs 5–7, well past the
+point where a pitch shift still sounds like a person — and the break is a change
+of *larynx*, not of pitch. The tool measures the source F0 and warns rather than
+pretending:
+
+```
+[*] Source F0: 118 Hz
+[!] the source is a low voice (118 Hz) and +4.5 st only reaches 153 Hz --
+    halfway to a young voice, so it reads as 'shifted' rather than 'younger'.
+    A real change of age across the male break needs RVC, not a pitch shift.
+```
+
+Requires `rubberband` (R3 engine when available — much cleaner on speech).
+
+#### Shorten silences
+
+`Shorten silences to (ms)` + `min gap (ms)` — compresses the gaps **without
+splitting the file**. Nothing is discarded, so no speech can be cut.
+
+This solves a different problem from segmenting. The segment pipeline splits,
+judges each piece and drops the failures; on a source with long pauses every cut
+is a chance to lose a syllable, which is why tightening thresholds never helped —
+the loss came from the *discarding*, not the thresholds. Here every voiced
+sample is kept in order.
+
+```
+[*] Silences shortened: 12 gap(s) >= 600ms reduced to 500ms
+    (23.4s removed, 97.3s -> 73.9s)
+[*] No speech was cut: every voiced sample is kept in order.
+```
+
+The silence threshold is relative to the material (42 dB below the signal's own
+loud level), so it adapts to a quiet recording instead of assuming a fixed dBFS.
+
+#### Speaker split — what the overlap filter is for
+
+With `--split-output`, segments are clustered by k-means on F0 (or by ECAPA
+speaker embedding with `--method ecapa`). A segment whose F0 sweeps more than
+`--overlap-range` in a short time holds **two speakers inside one segment** —
+one finishing, the next starting with less gap than `--min-silence`. Such
+segments are rejected rather than assigned to one side, and the run says how
+many:
+
+```
+[*] 71/205 segment(s) rejected: F0 range wider than 80 Hz, i.e. two speakers
+    inside one segment. Lower --min-silence to cut between them instead of
+    dropping them.
+```
+
+**`Silence` matters more than it looks here.** With `auto`, each output keeps
+the original timeline — silence where the *other* person speaks — so both files
+come out near the full duration. Set it to `0` for compact files.
+
 ### [Pit] Pitch
 
 Applies pitch correction to cloned voice audio.
@@ -250,6 +362,23 @@ needed — `prepare_rvc_dataset.py`), 2) converting any XTTS output through the
 trained model (`rvc_convert.py`, runs Applio's own env), 3) measuring identity
 before/after against the real reference. Training itself stays in Applio's UI
 — see docs/RVC_GUIDE.md for settings and the A/B protocol.
+
+### [Wav] Brainwave
+
+Binaural / isochronic / monaural beats and a physically modelled singing bowl,
+built as sessions of segments. Runs here as a tab, or standalone with
+`python brainwave_studio.py`.
+
+Full documentation: **[BRAINWAVE.md](BRAINWAVE.md)**.
+
+Short version: set the tone, its levels and its music on the left, press
+**Play** to check, then **+ Add** — the segment stores all of it. Click a
+segment to load it back. `♪ Set GLOBAL music` adds a bed under the whole
+session.
+
+The bowl accepts **measured** vibration modes: `Edit bowl…` → `Analyse a WAV…`
+reads a recording of a real bowl and extracts each mode's frequency, decay and
+its own beat rate.
 
 ---
 
@@ -325,6 +454,22 @@ block if it wins.
 | 15 | `pan` | 0 | Stereo pan (-1.0=left, 0=centre, +1.0=right) |
 | 16 | `limiter` | 0 | Output limiter (0=off, 1=on) |
 
+### `trim_end` is bounded by the measured silence
+
+`trim_end` used to cut a fixed number of milliseconds blindly. That was safe
+while `tts_to_file` left a generous silent tail, but the low-level path leaves
+much less — so the same block started clipping the last syllable of every
+sentence, with no warning and no change to the prompt. The trim now measures the
+actual trailing silence and never cuts into speech:
+
+```
+[*]  trim_end 320ms reduced to 100ms (only 100ms of trailing silence --
+     cutting more would clip the last word)
+```
+
+You can leave `trim_end` at its usual value; it simply stops doing damage when
+there is nothing to trim.
+
 ### Pause syntax
 
 Two forms. The second one is the important one for guided meditation, and it is
@@ -380,6 +525,24 @@ Première phrase.
 Deuxième phrase plus lente.
 [pause=2s]
 ```
+
+### Voice presets (`Voice_Presets/`)
+
+One readable `.txt` per voice, written automatically at the end of a pipeline
+run, holding the blocks plus the scores and acoustics that produced them:
+
+```
+# Voice: anna
+# Saved: 2026-08-19 14:32
+# Held-out: score 0.804  french 0.912  identity 0.677
+# Acoustics: contralto / low voice, F0 80 Hz, voiced 71%, RMS -24.1 dBFS, SNR 62 dB
+{1, 200, 0, 200, 150, 300, 0.65, 50, 0.85, 5, 1, 45, 4, 0}
+[1, FR, 1, -4, -0.1, 1.8, -1.7, 75, 8000, 0, 0, 0, 0, 0, 0, 1]
+```
+
+The blocks paste straight into a prompt. In `[Gen]`, the preset bar inserts,
+saves, deletes and browses them; `--preset-name` names them per voice from the
+pipeline, `--no-save-preset` disables the automatic save.
 
 ### Multi-reference voices
 
@@ -515,6 +678,32 @@ LTAS. The reported residual is the weighted in-band RMS error (dB) before vs aft
 - The `{}` is never modified — fix seed/temp in the Validator first.
 
 ---
+
+### EQ weighting (`--eq-weighting a | voice | blend`)
+
+Which frequencies the least-squares fit should care about:
+
+- **`a`** — A-weighting, the standard perceptual curve
+- **`voice`** — weights where the *reference* has energy
+- **`blend`** — halfway
+
+On a voice whose energy and whose error sit in the same region the three agree
+closely; they diverge when a clone is wrong where the reference is quiet.
+
+### Two fixes worth knowing about
+
+**Gains are re-centred.** The fit models `EQ(f) + c`, and a constant offset
+applied to all three bands is indistinguishable from `c` — so least squares
+drifted them together until they hit the bounds, producing blocks like
+`(+11.5, +11.0, +11.5)`: eleven dB of plain gain, immediately cancelled by
+`vol`, correcting nothing. The gains now describe a **shape**; the level is left
+to `vol`.
+
+**The low band moved from 200 Hz to 120 Hz.** A bell at 200 Hz delivered only
+19 % of its gain at 80 Hz — unreachable for a deep voice. `ltas_match.py` and
+the generator's ffmpeg filter must stay in agreement here: if you change one,
+change the other, or the fit optimises against a response that is not the one
+applied.
 
 ## Advanced — input curation & sampling search
 
@@ -831,6 +1020,44 @@ Resemble) not yet on PyPI; retest when released.
 | Content | Clean speech only — no music, no echo, no noise |
 
 Using **multiple reference files** (2–3 clips) significantly improves cloning quality.
+
+---
+
+## Running on Windows
+
+The pipeline runs natively on Windows (Python 3.11 recommended — some packages
+have no wheels for 3.14 yet). Points that cost time:
+
+**Version constraints.** `requirements.txt` does not pin these and it should:
+
+```
+torch>=2.0,<2.9          # 2.9+ requires torchcodec, which needs ffmpeg full-shared
+transformers>=4.46,<5    # coqui-tts needs isin_mps_friendly, removed in v5
+numpy>=1.22,<2           # the audio stack is not uniformly ready for 2.x
+```
+
+**ffmpeg must be the "full-shared" build** if you stay on torch ≥ 2.9 — the
+plain GPL build ships no DLLs and torchcodec cannot load.
+
+**Symlinks.** speechbrain fetches models with symlinks, which Windows refuses
+without Developer Mode. If your machine policy blocks it, patch
+`speechbrain/utils/fetching.py` to copy instead of link.
+
+**Console encoding.** Windows consoles default to cp1252 and raise
+`UnicodeEncodeError` on any non-ASCII character in output — a run that computed
+correctly then died on a `print`. The scripts now force UTF-8 and avoid
+non-ASCII in console lines.
+
+**Locked temp files.** Windows refuses to delete a file that is still open, so
+every `os.unlink` on a scratch file is guarded.
+
+**Missing tools are survivable.** A missing `ffmpeg` used to lose every sentence
+silently and produce an empty render; the effect is now skipped and the audio
+kept, with the reason named. If you add a tool to `PATH`, **restart the app** —
+a running process keeps its old `PATH`.
+
+**Audio.** Preview needs `pygame` and a sound card. On WSL or a headless server
+there is none; export still works. Generate there, listen elsewhere.
 
 ---
 
