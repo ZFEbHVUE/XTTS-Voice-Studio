@@ -1056,8 +1056,37 @@ silently and produce an empty render; the effect is now skipped and the audio
 kept, with the reason named. If you add a tool to `PATH`, **restart the app** —
 a running process keeps its old `PATH`.
 
-**Audio.** Preview needs `pygame` and a sound card. On WSL or a headless server
-there is none; export still works. Generate there, listen elsewhere.
+**Audio.** Preview needs `pygame` and a sound card. On a headless server there
+is none; export still works, so generate there and listen elsewhere.
+
+### WSL: sound and window are provided by WSLg
+
+WSLg gives WSL2 both an audio server and a display, with no third-party server
+to install. But a setup carried over from the VcXsrv era usually leaves stale
+exports in `~/.bashrc` pointing at the **Windows IP**:
+
+```bash
+export PULSE_SERVER=tcp:$(grep nameserver /etc/resolv.conf | awk '{print $2}')
+export DISPLAY=<IP>:0
+```
+
+Those override WSLg's own sockets, and everything fails with `Could not connect
+to PulseAudio` or `couldn't connect to display` — while WSLg sits there working.
+Replace them with:
+
+```bash
+export PULSE_SERVER=unix:/mnt/wslg/PulseServer
+export DISPLAY=:0
+```
+
+Check with `ls /mnt/wslg/` — if `PulseServer` is listed, the bridge is there.
+If the directory does not exist, WSL is too old: `wsl --update` then
+`wsl --shutdown` from PowerShell.
+
+Worth knowing: **CUDA works in WSL, audio does not come for free.** A machine
+that generates fast on GPU can still be silent, and the two have nothing to do
+with each other — `lspci` inside WSL shows only virtual devices, so an absent
+sound card there says nothing about the hardware.
 
 ---
 
