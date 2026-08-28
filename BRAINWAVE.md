@@ -188,6 +188,49 @@ the file. The longer the tail, the more accurate the decay times.
 
 ---
 
+### A sequence of chakras
+
+**`Add all 7`**, beside the chakra buttons, appends one segment per chakra in
+order, each at the frequency of the chosen tuning. Every other setting on the
+left is kept, and the panel is put back where you left it afterwards.
+
+**A sequence, not a sweep.** A bowl does not change pitch while it rings — its
+frequency comes from its geometry — so a glissando would sound like a
+speeded-up tape rather than like seven bowls. Each chakra is its own struck
+segment that decays before the next.
+
+#### With a measured bowl loaded
+
+Measured modes override the carrier, so the chakra buttons would otherwise have
+no effect. Instead the bowl is **transposed** onto each chakra: everything
+scales by one factor, which is the same as playing bowls of different sizes from
+the same workshop — what a set of tuned bowls is.
+
+What is preserved, and what follows:
+
+| | Behaviour |
+|---|---|
+| Ratios between modes | **unchanged** (verified identical to 0.002) |
+| Mode frequencies | scale with the factor |
+| Beat rates | scale too — the detuning is a fraction of the mode |
+| Decays | scale as 1/k: a smaller bowl rings shorter |
+| Amplitudes | untouched — they describe how it was struck |
+
+A 256 Hz bowl across `A=440`:
+
+```
+Root     261.6Hz  decay 34.3s  beat 0.92
+Sacral   293.7Hz  decay 30.5s  beat 1.03
+...
+Crown    493.9Hz  decay 18.1s  beat 1.74
+```
+
+Past a factor of **2** a confirmation appears: beyond that the measured decays
+and beats no longer describe the real bowl, and you are listening to an
+extrapolation rather than to your instrument.
+
+---
+
 ## Parameter checks
 
 A live advisory line reports settings that cannot produce what they claim. The
@@ -247,6 +290,20 @@ breaths per minute hits the baroreflex resonance and measurably shifts autonomic
 balance. A guided meditation that paces breathing acts on a documented
 mechanism; the sound bed makes it pleasant and holds attention, which is not
 nothing, but is not the same claim.
+
+---
+
+## Empty fields
+
+Every numeric field tolerates being emptied. A `DoubleVar` bound to an Entry
+raises as soon as the box is cleared, and each button reading it dies with it —
+clearing `Duration` to retype it used to make `+ Add`, `Play`, `Export` and
+`Generate audio` all throw. Reads now fall back to a default, write it back into
+the field so the value used is visible, and say which field was empty:
+
+```
+Duration was empty -- using 300.
+```
 
 ---
 
