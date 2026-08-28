@@ -263,6 +263,38 @@ def analyse_bowl_wav(path, sr_target=44100, max_modes=8, floor_db=-55.0):
     return out
 
 
+
+def transpose_bowl_modes(modes, target_hz, scale_decay=True):
+    """Move a measured bowl to another fundamental, keeping its identity.
+
+    A bowl's character lives in the RATIOS between its modes, their decays and
+    their beat rates -- not in its absolute pitch. Scaling all of it by one
+    factor is the same as playing a bowl of a different size from the same
+    workshop, which is exactly what a set of tuned bowls is.
+
+    What scales with the factor k:
+      - every mode frequency (by definition)
+      - every beat rate: the detuning is a fraction of the mode, so it follows
+      - the decays, if scale_decay: a smaller bowl rings shorter. Physically the
+        radiated power rises with frequency, so decay goes roughly as 1/k. Pass
+        False to keep the measured decays as they are.
+
+    Amplitudes are left alone: they describe how the bowl was struck.
+    """
+    if not modes or not target_hz or target_hz <= 0:
+        return list(modes or [])
+    f0 = float(modes[0][0])
+    if f0 <= 0:
+        return list(modes)
+    k = float(target_hz) / f0
+    out = []
+    for f, a, d, b in modes:
+        nd = (float(d) / k) if (scale_decay and k > 0) else float(d)
+        out.append((round(float(f) * k, 1), float(a),
+                    round(max(nd, 0.05), 2), round(float(b) * k, 2)))
+    return out
+
+
 def parse_bowl_modes(text):
     """Read a bowl table: one mode per line, 'freq amp decay beat'.
 
@@ -1502,6 +1534,9 @@ class BrainwaveStudio:
         for i, name in enumerate(CHAKRAS):
             ttk.Button(cf, text=name, width=7,
                        command=lambda idx=i: self._set_chakra(idx)).grid(row=0, column=i, padx=1)
+        ttk.Button(cf, text="Add all 7", width=9,
+                   command=self.add_chakra_sequence).grid(row=0, column=len(CHAKRAS),
+                                                          padx=(8, 1))
         r += 1
 
         ttk.Label(frm, text="Duration (s)").grid(row=r, column=0, sticky="w", **pad)
@@ -1817,6 +1852,74 @@ class BrainwaveStudio:
     def _on_ramp(self):
         self.ramp_spin.configure(state="normal" if self.use_ramp.get() else "disabled")
 
+    def add_chakra_sequence(self):
+        """Append one segment per chakra, in order, keeping every other setting.
+
+        A sequence rather than a sweep: a bowl does not change pitch while it
+        rings -- its frequency comes from its geometry -- so a glissando would
+        sound like a speeded-up tape, not like seven bowls. Each chakra is its
+        own struck segment that decays before the next.
+
+        The chakra frequencies are a tuning convention, not a measured
+        physiological fact; see "About the evidence".
+        """
+        try:
+            table = TUNINGS[self.tuning.get()]
+        except Exception:
+            self.status.set("Pick a tuning first.")
+            return
+        per = simpledialog.askfloat(
+            "Chakra sequence",
+            f"Duration of EACH of the {len(CHAKRAS)} segments, in seconds.\n\n"
+            f"Tuning: {self.tuning.get()}\n"
+            f"{', '.join(f'{n} {f:g}Hz' for n, f in zip(CHAKRAS, table))}\n\n"
+            f"Every other setting on the left is kept as it is.",
+            initialvalue=max(30.0, self._dget(self.duration, 300.0) / len(CHAKRAS)),
+            minvalue=1.0, maxvalue=3600.0, parent=self.root)
+        if per is None:
+            return
+        keep_carrier = self._dget(self.carrier, 200.0)
+        keep_dur = self._dget(self.duration, 300.0)
+        # With measured modes loaded, the carrier no longer sets the pitch --
+        # the modes do. Transposing them onto each chakra keeps the bowl's
+        # identity (its ratios, decays and beat rates) while moving its
+        # fundamental, which is what a set of tuned bowls actually is.
+        base_modes = list(self.bowl_modes) if self.bowl_modes else None
+        stretch = None
+        if base_modes:
+            f0 = float(base_modes[0][0])
+            ks = [table[i] / f0 for i in range(len(CHAKRAS))]
+            stretch = max(max(ks), 1.0 / max(min(ks), 1e-9))
+            if stretch > 2.0:
+                if not messagebox.askyesno(
+                        "Large transposition",
+                        f"The measured bowl's fundamental is {f0:g} Hz and this "
+                        f"tuning spans {table[0]:g}-{table[-1]:g} Hz, a factor of "
+                        f"{stretch:.1f}.\n\n"
+                        f"Past about 2x the measured decays and beats stop "
+                        f"describing the real bowl. Continue anyway?"):
+                    return
+        added = 0
+        for idx, name in enumerate(CHAKRAS):
+            self.carrier.set(table[idx])
+            self.duration.set(per)
+            if base_modes:
+                self.bowl_modes = transpose_bowl_modes(base_modes, table[idx])
+            seg = self._current_segment()
+            seg["chakra"] = name
+            self.segments.append(seg)
+            self.seg_list.insert("end", self._seg_label(seg))
+            added += 1
+        # Put the panel back where the user left it.
+        self.carrier.set(keep_carrier)
+        self.duration.set(keep_dur)
+        if base_modes:
+            self.bowl_modes = base_modes
+            self._refresh_bowl_label()
+        self._update_total()
+        self.status.set(f"{added} chakra segments added "
+                        f"({per:g}s each, {added * per / 60:.1f} min total).")
+
     def _set_chakra(self, idx):
         self.carrier.set(TUNINGS[self.tuning.get()][idx])
 
@@ -1892,6 +1995,7 @@ class BrainwaveStudio:
         tl = float(seg.get("tone_level", 1.0))
         beat_db = 20.0 * math.log10(max(tl, 1e-6))
         lvl = f" | beat {beat_db:+.0f}dB" if abs(beat_db) > 0.5 else ""
+        chk = f" | {seg['chakra']}" if seg.get("chakra") else ""
         rr = float(seg.get("rot_rpm", 0.0))
         rot = f" | rot {rr:.1f}/min" if rr > 0.05 else ""
         # Compact flags for the rest: a segment that uses none of them stays a
@@ -1915,7 +2019,7 @@ class BrainwaveStudio:
         else:
             mus = ""
         return (f"{seg['mode'][:4]:4s} | {seg['carrier']:.0f}Hz | "
-                f"{bs}Hz | {seg['duration']:.0f}s{lvl}{rot}{extra}{mus}")
+                f"{bs}Hz | {seg['duration']:.0f}s{chk}{lvl}{rot}{extra}{mus}")
 
     def set_global_music(self):
         """The bed under the WHOLE session, on top of any per-segment music.
