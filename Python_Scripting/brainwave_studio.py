@@ -1534,7 +1534,10 @@ class BrainwaveStudio:
         self.sph_val.grid(row=r, column=3, sticky="w", **pad)
 
         def _show_sph(*_):
-            v = self.stereo_phase.get()
+            try:
+                v = float(self.stereo_phase.get())
+            except Exception:
+                return
             deg = v * 360.0
             if v < 0.01:
                 self.sph_val.config(text="0 deg (both ears together)")
@@ -1586,7 +1589,10 @@ class BrainwaveStudio:
         self.lbl_rot.grid(row=r, column=3, sticky="w", **pad)
 
         def _show_rot(*_):
-            v, d = self.rot_rpm.get(), self.rot_depth.get()
+            try:
+                v, d = float(self.rot_rpm.get()), float(self.rot_depth.get())
+            except Exception:
+                return
             if v < 0.05 or d < 0.02:
                 self.lbl_rot.config(text="off (centred)")
             else:
@@ -1616,7 +1622,10 @@ class BrainwaveStudio:
         self.lbl_tone_db.grid(row=r, column=3, sticky="w", **pad)
 
         def _show_tone_db(*_):
-            v = self.tone_db.get()
+            try:
+                v = float(self.tone_db.get())
+            except Exception:
+                return
             hint = ("beat in front" if v > -6 else
                     "blended" if v > -14 else
                     "under the music" if v > -40 else
@@ -1682,9 +1691,15 @@ class BrainwaveStudio:
         self.lbl_music_db.grid(row=r, column=3, sticky="w", **pad)
 
         def _sync_music_db(*_):
-            db = self.music_db.get()
+            try:
+                db = float(self.music_db.get())
+            except Exception:
+                return
             self.music_level.set(10.0 ** (db / 20.0))
-            gap = db - self.tone_db.get()
+            try:
+                gap = db - float(self.tone_db.get())
+            except Exception:
+                gap = 0.0
             self.lbl_music_db.config(text=f"{db:.1f} dB   ({gap:+.0f} dB vs beat)")
             if self.ent_music_db.focus_get() is not self.ent_music_db:
                 self.ent_music_db.delete(0, "end")
@@ -1806,24 +1821,45 @@ class BrainwaveStudio:
         self.carrier.set(TUNINGS[self.tuning.get()][idx])
 
     # ---------------- session ----------------
+    def _dget(self, var, default=0.0, name=None):
+        """Read a numeric Tk variable, tolerating an empty field.
+
+        A DoubleVar bound to an Entry raises TclError as soon as the user clears
+        the box -- and every button that reads it dies with it, which is what
+        made + Add throw instead of adding. Fall back to a sane value, put it
+        back in the field so the user sees what was used, and say so.
+        """
+        try:
+            return float(var.get())
+        except Exception:
+            try:
+                var.set(default)
+            except Exception:
+                pass
+            if name:
+                self.status.set(f"{name} was empty -- using {default:g}.")
+            return float(default)
+
     def _current_segment(self):
         # Beat level is captured WITH the segment, like carrier and beat: a
         # session that alternates a quiet bed and a foreground cue needs its own
         # balance in each part.
-        seg = {"mode": self.mode.get(), "carrier": self.carrier.get(),
-               "beat": self._beat_value(), "duration": self.duration.get(),
-               "tone_level": 10.0 ** (self.tone_db.get() / 20.0)}
+        seg = {"mode": self.mode.get(),
+               "carrier": self._dget(self.carrier, 200.0, "Carrier"),
+               "beat": self._beat_value(),
+               "duration": self._dget(self.duration, 300.0, "Duration"),
+               "tone_level": 10.0 ** (self._dget(self.tone_db, 0.0) / 20.0)}
         if self.mode.get() == "isochronic":
-            seg["duty"] = self.duty.get()
-            if abs(self.stereo_phase.get()) > 1e-6:
-                seg["stereo_phase"] = self.stereo_phase.get()
+            seg["duty"] = self._dget(self.duty, 0.5)
+            if abs(self._dget(self.stereo_phase, 0.0)) > 1e-6:
+                seg["stereo_phase"] = self._dget(self.stereo_phase, 0.0)
         # The music loaded on the left goes in too. Play previews everything on
         # the left panel, so Add must store everything on the left panel --
         # music was the one exception, which made "tune, listen, add" impossible
         # to finish in one pass.
-        if self.rot_rpm.get() > 0.05 and self.rot_depth.get() > 0.02:
-            seg["rot_rpm"] = self.rot_rpm.get()
-            seg["rot_depth"] = self.rot_depth.get()
+        if self._dget(self.rot_rpm, 0.0) > 0.05 and self._dget(self.rot_depth, 1.0) > 0.02:
+            seg["rot_rpm"] = self._dget(self.rot_rpm, 0.0)
+            seg["rot_depth"] = self._dget(self.rot_depth, 1.0)
         # Everything else the left panel offers. Stored only when non-default,
         # so a plain segment stays a short readable line.
         if self.mode.get() == "bowl" and self.bowl_modes:
@@ -1832,20 +1868,20 @@ class BrainwaveStudio:
             seg["level_drone"] = True
         if self.level_noise.get():
             seg["level_noise"] = True
-        if self.drone_level.get() > 0.001:
-            seg["drone"] = self.drone_level.get()
-        if self.noise.get() > 0.001:
-            seg["noise"] = self.noise.get()
+        if self._dget(self.drone_level, 0.0) > 0.001:
+            seg["drone"] = self._dget(self.drone_level, 0.0)
+        if self._dget(self.noise, 0.0) > 0.001:
+            seg["noise"] = self._dget(self.noise, 0.0)
             seg["noise_color"] = self.noise_color.get()
-        if self.duck.get() > 0.001:
-            seg["duck"] = self.duck.get()
+        if self._dget(self.duck, 0.0) > 0.001:
+            seg["duck"] = self._dget(self.duck, 0.0)
         # Tuning does not change the render (it only feeds the chakra buttons),
         # but storing it means clicking a segment restores the panel exactly as
         # it was left.
         seg["tuning"] = self.tuning.get()
         if getattr(self, "music_path", None):
             seg["music"] = self.music_path
-            seg["music_level"] = self.music_level.get()
+            seg["music_level"] = self._dget(self.music_level, 0.25)
         return seg
 
     def _seg_label(self, seg):
@@ -1948,8 +1984,8 @@ class BrainwaveStudio:
         # global one: the whole point of per-segment music is that each part
         # can sit at a different balance against its beat.
         seg = self.segments[i]
-        cur_db = 20.0 * math.log10(max(float(seg.get("music_level",
-                                                     self.music_level.get())), 1e-6))
+        cur_db = 20.0 * math.log10(max(float(seg.get(
+            "music_level", self._dget(self.music_level, 0.25))), 1e-6))
         beat_db = 20.0 * math.log10(max(float(seg.get("tone_level", 1.0)), 1e-6))
         db = simpledialog.askfloat(
             "Music level for this segment",
@@ -2164,16 +2200,18 @@ class BrainwaveStudio:
     def _start_stream_job(self, segments, path):
         """Stream `segments` to `path` in a worker thread, with progress + cancel.
         Non-WAV extensions are written to a temp WAV then converted (ffmpeg)."""
-        opts = dict(noise=self.noise.get(), noise_color=self.noise_color.get(),
-                    drone=self.drone_level.get(),
+        opts = dict(noise=self._dget(self.noise, 0.0),
+                    noise_color=self.noise_color.get(),
+                    drone=self._dget(self.drone_level, 0.0),
                     fade=3.0 if len(segments) > 1 else 2.0, xfade=2.0,
                     # The session bed is the GLOBAL music, not the left panel:
                     # the left panel now belongs to whichever segment is being
                     # edited, and each segment carries its own music inside it.
                     music=self.global_music,
                     music_level=self.global_music_level,
-                    duck=self.duck.get(),
-                    rot_rpm=self.rot_rpm.get(), rot_depth=self.rot_depth.get(),
+                    duck=self._dget(self.duck, 0.0),
+                    rot_rpm=self._dget(self.rot_rpm, 0.0),
+                    rot_depth=self._dget(self.rot_depth, 1.0),
                     level_drone=self.level_drone.get(),
                     level_noise=self.level_noise.get())
         self._cancel_ev = threading.Event()
@@ -2216,15 +2254,17 @@ class BrainwaveStudio:
     def _start_play_build(self):
         """Build the session preview audio in a worker thread (indeterminate bar)."""
         segments = [dict(s) for s in self.segments]
-        opts = dict(noise=self.noise.get(), noise_color=self.noise_color.get(),
-                    drone=self.drone_level.get(), fade=3.0, xfade=2.0,
+        opts = dict(noise=self._dget(self.noise, 0.0),
+                    noise_color=self.noise_color.get(),
+                    drone=self._dget(self.drone_level, 0.0), fade=3.0, xfade=2.0,
                     # The session bed is the GLOBAL music, not the left panel:
                     # the left panel now belongs to whichever segment is being
                     # edited, and each segment carries its own music inside it.
                     music=self.global_music,
                     music_level=self.global_music_level,
-                    duck=self.duck.get(),
-                    rot_rpm=self.rot_rpm.get(), rot_depth=self.rot_depth.get(),
+                    duck=self._dget(self.duck, 0.0),
+                    rot_rpm=self._dget(self.rot_rpm, 0.0),
+                    rot_depth=self._dget(self.rot_depth, 1.0),
                     level_drone=self.level_drone.get(),
                     level_noise=self.level_noise.get())
         self._cancel_ev = None
@@ -2298,18 +2338,25 @@ class BrainwaveStudio:
     # ---------------- single ----------------
     def _beat_value(self):
         if self.use_ramp.get():
-            return (self.beat.get(), self.beat_end.get())
-        return self.beat.get()
+            return (self._dget(self.beat, 6.0, "Beat"),
+                    self._dget(self.beat_end, 10.0, "Ramp to"))
+        return self._dget(self.beat, 6.0, "Beat")
 
     def _render(self, duration):
+        # Same guards as _current_segment: Play must not die because a field is
+        # momentarily empty while the user is typing in it.
         return self.tb.render(
-            self.mode.get(), self.carrier.get(), self._beat_value(), duration,
-            duty=self.duty.get(), noise=self.noise.get(),
-            noise_color=self.noise_color.get(), drone=self.drone_level.get(), fade=2.0,
-            music=self.music, music_level=self.music_level.get(), duck=self.duck.get(),
-            tone_level=10.0 ** (self.tone_db.get() / 20.0),
-            stereo_phase=self.stereo_phase.get(),
-            rot_rpm=self.rot_rpm.get(), rot_depth=self.rot_depth.get(),
+            self.mode.get(), self._dget(self.carrier, 200.0, "Carrier"),
+            self._beat_value(), duration,
+            duty=self._dget(self.duty, 0.5), noise=self._dget(self.noise, 0.0),
+            noise_color=self.noise_color.get(),
+            drone=self._dget(self.drone_level, 0.0), fade=2.0,
+            music=self.music, music_level=self._dget(self.music_level, 0.25),
+            duck=self._dget(self.duck, 0.0),
+            tone_level=10.0 ** (self._dget(self.tone_db, 0.0) / 20.0),
+            stereo_phase=self._dget(self.stereo_phase, 0.0),
+            rot_rpm=self._dget(self.rot_rpm, 0.0),
+            rot_depth=self._dget(self.rot_depth, 1.0),
             level_drone=self.level_drone.get(),
             level_noise=self.level_noise.get(),
             bowl_modes=self.bowl_modes)
@@ -2354,7 +2401,8 @@ class BrainwaveStudio:
         if not self._need_audio():
             return
         try:
-            dur = min(self.duration.get(), 12.0) if self.loop.get() else self.duration.get()
+            _d = self._dget(self.duration, 300.0, "Duration")
+            dur = min(_d, 12.0) if self.loop.get() else _d
             audio = self._render(dur)
             # Do NOT normalise to peak here. Peak normalisation rescales the
             # whole mix, so lowering the beat by 20 dB and then dividing by the
@@ -2370,7 +2418,8 @@ class BrainwaveStudio:
             pygame.mixer.stop()
             self._snd = pygame.sndarray.make_sound(data)
             self._snd.play(loops=-1 if self.loop.get() else 0)
-            self.status.set(f"Playing… {self.mode.get()} | {self.carrier.get():.0f} Hz")
+            self.status.set(f"Playing… {self.mode.get()} | "
+                            f"{self._dget(self.carrier, 200.0):.0f} Hz")
         except Exception as e:
             self.status.set(f"Playback error: {e}")
 
@@ -2382,7 +2431,8 @@ class BrainwaveStudio:
     def save(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".wav", filetypes=self.AUDIO_TYPES,
-            initialfile=f"{self.mode.get()}_{int(self.carrier.get())}Hz.wav")
+            initialfile=f"{self.mode.get()}_"
+                        f"{int(self._dget(self.carrier, 200.0))}Hz.wav")
         if not path:
             return
         try:
