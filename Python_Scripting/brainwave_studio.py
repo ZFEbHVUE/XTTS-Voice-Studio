@@ -34,6 +34,70 @@ except Exception:
 BANDS = {"Delta": 2.0, "Theta": 6.0, "Alpha": 10.0, "Beta": 18.0, "Gamma": 40.0}
 
 CHAKRAS = ["Root", "Sacral", "Plexus", "Heart", "Throat", "3rd eye", "Crown"]
+# The nine "sacred" Solfeggio frequencies as they circulate today. Only six are
+# historical (396-852, from the Guido d'Arezzo hymn); 174, 285 and 963 are
+# modern additions. The chakra mapping is modern too -- the Solfeggio come from
+# a Latin hymn, the chakras from Indian tantra, and pairing them one to one is
+# a convention, not a tradition. Offered for composition, measured by nothing.
+SOLFEGGIO_9 = [174.0, 285.0, 396.0, 417.0, 528.0, 639.0, 741.0, 852.0, 963.0]
+
+# What each frequency is CLAIMED to do, in the sound-healing literature. These
+# are beliefs, not findings: none of them rests on a medical or scientific
+# basis. They are listed so a user can find a frequency by intent instead of
+# having to know the numbers by heart -- not as an endorsement.
+SOLFEGGIO_CLAIMS = {
+    174.0: "pain relief, grounding",
+    285.0: "tissue regeneration",
+    396.0: "releasing fear and guilt",
+    417.0: "facilitating change",
+    528.0: "the 'miracle' frequency, love, transformation",
+    639.0: "relationships, communication",
+    741.0: "intuition, self-expression",
+    852.0: "spiritual order, higher intuition",
+    963.0: "pineal gland, divine connection",
+}
+
+SOLFEGGIO_NOTE = (
+    "The nine Solfeggio frequencies\n"
+    "\n"
+    "Sound waves used in sound therapy and meditation to encourage relaxation "
+    "and a sense of wellbeing.\n"
+    "\n"
+    "IMPORTANT. Popular though they are for reducing stress, these frequencies "
+    "rest on NO medical or scientific basis for treating any physical illness. "
+    "They must never replace medical treatment.\n"
+    "\n"
+    "Six of the nine are historical (396-852, from a Latin hymn attributed to "
+    "Guido d'Arezzo); 174, 285 and 963 are modern additions. Pairing them with "
+    "the seven chakras is modern too -- the chakras come from Indian tantra, "
+    "and the correspondence is a convention, not a tradition.\n"
+    "\n"
+    "The claimed virtues, as they circulate:\n"
+    "\n"
+    "  174 Hz  Pain relief. Said to ground, to ease physical pain and to bring "
+    "a feeling of safety.\n"
+    "  285 Hz  Tissue regeneration. Said to help repair tissue and harmonise "
+    "the body's energy field.\n"
+    "  396 Hz  Releasing fear. Said to help overcome guilt, anxiety and "
+    "unconscious emotional blocks.\n"
+    "  417 Hz  Facilitating change. Said to dispel negative energy and help "
+    "move past old trauma.\n"
+    "  528 Hz  The 'miracle' frequency, or frequency of love. The best known: "
+    "associated with transformation, deep peace, and -- in alternative-medicine "
+    "belief -- DNA repair.\n"
+    "  639 Hz  Harmonising relationships. Said to favour communication, empathy "
+    "and reconnection with others.\n"
+    "  741 Hz  Awakening intuition. Said to clear cells of toxins and to "
+    "stimulate self-expression.\n"
+    "  852 Hz  Return to spiritual order. Said to raise consciousness and "
+    "connect to a higher intuition.\n"
+    "  963 Hz  Divine connection. Called the pineal gland frequency; said to "
+    "aim at complete spiritual harmonisation.\n"
+    "\n"
+    "Every 'said to' above is exactly that. This tool renders the frequency "
+    "accurately; it makes no claim about what the frequency does."
+)
+
 TUNINGS = {
     "A=440 (notes)": [261.6, 293.7, 329.6, 349.2, 392.0, 440.0, 493.9],
     "C=256":         [256.0, 288.0, 320.0, 341.3, 384.0, 432.0, 480.0],
@@ -499,9 +563,18 @@ class ToneToolbox:
         strike = float(strike_s) if strike_s else max(6.0, duration / 4.0)
         out = np.zeros(n)
 
+        # The strike repeats by restarting the ENVELOPE, not by copying the
+        # first seconds of signal. Copying froze everything that evolves over
+        # the segment -- a beat ramp came out flat because samples past the
+        # first strike were a duplicate of the beginning. This also makes the
+        # in-memory path agree with the streaming one, which already did it
+        # this way.
+        longest_env = max((float(d) for _, _, d, _ in modes), default=strike) \
+            if modes else strike
+        tt = np.mod(t, max(longest_env, 1.0))
         if modes:
             for f, amp, dec, bt in modes:
-                env = np.exp(-t / max(float(dec), 0.05))
+                env = np.exp(-tt / max(float(dec), 0.05))
                 ph = 2.0 * np.pi * float(f) * t
                 out += amp * env * np.sin(ph)
                 if bt and bt > 0:
@@ -511,24 +584,19 @@ class ToneToolbox:
             longest = max((float(d) for _, _, d, _ in modes), default=strike)
         else:
             car = self._freq_array(carrier, n)
-            rel = float(beat[0] if isinstance(beat, tuple) else beat) / max(float(
-                carrier[0] if isinstance(carrier, tuple) else carrier), 1e-9)
+            # The detune must follow the beat SAMPLE BY SAMPLE, or a ramp is
+            # silently dropped: taking beat[0] alone made the bowl wobble at the
+            # starting rate for the whole segment while the panel showed a ramp.
+            bt = self._freq_array(beat, n)
+            rel = bt / np.maximum(car, 1e-9)
             for ratio, amp in BOWL_PARTIALS:
                 f = car * ratio
                 tau = strike / (1.0 + 1.4 * (ratio - 1.0))
-                env = np.exp(-t / max(tau, 0.05))
+                env = np.exp(-tt / max(tau, 0.05))
                 out += amp * env * np.sin(self._phase(f))
                 out += amp * env * np.sin(self._phase(f * (1.0 + rel)))
             longest = strike
 
-        # Re-strike so a long segment keeps ringing instead of fading to nothing.
-        period = int(max(longest, 1.0) * self.sr)
-        if period > 0 and n > period:
-            hits = np.zeros(n)
-            for start in range(0, n, period):
-                seg = out[:min(period, n - start)]
-                hits[start:start + len(seg)] += seg
-            out = hits
         at = min(int(0.004 * self.sr), n)          # audible strike
         if at > 1:
             out[:at] *= np.linspace(0.0, 1.0, at)
@@ -1424,11 +1492,30 @@ class BrainwaveStudio:
                    command=lambda: (txt.delete("1.0", "end"), _apply())).pack(side="left", padx=4)
 
     def _refresh_bowl_label(self):
+        # Fundamental/Warble availability depends on whether modes are loaded,
+        # so the mode handler has to run again whenever that changes.
+        try:
+            self._on_mode()
+        except Exception:
+            pass
         if self.bowl_modes:
             self.bowl_lbl.config(text=f"{len(self.bowl_modes)} modes "
                                       f"({self.bowl_modes[0][0]:g} Hz\u2026)")
         else:
             self.bowl_lbl.config(text="ratios")
+
+    def _show_solfeggio_note(self):
+        """What these frequencies are, and what they are not."""
+        win = tk.Toplevel(self.root)
+        win.title("Solfeggio frequencies")
+        win.transient(self.root)
+        txt = scrolledtext.ScrolledText(win, wrap="word", width=78, height=28,
+                                        padx=12, pady=12)
+        txt.grid(row=0, column=0)
+        txt.insert("1.0", SOLFEGGIO_NOTE)
+        txt.config(state="disabled")
+        ttk.Button(win, text="Close", command=win.destroy).grid(row=1, column=0,
+                                                                pady=(0, 10))
 
     def _show_honesty(self):
         """What this tool can and cannot claim. Same spirit as the TB-303 note:
@@ -1495,18 +1582,21 @@ class BrainwaveStudio:
         self.carrier_lbl = ttk.Label(frm, text="Carrier (Hz)")
         self.carrier_lbl.grid(row=r, column=0, sticky="w", **pad)
         self.carrier = tk.DoubleVar(value=200.0)
-        ttk.Spinbox(frm, from_=50, to=1100, increment=10, width=8,
-                    textvariable=self.carrier).grid(row=r, column=1, sticky="w", **pad)
+        self.carrier_spin = ttk.Spinbox(frm, from_=50, to=1100, increment=10, width=8,
+                                        textvariable=self.carrier)
+        self.carrier_spin.grid(row=r, column=1, sticky="w", **pad)
         r += 1
 
         self.beat_lbl = ttk.Label(frm, text="Beat (Hz)")
         self.beat_lbl.grid(row=r, column=0, sticky="w", **pad)
         self.beat = tk.DoubleVar(value=6.0)
-        ttk.Spinbox(frm, from_=0.5, to=40, increment=0.5, width=8,
-                    textvariable=self.beat).grid(row=r, column=1, sticky="w", **pad)
+        self.beat_spin = ttk.Spinbox(frm, from_=0.5, to=40, increment=0.5, width=8,
+                                     textvariable=self.beat)
+        self.beat_spin.grid(row=r, column=1, sticky="w", **pad)
         self.use_ramp = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Ramp to", variable=self.use_ramp,
-                        command=self._on_ramp).grid(row=r, column=2, sticky="e", **pad)
+        self.ramp_chk = ttk.Checkbutton(frm, text="Ramp to", variable=self.use_ramp,
+                                        command=self._on_ramp)
+        self.ramp_chk.grid(row=r, column=2, sticky="e", **pad)
         self.beat_end = tk.DoubleVar(value=10.0)
         self.ramp_spin = ttk.Spinbox(frm, from_=0.5, to=40, increment=0.5, width=8,
                                      textvariable=self.beat_end, state="disabled")
@@ -1537,6 +1627,41 @@ class BrainwaveStudio:
         ttk.Button(cf, text="Add all 7", width=9,
                    command=self.add_chakra_sequence).grid(row=0, column=len(CHAKRAS),
                                                           padx=(8, 1))
+        ttk.Button(cf, text="Add all 9", width=9,
+                   command=self.add_solfeggio_sequence).grid(
+                       row=0, column=len(CHAKRAS) + 1, padx=1)
+        r += 1
+
+        # Pick ONE Solfeggio frequency by intent. The chakra buttons only cover
+        # the seven of the selected tuning, so 174 and 285 -- which match no
+        # chakra in any convention -- were otherwise reachable only by typing
+        # the number, which means knowing it by heart.
+        ttk.Label(frm, text="Solfeggio (single)").grid(row=r, column=0,
+                                                       sticky="w", **pad)
+        frm_sol = ttk.Frame(frm)
+        frm_sol.grid(row=r, column=1, columnspan=3, sticky="w", **pad)
+        self.solfeggio_pick = tk.StringVar(value="")
+        _vals = [f"{f:g} Hz  \u2014  {SOLFEGGIO_CLAIMS[f]}" for f in SOLFEGGIO_9]
+        _cb = ttk.Combobox(frm_sol, textvariable=self.solfeggio_pick, width=44,
+                           state="readonly", values=_vals)
+        _cb.pack(side="left")
+
+        def _pick_solfeggio(*_):
+            s = self.solfeggio_pick.get()
+            if not s:
+                return
+            try:
+                self.carrier.set(float(s.split("Hz")[0].strip()))
+                self.status.set(f"Carrier set to {s}. Claimed effect only -- "
+                                f"see the note.")
+            except Exception:
+                pass
+        self.solfeggio_pick.trace_add("write", _pick_solfeggio)
+        ttk.Button(frm_sol, text="?", width=3,
+                   command=self._show_solfeggio_note).pack(side="left", padx=(6, 0))
+        ttk.Label(frm_sol, text="no medical basis \u2014 see ?",
+                  foreground="#8a6d00", font=("Arial", 8)).pack(side="left",
+                                                               padx=(6, 0))
         r += 1
 
         ttk.Label(frm, text="Duration (s)").grid(row=r, column=0, sticky="w", **pad)
@@ -1848,63 +1973,71 @@ class BrainwaveStudio:
             w.configure(foreground="black" if iso else "#aaa")
         self.carrier_lbl.configure(text="Fundamental (Hz)" if bowl else "Carrier (Hz)")
         self.beat_lbl.configure(text="Warble (Hz)" if bowl else "Beat (Hz)")
+        # A measured bowl IS its table of modes: each carries its own frequency
+        # and its own beat, so Fundamental and Warble are simply not read. They
+        # used to stay active and look as though they did something. (The chakra
+        # and Solfeggio buttons are the exception -- they transpose the whole
+        # table onto each step rather than replacing the fundamental.)
+        measured = bool(getattr(self, "bowl_modes", None)) and bowl
+        for w in (self.carrier_spin, self.beat_spin):
+            w.state(["disabled"] if measured else ["!disabled"])
+        for lbl, base in ((self.carrier_lbl, "Fundamental (Hz)" if bowl else "Carrier (Hz)"),
+                          (self.beat_lbl, "Warble (Hz)" if bowl else "Beat (Hz)")):
+            lbl.configure(foreground="#aaa" if measured else "black",
+                          text=base + (" \u2014 from modes" if measured else ""))
+        if hasattr(self, "ramp_chk"):
+            self.ramp_chk.state(["disabled"] if measured else ["!disabled"])
 
     def _on_ramp(self):
         self.ramp_spin.configure(state="normal" if self.use_ramp.get() else "disabled")
 
-    def add_chakra_sequence(self):
-        """Append one segment per chakra, in order, keeping every other setting.
+    def _add_frequency_sequence(self, freqs, labels, title, note=""):
+        """Append one segment per frequency, keeping every other left setting.
 
-        A sequence rather than a sweep: a bowl does not change pitch while it
-        rings -- its frequency comes from its geometry -- so a glissando would
-        sound like a speeded-up tape, not like seven bowls. Each chakra is its
-        own struck segment that decays before the next.
+        A sequence, not a sweep: a bowl does not change pitch while it rings --
+        its frequency comes from its geometry -- so a glissando would sound like
+        a speeded-up tape rather than like a set of bowls. Each entry is its own
+        struck segment that decays before the next.
 
-        The chakra frequencies are a tuning convention, not a measured
-        physiological fact; see "About the evidence".
+        Shared by the chakra and Solfeggio buttons: same machinery, different
+        tables, so the bowl transposition and the guard rails exist once.
         """
-        try:
-            table = TUNINGS[self.tuning.get()]
-        except Exception:
-            self.status.set("Pick a tuning first.")
-            return
         per = simpledialog.askfloat(
-            "Chakra sequence",
-            f"Duration of EACH of the {len(CHAKRAS)} segments, in seconds.\n\n"
-            f"Tuning: {self.tuning.get()}\n"
-            f"{', '.join(f'{n} {f:g}Hz' for n, f in zip(CHAKRAS, table))}\n\n"
+            title,
+            f"Duration of EACH of the {len(freqs)} segments, in seconds.\n\n"
+            f"{note}"
+            f"{', '.join(f'{n} {f:g}Hz' for n, f in zip(labels, freqs))}\n\n"
             f"Every other setting on the left is kept as it is.",
-            initialvalue=max(30.0, self._dget(self.duration, 300.0) / len(CHAKRAS)),
+            initialvalue=max(30.0, self._dget(self.duration, 300.0) / len(freqs)),
             minvalue=1.0, maxvalue=3600.0, parent=self.root)
         if per is None:
             return
         keep_carrier = self._dget(self.carrier, 200.0)
         keep_dur = self._dget(self.duration, 300.0)
         # With measured modes loaded, the carrier no longer sets the pitch --
-        # the modes do. Transposing them onto each chakra keeps the bowl's
+        # the modes do. Transposing them onto each step keeps the bowl's
         # identity (its ratios, decays and beat rates) while moving its
         # fundamental, which is what a set of tuned bowls actually is.
         base_modes = list(self.bowl_modes) if self.bowl_modes else None
-        stretch = None
         if base_modes:
             f0 = float(base_modes[0][0])
-            ks = [table[i] / f0 for i in range(len(CHAKRAS))]
+            ks = [f / f0 for f in freqs]
             stretch = max(max(ks), 1.0 / max(min(ks), 1e-9))
             if stretch > 2.0:
                 if not messagebox.askyesno(
                         "Large transposition",
                         f"The measured bowl's fundamental is {f0:g} Hz and this "
-                        f"tuning spans {table[0]:g}-{table[-1]:g} Hz, a factor of "
-                        f"{stretch:.1f}.\n\n"
+                        f"series spans {min(freqs):g}-{max(freqs):g} Hz, a factor "
+                        f"of {stretch:.1f}.\n\n"
                         f"Past about 2x the measured decays and beats stop "
                         f"describing the real bowl. Continue anyway?"):
                     return
         added = 0
-        for idx, name in enumerate(CHAKRAS):
-            self.carrier.set(table[idx])
+        for idx, name in enumerate(labels):
+            self.carrier.set(freqs[idx])
             self.duration.set(per)
             if base_modes:
-                self.bowl_modes = transpose_bowl_modes(base_modes, table[idx])
+                self.bowl_modes = transpose_bowl_modes(base_modes, freqs[idx])
             seg = self._current_segment()
             seg["chakra"] = name
             self.segments.append(seg)
@@ -1917,8 +2050,32 @@ class BrainwaveStudio:
             self.bowl_modes = base_modes
             self._refresh_bowl_label()
         self._update_total()
-        self.status.set(f"{added} chakra segments added "
-                        f"({per:g}s each, {added * per / 60:.1f} min total).")
+        self.status.set(f"{added} segments added ({per:g}s each, "
+                        f"{added * per / 60:.1f} min total).")
+
+    def add_chakra_sequence(self):
+        """One segment per chakra, at the frequencies of the selected tuning."""
+        try:
+            table = TUNINGS[self.tuning.get()]
+        except Exception:
+            self.status.set("Pick a tuning first.")
+            return
+        self._add_frequency_sequence(
+            list(table), list(CHAKRAS), "Chakra sequence",
+            note=f"Tuning: {self.tuning.get()}\n")
+
+    def add_solfeggio_sequence(self):
+        """The nine Solfeggio frequencies, 174 to 963 Hz.
+
+        Labelled by frequency rather than by chakra: 174 and 285 correspond to
+        no chakra in any convention, so naming them after one would invent a
+        correspondence that does not exist even in the modern mapping.
+        """
+        self._add_frequency_sequence(
+            list(SOLFEGGIO_9), [f"{f:g}Hz" for f in SOLFEGGIO_9],
+            "Solfeggio sequence (9)",
+            note="Six of these are historical (396-852); 174, 285 and 963 are\n"
+                 "modern additions. A composition convention, measured by nothing.\n\n")
 
     def _set_chakra(self, idx):
         self.carrier.set(TUNINGS[self.tuning.get()][idx])

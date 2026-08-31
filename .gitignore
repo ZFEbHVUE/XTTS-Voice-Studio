@@ -7,3 +7,4 @@ Voices_Cloning/*.wav
 *_old.py
 __pycache__/
 *.pyc
+RVC_datasets/
