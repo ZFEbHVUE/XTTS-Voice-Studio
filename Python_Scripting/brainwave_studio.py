@@ -344,6 +344,8 @@ def analyse_bowl_wav(path, sr_target=44100, max_modes=16,
 
 
 
+
+
 def transpose_bowl_modes(modes, target_hz, scale_decay=True):
     """Move a measured bowl to another fundamental, keeping its identity.
 
@@ -373,255 +375,11 @@ def transpose_bowl_modes(modes, target_hz, scale_decay=True):
     return out
 
 
-def analyse_bowl_wav(path, sr_target=44100, max_modes=16,
-                     floor_db=-55.0, min_amp=0.02):
-    """Extract a bowl's vibration modes from a recording.
-
-    Returns [(freq_hz, amp, decay_s, beat_hz), ...].
-
-    Method, and why each step: a struck bowl rings its modes at once, so the
-    spectrum of the whole take shows them as clear peaks -- that gives the
-    frequencies. Each mode is then band-pass filtered on its own and its
-    envelope followed: the slope of log(envelope) is the decay time, and the
-    envelope's own ripple is the beat rate (the split pair inside that mode).
-    Measuring the beat per mode is the point -- a single global beat is exactly
-    the approximation that made the synthetic bowl sound wrong.
-    """
-    import numpy as np
-    import soundfile as _sf
-    y, sr = _sf.read(path, dtype="float32", always_2d=False)
-    if getattr(y, "ndim", 1) > 1:
-        y = y.mean(axis=1)
-    if len(y) < sr // 2:
-        return []
-
-    # 1. Peaks of the long-term spectrum -> candidate mode frequencies
-    n = int(2 ** np.ceil(np.log2(min(len(y), sr * 8))))
-    seg = y[:n] * np.hanning(n)
-    mag = np.abs(np.fft.rfft(seg))
-    freqs = np.fft.rfftfreq(n, 1.0 / sr)
-    keep = (freqs > 60) & (freqs < min(6000, sr / 2 - 100))
-    mag, freqs = mag[keep], freqs[keep]
-    if not len(mag):
-        return []
-    peak = mag.max()
-    # -55 dB, not -38: the upper modes of a bowl are genuinely quiet (the third
-    # mode of the test bowl sits at -21 dB before smoothing and lower after) and
-    # a tighter floor simply drops them. Weak candidates are filtered later by
-    # amplitude and by the 3% spacing rule.
-    thr = peak * (10 ** (floor_db / 20.0))
-    # Smooth before peak-picking: each mode is a DOUBLET (f and f+beat), so raw
-    # bins wobble and a strict local-maximum test finds nothing. The smoothing
-    # width is a few bins -- wide enough to merge the pair, narrow enough to
-    # keep two distinct modes apart.
-    w = max(3, int(round(3.0 / max(freqs[1] - freqs[0], 1e-9))))
-    if w % 2 == 0:
-        w += 1
-    sm = np.convolve(mag, np.ones(w) / w, mode="same")
-    cand = []
-    for i in range(2, len(sm) - 2):
-        if sm[i] > thr and sm[i] >= sm[i-1] and sm[i] >= sm[i+1]:
-            # parabolic interpolation for sub-bin accuracy
-            # Parabolic interpolation for sub-bin accuracy. The denominator is
-            # near zero on a smoothed peak and can be NEGATIVE, so clamping it
-            # with max(x, 1e-12) turned it into a division by 1e-12 and threw
-            # the frequency into the millions. Guard on magnitude, and keep the
-            # correction inside one bin, which is all it can legitimately be.
-            a, b, c = sm[i-1], sm[i], sm[i+1]
-            den = a - 2.0 * b + c
-            d = 0.5 * (a - c) / den if abs(den) > 1e-9 else 0.0
-            d = float(np.clip(d, -0.5, 0.5))
-            cand.append((float(freqs[i] + d * (freqs[1] - freqs[0])), float(b)))
-    if not cand:
-        return []
-    cand.sort(key=lambda t: -t[1])
-    # drop peaks within 3% of a stronger one (same mode, adjacent bins)
-    picked = []
-    for f, a in cand:
-        if all(abs(f - pf) / pf > 0.03 for pf, _ in picked):
-            picked.append((f, a))
-        if len(picked) >= max_modes:
-            break
-    picked.sort(key=lambda t: t[0])
-    amax = max(a for _, a in picked)
-
-    # 2. Per-mode envelope -> decay time and beat rate
-    from numpy.fft import rfft as _rfft, rfftfreq as _rfreq
-    out = []
-    N = len(y)
-    Y = np.fft.rfft(y)
-    ff = np.fft.rfftfreq(N, 1.0 / sr)
-    for f, a in picked:
-        bw = max(12.0, f * 0.04)
-        band = np.zeros_like(Y)
-        m = (ff > f - bw) & (ff < f + bw)
-        band[m] = Y[m]
-        comp = np.fft.irfft(band, n=N)
-        env = np.abs(comp)
-        w = max(1, int(0.02 * sr))
-        env = np.convolve(env, np.ones(w) / w, mode="same")
-        if env.max() <= 0:
-            continue
-        # decay: slope of log envelope over the part that is still above noise
-        i0 = int(np.argmax(env))
-        tail = env[i0:]
-        good = tail > tail.max() * 0.08
-        k = int(np.sum(good))
-        if k > sr // 8:
-            t = np.arange(k) / sr
-            lg = np.log(np.maximum(tail[:k], 1e-12))
-            slope = np.polyfit(t, lg, 1)[0]
-            decay = float(-1.0 / slope) if slope < -1e-6 else 30.0
-        else:
-            decay = 30.0
-        decay = float(min(max(decay, 0.3), 120.0))
-        # beat: ripple frequency of that mode's own envelope
-        e = tail[:k] if k > sr // 4 else tail
-        e = e - e.mean()
-        if len(e) > sr // 2:
-            E = np.abs(_rfft(e * np.hanning(len(e))))
-            EF = _rfreq(len(e), 1.0 / sr)
-            band2 = (EF > 0.2) & (EF < 20.0)
-            beat = float(EF[band2][np.argmax(E[band2])]) if band2.any() else 0.0
-            if E[band2].max() < E.mean() * 3:
-                beat = 0.0                       # ripple not convincing
-        else:
-            beat = 0.0
-        # Seven fields, like everything else that handles modes: delivery and
-        # band default to the measured behaviour, ramp to none. Returning
-        # 4-tuples worked only because normalise_mode padded them, which hid
-        # the inconsistency until something unpacked the result directly.
-        out.append((round(f, 1), round(float(a / amax), 3),
-                    round(decay, 1), round(beat, 2), 0.0, "mono", "none", 0.0,
-                    0.5, 0.0, 0.0, 1.0))
-    return out
 
 
 
 
 
-def analyse_bowl_wav(path, sr_target=44100, max_modes=16,
-                     floor_db=-55.0, min_amp=0.02):
-    """Extract a bowl's vibration modes from a recording.
-
-    Returns [(freq_hz, amp, decay_s, beat_hz), ...].
-
-    Method, and why each step: a struck bowl rings its modes at once, so the
-    spectrum of the whole take shows them as clear peaks -- that gives the
-    frequencies. Each mode is then band-pass filtered on its own and its
-    envelope followed: the slope of log(envelope) is the decay time, and the
-    envelope's own ripple is the beat rate (the split pair inside that mode).
-    Measuring the beat per mode is the point -- a single global beat is exactly
-    the approximation that made the synthetic bowl sound wrong.
-    """
-    import numpy as np
-    import soundfile as _sf
-    y, sr = _sf.read(path, dtype="float32", always_2d=False)
-    if getattr(y, "ndim", 1) > 1:
-        y = y.mean(axis=1)
-    if len(y) < sr // 2:
-        return []
-
-    # 1. Peaks of the long-term spectrum -> candidate mode frequencies
-    n = int(2 ** np.ceil(np.log2(min(len(y), sr * 8))))
-    seg = y[:n] * np.hanning(n)
-    mag = np.abs(np.fft.rfft(seg))
-    freqs = np.fft.rfftfreq(n, 1.0 / sr)
-    keep = (freqs > 60) & (freqs < min(6000, sr / 2 - 100))
-    mag, freqs = mag[keep], freqs[keep]
-    if not len(mag):
-        return []
-    peak = mag.max()
-    # -55 dB, not -38: the upper modes of a bowl are genuinely quiet (the third
-    # mode of the test bowl sits at -21 dB before smoothing and lower after) and
-    # a tighter floor simply drops them. Weak candidates are filtered later by
-    # amplitude and by the 3% spacing rule.
-    thr = peak * (10 ** (floor_db / 20.0))
-    # Smooth before peak-picking: each mode is a DOUBLET (f and f+beat), so raw
-    # bins wobble and a strict local-maximum test finds nothing. The smoothing
-    # width is a few bins -- wide enough to merge the pair, narrow enough to
-    # keep two distinct modes apart.
-    w = max(3, int(round(3.0 / max(freqs[1] - freqs[0], 1e-9))))
-    if w % 2 == 0:
-        w += 1
-    sm = np.convolve(mag, np.ones(w) / w, mode="same")
-    cand = []
-    for i in range(2, len(sm) - 2):
-        if sm[i] > thr and sm[i] >= sm[i-1] and sm[i] >= sm[i+1]:
-            # parabolic interpolation for sub-bin accuracy
-            # Parabolic interpolation for sub-bin accuracy. The denominator is
-            # near zero on a smoothed peak and can be NEGATIVE, so clamping it
-            # with max(x, 1e-12) turned it into a division by 1e-12 and threw
-            # the frequency into the millions. Guard on magnitude, and keep the
-            # correction inside one bin, which is all it can legitimately be.
-            a, b, c = sm[i-1], sm[i], sm[i+1]
-            den = a - 2.0 * b + c
-            d = 0.5 * (a - c) / den if abs(den) > 1e-9 else 0.0
-            d = float(np.clip(d, -0.5, 0.5))
-            cand.append((float(freqs[i] + d * (freqs[1] - freqs[0])), float(b)))
-    if not cand:
-        return []
-    cand.sort(key=lambda t: -t[1])
-    # drop peaks within 3% of a stronger one (same mode, adjacent bins)
-    picked = []
-    for f, a in cand:
-        if all(abs(f - pf) / pf > 0.03 for pf, _ in picked):
-            picked.append((f, a))
-        if len(picked) >= max_modes:
-            break
-    picked.sort(key=lambda t: t[0])
-    amax = max(a for _, a in picked)
-
-    # 2. Per-mode envelope -> decay time and beat rate
-    from numpy.fft import rfft as _rfft, rfftfreq as _rfreq
-    out = []
-    N = len(y)
-    Y = np.fft.rfft(y)
-    ff = np.fft.rfftfreq(N, 1.0 / sr)
-    for f, a in picked:
-        bw = max(12.0, f * 0.04)
-        band = np.zeros_like(Y)
-        m = (ff > f - bw) & (ff < f + bw)
-        band[m] = Y[m]
-        comp = np.fft.irfft(band, n=N)
-        env = np.abs(comp)
-        w = max(1, int(0.02 * sr))
-        env = np.convolve(env, np.ones(w) / w, mode="same")
-        if env.max() <= 0:
-            continue
-        # decay: slope of log envelope over the part that is still above noise
-        i0 = int(np.argmax(env))
-        tail = env[i0:]
-        good = tail > tail.max() * 0.08
-        k = int(np.sum(good))
-        if k > sr // 8:
-            t = np.arange(k) / sr
-            lg = np.log(np.maximum(tail[:k], 1e-12))
-            slope = np.polyfit(t, lg, 1)[0]
-            decay = float(-1.0 / slope) if slope < -1e-6 else 30.0
-        else:
-            decay = 30.0
-        decay = float(min(max(decay, 0.3), 120.0))
-        # beat: ripple frequency of that mode's own envelope
-        e = tail[:k] if k > sr // 4 else tail
-        e = e - e.mean()
-        if len(e) > sr // 2:
-            E = np.abs(_rfft(e * np.hanning(len(e))))
-            EF = _rfreq(len(e), 1.0 / sr)
-            band2 = (EF > 0.2) & (EF < 20.0)
-            beat = float(EF[band2][np.argmax(E[band2])]) if band2.any() else 0.0
-            if E[band2].max() < E.mean() * 3:
-                beat = 0.0                       # ripple not convincing
-        else:
-            beat = 0.0
-        # Seven fields, like everything else that handles modes: delivery and
-        # band default to the measured behaviour, ramp to none. Returning
-        # 4-tuples worked only because normalise_mode padded them, which hid
-        # the inconsistency until something unpacked the result directly.
-        out.append((round(f, 1), round(float(a / amax), 3),
-                    round(decay, 1), round(beat, 2), 0.0, "mono", "none", 0.0,
-                    0.5, 0.0, 0.0, 1.0))
-    return out
 
 
 
@@ -1825,8 +1583,47 @@ class BrainwaveStudio:
 
     # ---------------- build ----------------
     def _build(self):
-        cont = ttk.Frame(self.root, padding=10)
-        cont.grid()
+        # The panel is wider and taller than a laptop screen once every control
+        # is on it, and as a notebook tab it cannot be resized freely. Wrapping
+        # the whole thing in a scrollable canvas means nothing is ever out of
+        # reach -- previously the lower rows and the right-hand columns simply
+        # could not be seen on a small display.
+        outer = ttk.Frame(self.root)
+        outer.grid(row=0, column=0, sticky="nsew")
+        try:
+            self.root.grid_rowconfigure(0, weight=1)
+            self.root.grid_columnconfigure(0, weight=1)
+        except Exception:
+            pass
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+        _cv = tk.Canvas(outer, highlightthickness=0)
+        _vs = ttk.Scrollbar(outer, orient="vertical", command=_cv.yview)
+        _hs = ttk.Scrollbar(outer, orient="horizontal", command=_cv.xview)
+        _cv.configure(yscrollcommand=_vs.set, xscrollcommand=_hs.set)
+        _cv.grid(row=0, column=0, sticky="nsew")
+        _vs.grid(row=0, column=1, sticky="ns")
+        _hs.grid(row=1, column=0, sticky="ew")
+
+        cont = ttk.Frame(_cv, padding=10)
+        _cv.create_window((0, 0), window=cont, anchor="nw")
+
+        def _fit(_e=None):
+            _cv.configure(scrollregion=_cv.bbox("all"))
+            # Ask for a window no larger than the content, so the panel does not
+            # open with acres of empty canvas around it.
+            try:
+                w = min(cont.winfo_reqwidth() + 24, 1400)
+                h = min(cont.winfo_reqheight() + 24, 900)
+                _cv.configure(width=w, height=h)
+            except Exception:
+                pass
+        cont.bind("<Configure>", _fit)
+
+        def _wheel(e):
+            _cv.yview_scroll(-1 if e.num == 4 or e.delta > 0 else 1, "units")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            _cv.bind_all(seq, _wheel)
         left = ttk.Frame(cont)
         left.grid(row=0, column=0, sticky="n")
         right = ttk.LabelFrame(cont, text="Session (segments)", padding=8)
@@ -1926,6 +1723,9 @@ class BrainwaveStudio:
         note_vals += [f"Sol {f:g}" for f in SOLFEGGIO_9]
 
         rows = []
+        # The last complete set of modes, so the threshold can be raised and
+        # lowered without losing anything.
+        full_set = [list(self.bowl_modes) if self.bowl_modes else []]
 
         def add_row(vals=None):
             (f, a, d, b, bdb, dl, bd, rp,
@@ -2058,6 +1858,7 @@ class BrainwaveStudio:
             if not modes:
                 pv.set("No usable line in that file.")
                 return
+            full_set[0] = list(modes)
             _fill(modes)
             pv.set(f"{len(modes)} mode(s) loaded from {os.path.basename(path)}")
 
@@ -2071,7 +1872,7 @@ class BrainwaveStudio:
             pv.set("Analysing\u2026")
             win.update_idletasks()
             try:
-                modes = analyse_bowl_wav(path)
+                modes = analyse_bowl_wav(path, min_amp=0.0)
             except Exception as e:
                 pv.set(f"Could not analyse: {e}")
                 return
@@ -2079,18 +1880,61 @@ class BrainwaveStudio:
                 pv.set("No clear mode found. Record a single strike, let it ring, "
                        "and keep the file free of other sounds.")
                 return
+            full_set[0] = list(modes)
             _fill(modes)
-            pv.set(f"{len(modes)} mode(s) measured from {os.path.basename(path)} "
-                   f"\u2014 check and adjust by ear.")
+            pv.set(f"{len(modes)} mode(s) measured from {os.path.basename(path)}. "
+                   f"Set a threshold above and press Apply to drop the faint "
+                   f"ones, then check by ear.")
+
+        # Threshold applied to whatever is in the table, not only to a fresh
+        # analysis: a measured bowl often shows a dozen faint peaks that are
+        # measurement noise rather than the instrument, and the useful cut
+        # depends on the recording. Editable, so it can be judged by ear.
+        tf = ttk.Frame(win)
+        tf.grid(row=3, column=0, sticky="w", padx=10, pady=(6, 0))
+        ttk.Label(tf, text="Keep modes \u2265").pack(side="left")
+        v_minamp = tk.StringVar(value="2")
+        ttk.Entry(tf, textvariable=v_minamp, width=5).pack(side="left", padx=2)
+        ttk.Label(tf, text="% of the strongest").pack(side="left")
+
+        def _apply_threshold():
+            # Filter from the FULL set kept aside, never from what is currently
+            # displayed: otherwise raising the threshold then lowering it again
+            # could not bring the modes back -- they had already been deleted.
+            got = full_set[0] or collect()
+            if not got:
+                pv.set("Nothing to filter.")
+                return
+            full_set[0] = got
+            try:
+                thr = float(v_minamp.get().strip().replace(",", ".")) / 100.0
+            except ValueError:
+                pv.set("Threshold must be a number.")
+                return
+            amax = max(mm[1] for mm in got) or 1.0
+            kept = [mm for mm in got if mm[1] / amax >= thr]
+            if not kept:
+                pv.set("That threshold removes every mode -- lower it.")
+                return
+            dropped = len(got) - len(kept)
+            _fill(kept)
+            pv.set(f"{len(kept)} of {len(got)} kept ({dropped} below "
+                   f"{thr * 100:g}%). Lower the threshold and Apply again to "
+                   f"bring them back.")
+
+        ttk.Button(tf, text="Apply", width=7,
+                   command=_apply_threshold).pack(side="left", padx=(8, 2))
 
         pf = ttk.Frame(win)
-        pf.grid(row=3, column=0, sticky="w", padx=10, pady=(6, 0))
+        pf.grid(row=4, column=0, sticky="w", padx=10, pady=(6, 0))
         ttk.Label(pf, text="Start from:").pack(side="left")
         for nm in BOWL_PRESETS:
             ttk.Button(pf, text=nm.replace("Generic ", ""), width=8,
                        command=lambda n=nm: _fill(BOWL_PRESETS[n])).pack(side="left", padx=2)
         ttk.Button(pf, text="+ row", width=7,
-                   command=lambda: add_row()).pack(side="left", padx=(10, 2))
+                   command=lambda: (add_row(),
+                                    full_set.__setitem__(0, []))).pack(side="left",
+                                                                      padx=(10, 2))
         ttk.Button(pf, text="Save\u2026", width=8,
                    command=_save).pack(side="left", padx=(14, 2))
         ttk.Button(pf, text="Load\u2026", width=8,
@@ -2111,7 +1955,7 @@ class BrainwaveStudio:
                 win.destroy()
 
         bf = ttk.Frame(win)
-        bf.grid(row=4, column=0, pady=(8, 10))
+        bf.grid(row=5, column=0, pady=(8, 10))
         ttk.Button(bf, text="Analyse a WAV\u2026", command=_from_wav).pack(side="left", padx=4)
         ttk.Button(bf, text="Check", command=lambda: _apply(False)).pack(side="left", padx=4)
         ttk.Button(bf, text="Use these modes", command=_apply).pack(side="left", padx=4)
