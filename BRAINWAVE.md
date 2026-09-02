@@ -148,21 +148,34 @@ rate**.
 
 ### Editing a bowl
 
-Select mode **Bowl**, then **`Edit bowl…`**. One mode per line:
+Select mode **Bowl**, then **`Edit bowl…`**. One row per vibration mode:
 
-```
-# freq_hz  amp  decay_s  beat_hz
-256   1.0   35   0.9
-704   0.55  12   2.1
-1326  0.32   5   3.4
-```
+| Column | What it is |
+|---|---|
+| `freq_hz` | the mode's frequency — the only required field |
+| `amp` | its loudness relative to the strongest mode |
+| `decay_s` | how long it rings; higher modes die first |
+| `beat_hz` | **this mode's own** beat rate |
+| `beat_dB` | how strongly it beats. 0 = full, −6 ≈ 74 %, −20 ≈ 36 % of modulation depth |
+| `delivery` | `mono` two tones summed · `bina` one per ear · `iso` the tone gated |
+| `band` | force the beat onto delta/theta/alpha/beta/gamma instead of the measured value |
+| `ramp_hz` | beat target at the end of the segment, 0 = steady |
+| `duty` | gate width — **iso only**, greyed otherwise |
+| `stereo` | gate offset between the ears — **iso only** |
+| `rot/min`, `depth` | this mode's own slow constant-power pan |
+| `note → freq` | pick a named frequency (any tuning × chakra, or a Solfeggio) to fill `freq_hz` |
 
-Only the frequency is required — amplitude 1.0, a decay scaled from the
-fundamental and no beat are assumed. A bare list of frequencies read off a
-phone analyser is already usable.
+Every row is independent: one partial can beat binaurally in theta while another
+pulses isochronically and a third simply rings.
 
-Three starting presets (small / medium / large), **Check** to see what was
-understood before applying, **Clear** to return to the ratio-based bowl.
+`Save…` and `Load…` write a readable `.bowl` file, so a measured instrument
+outlives the segment it was used in. Three starting presets (small / medium /
+large), `+ row` to add one, `✕` to remove one, `Check` to see what was
+understood before applying, `Clear` to return to the ratio-based bowl.
+
+Short tables still work: a 4-column list — or a bare column of frequencies read
+off a phone analyser — parses fine, the later fields taking the values that
+reproduce the plain measured behaviour.
 
 ### Measuring your own bowl
 
@@ -183,10 +196,14 @@ Validated against a synthetic bowl with known values:
 
 Frequencies to better than 0.2 %.
 
+Modes below **2 %** of the strongest one are dropped: that far down the analyser
+is picking up measurement noise rather than the bowl, and those rows arrive with
+tell-tale nonsense — a 1700 Hz partial ringing for 30 s (the fallback value when
+the decay fit fails), or the same mode found twice a few Hz apart. On a real
+recording this took a 16-row table back to the 8 modes that carry the sound.
+
 **For a good recording:** one strike, let it ring to the end, nothing else in
 the file. The longer the tail, the more accurate the decay times.
-
----
 
 ### A sequence of chakras
 

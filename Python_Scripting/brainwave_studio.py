@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 brainwave_studio.py — Standalone GUI: binaural / isochronic / monaural
 tones + Tibetan bowl, band & chakra presets (3 tuning systems),
@@ -209,7 +208,8 @@ BOWL_PRESETS = {
 
 
 
-def analyse_bowl_wav(path, sr_target=44100, max_modes=8, floor_db=-55.0):
+def analyse_bowl_wav(path, sr_target=44100, max_modes=16,
+                     floor_db=-55.0, min_amp=0.02):
     """Extract a bowl's vibration modes from a recording.
 
     Returns [(freq_hz, amp, decay_s, beat_hz), ...].
@@ -322,8 +322,24 @@ def analyse_bowl_wav(path, sr_target=44100, max_modes=8, floor_db=-55.0):
                 beat = 0.0                       # ripple not convincing
         else:
             beat = 0.0
-        out.append((round(f, 1), round(float(a / amax), 3),
-                    round(decay, 1), round(beat, 2)))
+        # Seven fields, like everything else that handles modes: delivery and
+        # band default to the measured behaviour, ramp to none. Returning
+        # 4-tuples worked only because normalise_mode padded them, which hid
+        # the inconsistency until something unpacked the result directly.
+        rel = float(a / amax)
+        # Below a couple of percent of the strongest mode we are picking up
+        # measurement noise, not the bowl: those rows come with tell-tale
+        # nonsense such as a 1700 Hz partial ringing for 30 s (the fallback
+        # value when the decay fit fails) or the same mode found twice a few
+        # Hz apart. Dropping them keeps the table readable and changes nothing
+        # audible -- raise min_amp to 0 to see everything.
+        if rel < min_amp:
+            continue
+        out.append((round(f, 1), round(rel, 3),
+                    round(decay, 1), round(beat, 2), 0.0, "mono", "none", 0.0,
+                    0.5, 0.0, 0.0, 1.0))
+    if not out:
+        return []
     return out
 
 
@@ -334,62 +350,420 @@ def transpose_bowl_modes(modes, target_hz, scale_decay=True):
     A bowl's character lives in the RATIOS between its modes, their decays and
     their beat rates -- not in its absolute pitch. Scaling all of it by one
     factor is the same as playing a bowl of a different size from the same
-    workshop, which is exactly what a set of tuned bowls is.
+    workshop, which is what a set of tuned bowls is.
 
-    What scales with the factor k:
-      - every mode frequency (by definition)
-      - every beat rate: the detuning is a fraction of the mode, so it follows
-      - the decays, if scale_decay: a smaller bowl rings shorter. Physically the
-        radiated power rises with frequency, so decay goes roughly as 1/k. Pass
-        False to keep the measured decays as they are.
-
-    Amplitudes are left alone: they describe how the bowl was struck.
+    A beat forced onto a band is NOT scaled: it was chosen, not measured, so it
+    stays where it was put. Neither are the per-mode levels, duty, stereo offset
+    or rotation -- those are choices too.
     """
     if not modes or not target_hz or target_hz <= 0:
         return list(modes or [])
-    f0 = float(modes[0][0])
+    f0 = float(normalise_mode(modes[0])[0])
     if f0 <= 0:
         return list(modes)
     k = float(target_hz) / f0
     out = []
-    for f, a, d, b in modes:
-        nd = (float(d) / k) if (scale_decay and k > 0) else float(d)
-        out.append((round(float(f) * k, 1), float(a),
-                    round(max(nd, 0.05), 2), round(float(b) * k, 2)))
+    for mm in modes:
+        f, a, d, b, bdb, dl, bd, rp, du, sp, rr, rd = normalise_mode(mm)
+        nd = (d / k) if (scale_decay and k > 0) else d
+        nb = b if bd in BANDS else b * k
+        nr = rp if bd in BANDS else rp * k
+        out.append((round(f * k, 1), a, round(max(nd, 0.05), 2), round(nb, 2),
+                    bdb, dl, bd, round(nr, 2), du, sp, rr, rd))
     return out
 
 
-def parse_bowl_modes(text):
-    """Read a bowl table: one mode per line, 'freq amp decay beat'.
+def analyse_bowl_wav(path, sr_target=44100, max_modes=16,
+                     floor_db=-55.0, min_amp=0.02):
+    """Extract a bowl's vibration modes from a recording.
 
-    Amplitude, decay and beat are optional and fall back to sensible values, so
-    a bare list of frequencies measured with a phone is already usable.
+    Returns [(freq_hz, amp, decay_s, beat_hz), ...].
+
+    Method, and why each step: a struck bowl rings its modes at once, so the
+    spectrum of the whole take shows them as clear peaks -- that gives the
+    frequencies. Each mode is then band-pass filtered on its own and its
+    envelope followed: the slope of log(envelope) is the decay time, and the
+    envelope's own ripple is the beat rate (the split pair inside that mode).
+    Measuring the beat per mode is the point -- a single global beat is exactly
+    the approximation that made the synthetic bowl sound wrong.
+    """
+    import numpy as np
+    import soundfile as _sf
+    y, sr = _sf.read(path, dtype="float32", always_2d=False)
+    if getattr(y, "ndim", 1) > 1:
+        y = y.mean(axis=1)
+    if len(y) < sr // 2:
+        return []
+
+    # 1. Peaks of the long-term spectrum -> candidate mode frequencies
+    n = int(2 ** np.ceil(np.log2(min(len(y), sr * 8))))
+    seg = y[:n] * np.hanning(n)
+    mag = np.abs(np.fft.rfft(seg))
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    keep = (freqs > 60) & (freqs < min(6000, sr / 2 - 100))
+    mag, freqs = mag[keep], freqs[keep]
+    if not len(mag):
+        return []
+    peak = mag.max()
+    # -55 dB, not -38: the upper modes of a bowl are genuinely quiet (the third
+    # mode of the test bowl sits at -21 dB before smoothing and lower after) and
+    # a tighter floor simply drops them. Weak candidates are filtered later by
+    # amplitude and by the 3% spacing rule.
+    thr = peak * (10 ** (floor_db / 20.0))
+    # Smooth before peak-picking: each mode is a DOUBLET (f and f+beat), so raw
+    # bins wobble and a strict local-maximum test finds nothing. The smoothing
+    # width is a few bins -- wide enough to merge the pair, narrow enough to
+    # keep two distinct modes apart.
+    w = max(3, int(round(3.0 / max(freqs[1] - freqs[0], 1e-9))))
+    if w % 2 == 0:
+        w += 1
+    sm = np.convolve(mag, np.ones(w) / w, mode="same")
+    cand = []
+    for i in range(2, len(sm) - 2):
+        if sm[i] > thr and sm[i] >= sm[i-1] and sm[i] >= sm[i+1]:
+            # parabolic interpolation for sub-bin accuracy
+            # Parabolic interpolation for sub-bin accuracy. The denominator is
+            # near zero on a smoothed peak and can be NEGATIVE, so clamping it
+            # with max(x, 1e-12) turned it into a division by 1e-12 and threw
+            # the frequency into the millions. Guard on magnitude, and keep the
+            # correction inside one bin, which is all it can legitimately be.
+            a, b, c = sm[i-1], sm[i], sm[i+1]
+            den = a - 2.0 * b + c
+            d = 0.5 * (a - c) / den if abs(den) > 1e-9 else 0.0
+            d = float(np.clip(d, -0.5, 0.5))
+            cand.append((float(freqs[i] + d * (freqs[1] - freqs[0])), float(b)))
+    if not cand:
+        return []
+    cand.sort(key=lambda t: -t[1])
+    # drop peaks within 3% of a stronger one (same mode, adjacent bins)
+    picked = []
+    for f, a in cand:
+        if all(abs(f - pf) / pf > 0.03 for pf, _ in picked):
+            picked.append((f, a))
+        if len(picked) >= max_modes:
+            break
+    picked.sort(key=lambda t: t[0])
+    amax = max(a for _, a in picked)
+
+    # 2. Per-mode envelope -> decay time and beat rate
+    from numpy.fft import rfft as _rfft, rfftfreq as _rfreq
+    out = []
+    N = len(y)
+    Y = np.fft.rfft(y)
+    ff = np.fft.rfftfreq(N, 1.0 / sr)
+    for f, a in picked:
+        bw = max(12.0, f * 0.04)
+        band = np.zeros_like(Y)
+        m = (ff > f - bw) & (ff < f + bw)
+        band[m] = Y[m]
+        comp = np.fft.irfft(band, n=N)
+        env = np.abs(comp)
+        w = max(1, int(0.02 * sr))
+        env = np.convolve(env, np.ones(w) / w, mode="same")
+        if env.max() <= 0:
+            continue
+        # decay: slope of log envelope over the part that is still above noise
+        i0 = int(np.argmax(env))
+        tail = env[i0:]
+        good = tail > tail.max() * 0.08
+        k = int(np.sum(good))
+        if k > sr // 8:
+            t = np.arange(k) / sr
+            lg = np.log(np.maximum(tail[:k], 1e-12))
+            slope = np.polyfit(t, lg, 1)[0]
+            decay = float(-1.0 / slope) if slope < -1e-6 else 30.0
+        else:
+            decay = 30.0
+        decay = float(min(max(decay, 0.3), 120.0))
+        # beat: ripple frequency of that mode's own envelope
+        e = tail[:k] if k > sr // 4 else tail
+        e = e - e.mean()
+        if len(e) > sr // 2:
+            E = np.abs(_rfft(e * np.hanning(len(e))))
+            EF = _rfreq(len(e), 1.0 / sr)
+            band2 = (EF > 0.2) & (EF < 20.0)
+            beat = float(EF[band2][np.argmax(E[band2])]) if band2.any() else 0.0
+            if E[band2].max() < E.mean() * 3:
+                beat = 0.0                       # ripple not convincing
+        else:
+            beat = 0.0
+        # Seven fields, like everything else that handles modes: delivery and
+        # band default to the measured behaviour, ramp to none. Returning
+        # 4-tuples worked only because normalise_mode padded them, which hid
+        # the inconsistency until something unpacked the result directly.
+        out.append((round(f, 1), round(float(a / amax), 3),
+                    round(decay, 1), round(beat, 2), 0.0, "mono", "none", 0.0,
+                    0.5, 0.0, 0.0, 1.0))
+    return out
+
+
+
+
+
+def analyse_bowl_wav(path, sr_target=44100, max_modes=16,
+                     floor_db=-55.0, min_amp=0.02):
+    """Extract a bowl's vibration modes from a recording.
+
+    Returns [(freq_hz, amp, decay_s, beat_hz), ...].
+
+    Method, and why each step: a struck bowl rings its modes at once, so the
+    spectrum of the whole take shows them as clear peaks -- that gives the
+    frequencies. Each mode is then band-pass filtered on its own and its
+    envelope followed: the slope of log(envelope) is the decay time, and the
+    envelope's own ripple is the beat rate (the split pair inside that mode).
+    Measuring the beat per mode is the point -- a single global beat is exactly
+    the approximation that made the synthetic bowl sound wrong.
+    """
+    import numpy as np
+    import soundfile as _sf
+    y, sr = _sf.read(path, dtype="float32", always_2d=False)
+    if getattr(y, "ndim", 1) > 1:
+        y = y.mean(axis=1)
+    if len(y) < sr // 2:
+        return []
+
+    # 1. Peaks of the long-term spectrum -> candidate mode frequencies
+    n = int(2 ** np.ceil(np.log2(min(len(y), sr * 8))))
+    seg = y[:n] * np.hanning(n)
+    mag = np.abs(np.fft.rfft(seg))
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    keep = (freqs > 60) & (freqs < min(6000, sr / 2 - 100))
+    mag, freqs = mag[keep], freqs[keep]
+    if not len(mag):
+        return []
+    peak = mag.max()
+    # -55 dB, not -38: the upper modes of a bowl are genuinely quiet (the third
+    # mode of the test bowl sits at -21 dB before smoothing and lower after) and
+    # a tighter floor simply drops them. Weak candidates are filtered later by
+    # amplitude and by the 3% spacing rule.
+    thr = peak * (10 ** (floor_db / 20.0))
+    # Smooth before peak-picking: each mode is a DOUBLET (f and f+beat), so raw
+    # bins wobble and a strict local-maximum test finds nothing. The smoothing
+    # width is a few bins -- wide enough to merge the pair, narrow enough to
+    # keep two distinct modes apart.
+    w = max(3, int(round(3.0 / max(freqs[1] - freqs[0], 1e-9))))
+    if w % 2 == 0:
+        w += 1
+    sm = np.convolve(mag, np.ones(w) / w, mode="same")
+    cand = []
+    for i in range(2, len(sm) - 2):
+        if sm[i] > thr and sm[i] >= sm[i-1] and sm[i] >= sm[i+1]:
+            # parabolic interpolation for sub-bin accuracy
+            # Parabolic interpolation for sub-bin accuracy. The denominator is
+            # near zero on a smoothed peak and can be NEGATIVE, so clamping it
+            # with max(x, 1e-12) turned it into a division by 1e-12 and threw
+            # the frequency into the millions. Guard on magnitude, and keep the
+            # correction inside one bin, which is all it can legitimately be.
+            a, b, c = sm[i-1], sm[i], sm[i+1]
+            den = a - 2.0 * b + c
+            d = 0.5 * (a - c) / den if abs(den) > 1e-9 else 0.0
+            d = float(np.clip(d, -0.5, 0.5))
+            cand.append((float(freqs[i] + d * (freqs[1] - freqs[0])), float(b)))
+    if not cand:
+        return []
+    cand.sort(key=lambda t: -t[1])
+    # drop peaks within 3% of a stronger one (same mode, adjacent bins)
+    picked = []
+    for f, a in cand:
+        if all(abs(f - pf) / pf > 0.03 for pf, _ in picked):
+            picked.append((f, a))
+        if len(picked) >= max_modes:
+            break
+    picked.sort(key=lambda t: t[0])
+    amax = max(a for _, a in picked)
+
+    # 2. Per-mode envelope -> decay time and beat rate
+    from numpy.fft import rfft as _rfft, rfftfreq as _rfreq
+    out = []
+    N = len(y)
+    Y = np.fft.rfft(y)
+    ff = np.fft.rfftfreq(N, 1.0 / sr)
+    for f, a in picked:
+        bw = max(12.0, f * 0.04)
+        band = np.zeros_like(Y)
+        m = (ff > f - bw) & (ff < f + bw)
+        band[m] = Y[m]
+        comp = np.fft.irfft(band, n=N)
+        env = np.abs(comp)
+        w = max(1, int(0.02 * sr))
+        env = np.convolve(env, np.ones(w) / w, mode="same")
+        if env.max() <= 0:
+            continue
+        # decay: slope of log envelope over the part that is still above noise
+        i0 = int(np.argmax(env))
+        tail = env[i0:]
+        good = tail > tail.max() * 0.08
+        k = int(np.sum(good))
+        if k > sr // 8:
+            t = np.arange(k) / sr
+            lg = np.log(np.maximum(tail[:k], 1e-12))
+            slope = np.polyfit(t, lg, 1)[0]
+            decay = float(-1.0 / slope) if slope < -1e-6 else 30.0
+        else:
+            decay = 30.0
+        decay = float(min(max(decay, 0.3), 120.0))
+        # beat: ripple frequency of that mode's own envelope
+        e = tail[:k] if k > sr // 4 else tail
+        e = e - e.mean()
+        if len(e) > sr // 2:
+            E = np.abs(_rfft(e * np.hanning(len(e))))
+            EF = _rfreq(len(e), 1.0 / sr)
+            band2 = (EF > 0.2) & (EF < 20.0)
+            beat = float(EF[band2][np.argmax(E[band2])]) if band2.any() else 0.0
+            if E[band2].max() < E.mean() * 3:
+                beat = 0.0                       # ripple not convincing
+        else:
+            beat = 0.0
+        # Seven fields, like everything else that handles modes: delivery and
+        # band default to the measured behaviour, ramp to none. Returning
+        # 4-tuples worked only because normalise_mode padded them, which hid
+        # the inconsistency until something unpacked the result directly.
+        out.append((round(f, 1), round(float(a / amax), 3),
+                    round(decay, 1), round(beat, 2), 0.0, "mono", "none", 0.0,
+                    0.5, 0.0, 0.0, 1.0))
+    return out
+
+
+
+def _mode_fields(m):
+    """Normalise a mode row to 7 fields, accepting the old 4-field form.
+
+    (freq, amp, decay, beat, delivery, beat_ref, ramp_to)
+
+    delivery : how THIS partial is presented -- 'mono' sums the detuned pair in
+               both ears (a real acoustic beat), 'binaural' sends one tone to
+               each ear, 'isochronic' gates the partial on and off.
+    beat_ref : a band name that REPLACES the measured beat, so a bowl can be
+               driven at theta or alpha instead of its own geometry. Empty or
+               'none' keeps what was measured.
+    ramp_to  : end value of a beat ramp over the segment; 0 means no ramp.
+    """
+    m = tuple(m) + ("", "", 0.0)
+    f, a, d, b = float(m[0]), float(m[1]), float(m[2]), float(m[3])
+    dl = str(m[4] or "mono").lower()
+    if dl not in BOWL_DELIVERY:
+        dl = "mono"
+    ref = str(m[5] or "").strip()
+    ramp = float(m[6] or 0.0)
+    # A band name overrides the measured beat: this is composition, not the
+    # bowl's own physics, which is why it is opt-in per partial.
+    if ref and ref.lower() not in ("none", "-", ""):
+        for k, v in BANDS.items():
+            if k.lower() == ref.lower():
+                b = float(v)
+                break
+    return f, a, d, b, dl, ref, ramp
+
+
+# How a mode's beat is delivered. 'none' keeps the measured pair (two close
+# frequencies summed in both ears -- a real acoustic beat, which is what a bowl
+# actually does). The others impose a delivery on that partial.
+MODE_DELIVERY = ("none", "binaural", "isochronic", "monaural")
+
+
+def parse_bowl_modes(text):
+    """Read a bowl table. One mode per line, whitespace separated:
+
+        freq_hz amp decay_s beat_hz beat_dB delivery band ramp_hz
+        duty stereo_phase rot_rpm rot_depth
+
+    Only the frequency is required; every later field falls back to the value
+    that reproduces the plain measured behaviour. A 4-column table -- or a bare
+    list of frequencies off a phone analyser -- still parses.
+
+      beat_dB  : level of the beating partner, relative to the mode. 0 = full
+                 beating, -20 = a shimmer. Each mode can beat as strongly or as
+                 discreetly as you like.
+      delivery : mono (two tones summed) | bina (one per ear) | iso (gated)
+      band     : force the beat onto delta/theta/alpha/beta/gamma instead of the
+                 measured value. The bowl then stops being the bowl that was
+                 measured -- a composition choice, not a measurement.
+      ramp_hz  : beat target at the end of the segment, 0 = steady
+      duty     : gate width, iso only
+      stereo_phase : offset of the gate between ears, iso only
+      rot_rpm / rot_depth : this mode's own slow pan
     """
     modes = []
     for raw in (text or "").splitlines():
         line = raw.split("#")[0].strip().replace(",", " ")
         if not line:
             continue
-        parts = line.split()
+        p = line.split()
         try:
-            f = float(parts[0])
+            f = float(p[0])
         except ValueError:
             continue
         if f <= 0:
             continue
-        a = float(parts[1]) if len(parts) > 1 else 1.0
-        # Higher modes radiate more and die sooner; a rough default when the
-        # user only typed frequencies.
-        d = float(parts[2]) if len(parts) > 2 else max(2.0, 40.0 * (modes and
-              modes[0][0] or f) / f)
-        b = float(parts[3]) if len(parts) > 3 else 0.0
-        modes.append((f, max(0.0, a), max(0.05, d), max(0.0, b)))
+
+        def num(i, default):
+            try:
+                return float(p[i])
+            except (IndexError, ValueError):
+                return default
+
+        a = num(1, 1.0)
+        d = num(2, max(2.0, 40.0 * (modes[0][0] if modes else f) / f))
+        b = num(3, 0.0)
+        bdb = num(4, 0.0)
+        dl = p[5].lower() if len(p) > 5 else "mono"
+        if dl not in ("mono", "bina", "iso"):
+            dl = "mono"
+        bd = p[6].capitalize() if len(p) > 6 else "none"
+        if bd not in BANDS:
+            bd = "none"
+        modes.append((f, max(0.0, a), max(0.05, d), max(0.0, b),
+                      min(0.0, bdb), dl, bd, max(0.0, num(7, 0.0)),
+                      min(0.9, max(0.1, num(8, 0.5))),
+                      min(0.5, max(0.0, num(9, 0.0))),
+                      max(0.0, num(10, 0.0)),
+                      min(1.0, max(0.0, num(11, 1.0)))))
     return modes
 
 
+def mode_beat(mode, duration, sr, n):
+    """The beat curve for one mode: measured value, or a forced band, ramped.
+
+    Returns an array so a ramp is followed sample by sample -- reading only the
+    start value is exactly the bug that made ramps come out flat.
+    """
+    f, a, d, b, bdb, dl, bd, rp = normalise_mode(mode)[:8]
+    start = float(BANDS[bd]) if bd in BANDS else float(b)
+    end = float(rp) if rp > 0 else start
+    if abs(end - start) < 1e-9:
+        return np.full(n, start)
+    return np.linspace(start, end, n)
+
+
+def normalise_mode(mode):
+    """Accept a short mode and always hand back twelve fields.
+
+    freq, amp, decay_s, beat_hz, beat_db, delivery, band, ramp_hz,
+    duty, stereo_phase, rot_rpm, rot_depth
+
+    Old 4- and 7-field tables still parse: the extra fields take the values
+    that reproduce the previous behaviour, so nothing that worked stops
+    working.
+    """
+    d = [None, 1.0, 10.0, 0.0, 0.0, "mono", "none", 0.0, 0.5, 0.0, 0.0, 1.0]
+    m = list(mode) + d[len(mode):]
+    return (float(m[0]), float(m[1]), float(m[2]), float(m[3]), float(m[4]),
+            str(m[5]), str(m[6]), float(m[7]), float(m[8]), float(m[9]),
+            float(m[10]), float(m[11]))
+
+
 def bowl_modes_to_text(modes):
-    head = "# freq_hz  amp  decay_s  beat_hz\n"
-    return head + "\n".join(f"{f:g} {a:g} {d:g} {b:g}" for f, a, d, b in modes)
+    head = "# freq_hz  amp  decay_s  beat_hz  delivery  band  ramp_to\n"
+    out = []
+    for m in modes:
+        f, a, d, b = m[0], m[1], m[2], m[3]
+        dl = m[4] if len(m) > 4 else "none"
+        bd = m[5] if len(m) > 5 else "none"
+        rp = m[6] if len(m) > 6 else 0.0
+        out.append(f"{f:g} {a:g} {d:g} {b:g} {dl} {bd} {rp:g}")
+    return head + "\n".join(out)
+
+
 
 
 
@@ -569,19 +943,62 @@ class ToneToolbox:
         # first strike were a duplicate of the beginning. This also makes the
         # in-memory path agree with the streaming one, which already did it
         # this way.
-        longest_env = max((float(d) for _, _, d, _ in modes), default=strike) \
+        longest_env = max((normalise_mode(mm)[2] for mm in modes), default=strike) \
             if modes else strike
         tt = np.mod(t, max(longest_env, 1.0))
+        outL = outR = None
         if modes:
-            for f, amp, dec, bt in modes:
-                env = np.exp(-tt / max(float(dec), 0.05))
-                ph = 2.0 * np.pi * float(f) * t
-                out += amp * env * np.sin(ph)
-                if bt and bt > 0:
-                    # The mode's twin, offset by its OWN beat rate: this pair is
-                    # what produces the pulsing, one rate per mode.
-                    out += amp * env * np.sin(2.0 * np.pi * (float(f) + float(bt)) * t)
-            longest = max((float(d) for _, _, d, _ in modes), default=strike)
+            # Per-mode delivery means the bowl can be genuinely stereo: one
+            # partial beating binaurally while another beats acoustically. So
+            # the two channels are built separately and only collapsed at the
+            # end if nothing asked for a difference.
+            outL = np.zeros(n)
+            outR = np.zeros(n)
+            for mm in modes:
+                (f, amp, dec, b0, bdb, deliv, band, rp,
+                 duty_m, sph_m, rr_m, rd_m) = normalise_mode(mm)
+                env = np.exp(-tt / max(dec, 0.05))
+                bt = mode_beat(mm, duration, self.sr, n)
+                # Phase from the cumulative frequency, so a ramp is followed
+                # instead of being read once at its start value.
+                ph = 2.0 * np.pi * np.cumsum(np.full(n, f)) / self.sr
+                # Level of the beating partner: 0 dB gives full beating, -20 dB
+                # a shimmer. It is the modulation depth of THIS mode.
+                gb = 10.0 ** (bdb / 20.0)
+                mL = np.zeros(n)
+                mR = np.zeros(n)
+                if not bool(np.any(bt > 0)):
+                    mL = mR = amp * env * np.sin(ph)
+                elif deliv == "bina":
+                    ph2 = 2.0 * np.pi * np.cumsum(f + bt) / self.sr
+                    mL = amp * env * np.sin(ph)
+                    mR = amp * env * gb * np.sin(ph2)
+                elif deliv == "iso":
+                    frac = np.mod(np.cumsum(bt) / self.sr, 1.0)
+                    du = min(0.9, max(0.1, duty_m))
+                    g1 = np.where(frac < du, np.sin(np.pi * frac / du) ** 2, 0.0)
+                    base = amp * env * np.sin(ph)
+                    # A gate that never fully closes when beat_dB is below 0:
+                    # the tone stays, only the pulsing gets shallower.
+                    mL = base * (gb + (1.0 - gb) * g1) if gb < 1 else base * g1
+                    if abs(sph_m) > 1e-6:
+                        f2 = np.mod(frac + sph_m, 1.0)
+                        g2 = np.where(f2 < du, np.sin(np.pi * f2 / du) ** 2, 0.0)
+                        mR = base * (gb + (1.0 - gb) * g2) if gb < 1 else base * g2
+                    else:
+                        mR = mL
+                else:                                   # mono: two tones summed
+                    ph2 = 2.0 * np.pi * np.cumsum(f + bt) / self.sr
+                    mL = mR = amp * env * (np.sin(ph) + gb * np.sin(ph2))
+                # This mode's own slow pan, constant power so the level never
+                # dips as the image travels.
+                if rr_m > 0 and rd_m > 0:
+                    pan = rd_m * np.sin(2.0 * np.pi * (rr_m / 60.0) * t)
+                    ang = (pan + 1.0) * (np.pi / 4.0)
+                    mL, mR = mL * np.cos(ang), mR * np.sin(ang)
+                outL += mL
+                outR += mR
+            longest = longest_env
         else:
             car = self._freq_array(carrier, n)
             # The detune must follow the beat SAMPLE BY SAMPLE, or a ramp is
@@ -598,6 +1015,13 @@ class ToneToolbox:
             longest = strike
 
         at = min(int(0.004 * self.sr), n)          # audible strike
+        if outL is not None:
+            if at > 1:
+                ramp = np.linspace(0.0, 1.0, at)
+                outL[:at] *= ramp
+                outR[:at] *= ramp
+            peak = max(np.max(np.abs(outL)), np.max(np.abs(outR))) or 1.0
+            return self.amp * np.stack([outL / peak, outR / peak], axis=1)
         if at > 1:
             out[:at] *= np.linspace(0.0, 1.0, at)
         out /= (np.max(np.abs(out)) or 1.0)
@@ -837,26 +1261,64 @@ class ToneToolbox:
             bmodes = seg.get("bowl_modes")
             t0 = 0
             if bmodes:
-                ph = np.zeros(2 * len(bmodes))
-                norm = 1.0 / (2.0 * max(sum(a for _, a, _, _ in bmodes), 1e-9))
-                longest = max(d for _, _, d, _ in bmodes)
+                nm = [normalise_mode(mm) for mm in bmodes]
+                ph = np.zeros(2 * len(nm))
+                norm = 1.0 / (2.0 * max(sum(mm[1] for mm in nm), 1e-9))
+                longest = max(mm[2] for mm in nm)
+                # Beat curves are computed over the WHOLE segment then sliced,
+                # so a ramp is continuous across blocks instead of restarting.
+                curves = [mode_beat(mm, seg["duration"], self.sr, n) for mm in bmodes]
+                gate_acc = np.zeros(len(nm))
                 for i0 in range(0, n, block):
                     i1 = min(n, i0 + block)
-                    tt = (t0 + np.arange(i1 - i0)) / self.sr
-                    tt = np.mod(tt, max(longest, 1.0))      # re-strike
-                    out = np.zeros(i1 - i0)
-                    for j, (f, amp, dec, bt) in enumerate(bmodes):
+                    ln = i1 - i0
+                    tt = np.mod((t0 + np.arange(ln)) / self.sr, max(longest, 1.0))
+                    oL = np.zeros(ln)
+                    oR = np.zeros(ln)
+                    for j, (f, amp, dec, b0, bdb, deliv, band, rp,
+                            duty_m, sph_m, rr_m, rd_m) in enumerate(nm):
                         env = np.exp(-tt / max(dec, 0.05))
-                        p1 = ph[2 * j] + two_pi * f * np.arange(1, i1 - i0 + 1) / self.sr
-                        out += amp * env * np.sin(p1)
+                        bt = curves[j][i0:i1]
+                        p1 = ph[2 * j] + two_pi * f * np.arange(1, ln + 1) / self.sr
                         ph[2 * j] = p1[-1] % two_pi
-                        if bt and bt > 0:
-                            p2 = ph[2 * j + 1] + two_pi * (f + bt) * np.arange(1, i1 - i0 + 1) / self.sr
-                            out += amp * env * np.sin(p2)
+                        s1 = amp * env * np.sin(p1)
+                        if not np.any(bt > 0):
+                            oL += s1
+                            oR += s1
+                            continue
+                        gb = 10.0 ** (bdb / 20.0)
+                        if deliv == "iso":
+                            frac = np.mod(gate_acc[j] + np.cumsum(bt) / self.sr, 1.0)
+                            gate_acc[j] = (gate_acc[j] + np.sum(bt) / self.sr) % 1.0
+                            du = min(0.9, max(0.1, duty_m))
+                            g = np.where(frac < du,
+                                         np.sin(np.pi * frac / du) ** 2, 0.0)
+                            gl = s1 * (gb + (1.0 - gb) * g) if gb < 1 else s1 * g
+                            if abs(sph_m) > 1e-6:
+                                f2 = np.mod(frac + sph_m, 1.0)
+                                g2 = np.where(f2 < du,
+                                              np.sin(np.pi * f2 / du) ** 2, 0.0)
+                                gr = s1 * (gb + (1.0 - gb) * g2) if gb < 1 else s1 * g2
+                            else:
+                                gr = gl
+                            mL, mR = gl, gr
+                        else:
+                            p2 = ph[2 * j + 1] + two_pi * np.cumsum(f + bt) / self.sr
                             ph[2 * j + 1] = p2[-1] % two_pi
-                    t0 += (i1 - i0)
-                    sig = self.amp * out * norm
-                    yield np.stack([sig, sig], axis=1)
+                            s2 = amp * env * gb * np.sin(p2)
+                            if deliv == "bina":
+                                mL, mR = s1, s2
+                            else:
+                                mL = mR = s1 + s2
+                        if rr_m > 0 and rd_m > 0:
+                            tabs = (t0 + np.arange(ln)) / self.sr
+                            pan = rd_m * np.sin(2.0 * np.pi * (rr_m / 60.0) * tabs)
+                            ang = (pan + 1.0) * (np.pi / 4.0)
+                            mL, mR = mL * np.cos(ang), mR * np.sin(ang)
+                        oL += mL
+                        oR += mR
+                    t0 += ln
+                    yield self.amp * norm * np.stack([oL, oR], axis=1)
                 return
             nppart = len(BOWL_PARTIALS)
             ph = np.zeros(2 * nppart)
@@ -1407,66 +1869,203 @@ class BrainwaveStudio:
 
 
     def edit_bowl(self):
-        """Edit the bowl as a table of measured vibration modes.
+        """Edit the bowl as a TABLE of vibration modes, one row per mode.
 
         A real bowl is not a harmonic series: its modes sit at frequencies that
         are not integer multiples, each with its own decay and its own beat rate
         (the hammered shape is never perfectly circular, so every mode splits
-        into a close pair). Measuring one with a phone analyser gives exactly
-        this table, so the table is what the tool takes.
+        into a close pair). Measuring one gives the first four columns.
+
+        The rest turn the measurement into an instrument. Every row is
+        independent: one partial can beat binaurally in theta while another
+        pulses isochronically and a third simply rings.
         """
         win = tk.Toplevel(self.root)
         win.title("Bowl modes")
         win.transient(self.root)
+        win.grid_rowconfigure(1, weight=1)
+        win.grid_columnconfigure(0, weight=1)
 
-        tk.Label(win, justify="left", anchor="w", padx=10, pady=8,
-                 text="One mode per line:   freq_hz  amp  decay_s  beat_hz\n"
-                      "Only the frequency is required -- amp 1.0, a decay scaled\n"
-                      "from the fundamental and no beat are assumed.\n"
-                      "beat_hz is that mode's own pulsing (0 = steady)."
-                 ).grid(row=0, column=0, columnspan=3, sticky="w")
+        tk.Label(win, justify="left", anchor="w",
+                 text="One row per vibration mode. Only the frequency is "
+                      "required; every other field has a sensible default.\n"
+                      "band overrides the measured beat  |  duty and stereo "
+                      "apply to iso only  |  beat dB sets how strongly that "
+                      "mode beats."
+                 ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
 
-        txt = scrolledtext.ScrolledText(win, width=46, height=12,
-                                        font=("Courier", 10))
-        txt.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 6))
-        txt.insert("1.0", bowl_modes_to_text(self.bowl_modes) if self.bowl_modes
-                   else "# freq_hz  amp  decay_s  beat_hz\n")
+        holder = ttk.Frame(win)
+        holder.grid(row=1, column=0, padx=10, sticky="nsew")
+        holder.grid_rowconfigure(0, weight=1)
+        holder.grid_columnconfigure(0, weight=1)
+        canvas = tk.Canvas(holder, width=980, height=280, highlightthickness=0)
+        vsb = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        hsb = ttk.Scrollbar(holder, orient="horizontal", command=canvas.xview)
+        grid = ttk.Frame(canvas)
+        grid.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=grid, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        cols = [("freq_hz", 9), ("amp", 6), ("decay_s", 7), ("beat_hz", 7),
+                ("beat_dB", 7), ("delivery", 8), ("band", 7), ("ramp_hz", 7),
+                ("duty", 6), ("stereo", 6), ("rot/min", 7), ("depth", 6),
+                ("note \u2192 freq", 15)]
+        for c, (name, w) in enumerate(cols):
+            ttk.Label(grid, text=name, width=w,
+                      font=("Arial", 8, "bold")).grid(row=0, column=c, padx=1, pady=2)
+
+        # every named frequency the tool knows, so a mode can be set from a note
+        note_vals = [""]
+        for tn, tab in TUNINGS.items():
+            for nm, fq in zip(CHAKRAS, tab):
+                note_vals.append(f"{tn[:3]} {nm} {fq:g}")
+        note_vals += [f"Sol {f:g}" for f in SOLFEGGIO_9]
+
+        rows = []
+
+        def add_row(vals=None):
+            (f, a, d, b, bdb, dl, bd, rp,
+             du, sp, rr, rd) = normalise_mode(vals or (0.0,))
+            r = len(rows) + 1
+            ws = []
+            for c, v, w in ((0, f"{f:g}" if f else "", 9), (1, f"{a:g}", 6),
+                            (2, f"{d:g}", 7), (3, f"{b:g}", 7), (4, f"{bdb:g}", 7)):
+                e = ttk.Entry(grid, width=w)
+                e.insert(0, v)
+                e.grid(row=r, column=c, padx=1, pady=1)
+                ws.append(e)
+            cb_d = ttk.Combobox(grid, width=7, state="readonly",
+                                values=["mono", "bina", "iso"])
+            cb_d.set(dl); cb_d.grid(row=r, column=5, padx=1)
+            cb_b = ttk.Combobox(grid, width=6, state="readonly",
+                                values=["none"] + list(BANDS))
+            cb_b.set(bd); cb_b.grid(row=r, column=6, padx=1)
+            ws += [cb_d, cb_b]
+            for c, v, w in ((7, f"{rp:g}", 7), (8, f"{du:g}", 6), (9, f"{sp:g}", 6),
+                            (10, f"{rr:g}", 7), (11, f"{rd:g}", 6)):
+                e = ttk.Entry(grid, width=w)
+                e.insert(0, v)
+                e.grid(row=r, column=c, padx=1, pady=1)
+                ws.append(e)
+            cb_n = ttk.Combobox(grid, width=14, state="readonly", values=note_vals)
+            cb_n.grid(row=r, column=12, padx=1)
+
+            def _note(_e=None, _f=ws[0], _cb=cb_n):
+                s = _cb.get().split()
+                if s:
+                    _f.delete(0, "end")
+                    _f.insert(0, s[-1])
+            cb_n.bind("<<ComboboxSelected>>", _note)
+
+            def _grey(*_a, _d=cb_d, _duty=ws[8], _sph=ws[9]):
+                # duty and stereo offset only exist for a gated tone; leaving
+                # them live would suggest they act in mono or binaural.
+                st = "normal" if _d.get() == "iso" else "disabled"
+                _duty.configure(state=st)
+                _sph.configure(state=st)
+            cb_d.bind("<<ComboboxSelected>>", _grey)
+            _grey()
+
+            btn = ttk.Button(grid, text="\u2715", width=3)
+            btn.grid(row=r, column=13, padx=2)
+            entry = {"w": ws + [cb_n], "btn": btn}
+
+            def _del():
+                for x in entry["w"]:
+                    x.destroy()
+                btn.destroy()
+                if entry in rows:
+                    rows.remove(entry)
+            btn.configure(command=_del)
+            rows.append(entry)
+
+        def _fill(modes):
+            for e in list(rows):
+                for x in e["w"]:
+                    x.destroy()
+                e["btn"].destroy()
+                rows.remove(e)
+            for mm in modes:
+                add_row(mm)
+
+        for mm in (self.bowl_modes or []):
+            add_row(mm)
+        if not rows:
+            add_row()
 
         pv = tk.StringVar(value="")
-        ttk.Label(win, textvariable=pv, foreground="#555").grid(
-            row=2, column=0, columnspan=3, sticky="w", padx=10)
+        ttk.Label(win, textvariable=pv, foreground="#555", wraplength=960,
+                  justify="left").grid(row=2, column=0, sticky="w", padx=10,
+                                       pady=(6, 0))
 
-        def _preset(name):
-            txt.delete("1.0", "end")
-            txt.insert("1.0", bowl_modes_to_text(BOWL_PRESETS[name]))
+        def collect():
+            got = []
+            for e in rows:
+                w = e["w"]
 
-        pf = ttk.Frame(win)
-        pf.grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
-        ttk.Label(pf, text="Start from:").pack(side="left")
-        for nm in BOWL_PRESETS:
-            ttk.Button(pf, text=nm.replace("Generic ", ""), width=8,
-                       command=lambda n=nm: _preset(n)).pack(side="left", padx=2)
+                def num(widget, default):
+                    try:
+                        return float(widget.get().strip().replace(",", "."))
+                    except Exception:
+                        return default
+                f = num(w[0], 0.0)
+                if f <= 0:
+                    continue
+                got.append((f, max(0.0, num(w[1], 1.0)), max(0.05, num(w[2], 10.0)),
+                            max(0.0, num(w[3], 0.0)), min(0.0, num(w[4], 0.0)),
+                            w[5].get(), w[6].get(), max(0.0, num(w[7], 0.0)),
+                            min(0.9, max(0.1, num(w[8], 0.5))),
+                            min(0.5, max(0.0, num(w[9], 0.0))),
+                            max(0.0, num(w[10], 0.0)),
+                            min(1.0, max(0.0, num(w[11], 1.0)))))
+            return got
 
-        def _apply(close=True):
-            modes = parse_bowl_modes(txt.get("1.0", "end"))
+        # ── files ────────────────────────────────────────────────────────────
+        def _save():
+            got = collect()
+            if not got:
+                pv.set("Nothing to save.")
+                return
+            path = filedialog.asksaveasfilename(
+                title="Save bowl", defaultextension=".bowl",
+                filetypes=[("Bowl", "*.bowl"), ("Text", "*.txt")],
+                initialfile="bowl.bowl", parent=win)
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(bowl_modes_to_text(got) + "\n")
+                pv.set(f"Saved {len(got)} mode(s) to {os.path.basename(path)}")
+            except Exception as e:
+                pv.set(f"Could not save: {e}")
+
+        def _load():
+            path = filedialog.askopenfilename(
+                title="Load bowl",
+                filetypes=[("Bowl", "*.bowl *.txt"), ("All files", "*.*")],
+                parent=win)
+            if not path:
+                return
+            try:
+                modes = parse_bowl_modes(open(path, encoding="utf-8").read())
+            except Exception as e:
+                pv.set(f"Could not read: {e}")
+                return
             if not modes:
-                pv.set("No usable line -- the ratio-based bowl will be used.")
-                self.bowl_modes = []
-            else:
-                self.bowl_modes = modes
-                pv.set(f"{len(modes)} mode(s): "
-                       + ", ".join(f"{f:g}Hz" for f, _, _, _ in modes[:6]))
-            self._refresh_bowl_label()
-            if close:
-                win.destroy()
+                pv.set("No usable line in that file.")
+                return
+            _fill(modes)
+            pv.set(f"{len(modes)} mode(s) loaded from {os.path.basename(path)}")
 
-        bf = ttk.Frame(win)
-        bf.grid(row=4, column=0, columnspan=3, pady=(0, 10))
         def _from_wav():
             path = filedialog.askopenfilename(
                 title="Recording of a struck bowl",
                 filetypes=[("Audio", "*.wav *.flac *.aiff *.aif *.ogg *.mp3"),
-                           ("All files", "*.*")])
+                           ("All files", "*.*")], parent=win)
             if not path:
                 return
             pv.set("Analysing\u2026")
@@ -1480,16 +2079,44 @@ class BrainwaveStudio:
                 pv.set("No clear mode found. Record a single strike, let it ring, "
                        "and keep the file free of other sounds.")
                 return
-            txt.delete("1.0", "end")
-            txt.insert("1.0", bowl_modes_to_text(modes))
-            pv.set(f"{len(modes)} mode(s) measured from "
-                   f"{os.path.basename(path)} \u2014 check and adjust by ear.")
+            _fill(modes)
+            pv.set(f"{len(modes)} mode(s) measured from {os.path.basename(path)} "
+                   f"\u2014 check and adjust by ear.")
 
+        pf = ttk.Frame(win)
+        pf.grid(row=3, column=0, sticky="w", padx=10, pady=(6, 0))
+        ttk.Label(pf, text="Start from:").pack(side="left")
+        for nm in BOWL_PRESETS:
+            ttk.Button(pf, text=nm.replace("Generic ", ""), width=8,
+                       command=lambda n=nm: _fill(BOWL_PRESETS[n])).pack(side="left", padx=2)
+        ttk.Button(pf, text="+ row", width=7,
+                   command=lambda: add_row()).pack(side="left", padx=(10, 2))
+        ttk.Button(pf, text="Save\u2026", width=8,
+                   command=_save).pack(side="left", padx=(14, 2))
+        ttk.Button(pf, text="Load\u2026", width=8,
+                   command=_load).pack(side="left", padx=2)
+
+        def _apply(close=True):
+            got = collect()
+            if not got:
+                pv.set("No usable row -- the ratio-based bowl will be used.")
+                self.bowl_modes = []
+            else:
+                self.bowl_modes = got
+                forced = [f"{m[0]:g}Hz={m[6]}" for m in got if m[6] in BANDS]
+                pv.set(f"{len(got)} mode(s)"
+                       + (f"; forced: {', '.join(forced)}" if forced else ""))
+            self._refresh_bowl_label()
+            if close:
+                win.destroy()
+
+        bf = ttk.Frame(win)
+        bf.grid(row=4, column=0, pady=(8, 10))
         ttk.Button(bf, text="Analyse a WAV\u2026", command=_from_wav).pack(side="left", padx=4)
         ttk.Button(bf, text="Check", command=lambda: _apply(False)).pack(side="left", padx=4)
         ttk.Button(bf, text="Use these modes", command=_apply).pack(side="left", padx=4)
         ttk.Button(bf, text="Clear (use ratios)",
-                   command=lambda: (txt.delete("1.0", "end"), _apply())).pack(side="left", padx=4)
+                   command=lambda: (_fill([]), _apply())).pack(side="left", padx=4)
 
     def _refresh_bowl_label(self):
         # Fundamental/Warble availability depends on whether modes are loaded,
