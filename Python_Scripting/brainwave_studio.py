@@ -479,17 +479,28 @@ def parse_bowl_modes(text):
     return modes
 
 
-def mode_beat(mode, duration, sr, n):
+def mode_beat(mode, duration, sr, n, cycle_s=None):
     """The beat curve for one mode: measured value, or a forced band, ramped.
 
     Returns an array so a ramp is followed sample by sample -- reading only the
     start value is exactly the bug that made ramps come out flat.
+
+    cycle_s repeats the ramp on that period instead of spreading it over the
+    whole segment. Without it a 6->40 Hz ramp in a 300 s segment takes five
+    minutes and is inaudible, while the same ramp in the 12 s looped preview is
+    obvious -- the preview was promising something the segment never delivered.
+    With the bowl this also matches what the ear expects: the ramp restarts on
+    each strike, like the envelope.
     """
     f, a, d, b, bdb, dl, bd, rp = normalise_mode(mode)[:8]
     start = float(BANDS[bd]) if bd in BANDS else float(b)
     end = float(rp) if rp > 0 else start
     if abs(end - start) < 1e-9:
         return np.full(n, start)
+    if cycle_s and cycle_s > 0:
+        t = np.arange(n) / float(sr)
+        frac = np.mod(t, float(cycle_s)) / float(cycle_s)
+        return start + (end - start) * frac
     return np.linspace(start, end, n)
 
 
@@ -716,7 +727,11 @@ class ToneToolbox:
                 (f, amp, dec, b0, bdb, deliv, band, rp,
                  duty_m, sph_m, rr_m, rd_m) = normalise_mode(mm)
                 env = np.exp(-tt / max(dec, 0.05))
-                bt = mode_beat(mm, duration, self.sr, n)
+                # The ramp restarts with each strike: the envelope resets on
+                # `longest_env`, so the beat does too. Otherwise a long segment
+                # spread the ramp over minutes and it vanished.
+                bt = mode_beat(mm, duration, self.sr, n,
+                               cycle_s=longest_env)
                 # Phase from the cumulative frequency, so a ramp is followed
                 # instead of being read once at its start value.
                 ph = 2.0 * np.pi * np.cumsum(np.full(n, f)) / self.sr
@@ -1025,7 +1040,8 @@ class ToneToolbox:
                 longest = max(mm[2] for mm in nm)
                 # Beat curves are computed over the WHOLE segment then sliced,
                 # so a ramp is continuous across blocks instead of restarting.
-                curves = [mode_beat(mm, seg["duration"], self.sr, n) for mm in bmodes]
+                curves = [mode_beat(mm, seg["duration"], self.sr, n,
+                                    cycle_s=longest) for mm in bmodes]
                 gate_acc = np.zeros(len(nm))
                 for i0 in range(0, n, block):
                     i1 = min(n, i0 + block)
@@ -2618,6 +2634,25 @@ class BrainwaveStudio:
     def _seg_label(self, seg):
         b = seg["beat"]
         bs = f"{b[0]:.1f}->{b[1]:.1f}" if isinstance(b, tuple) else f"{b:.1f}"
+        # With measured modes the carrier and beat of the main panel are not
+        # read at all -- each mode carries its own. Showing them anyway made the
+        # line claim "200Hz | 6.0Hz" while the bowl was actually ringing at its
+        # own frequencies with its own ramps, so there was no way to tell what
+        # was driving the sound.
+        bm = seg.get("bowl_modes")
+        if bm:
+            nm = [normalise_mode(x) for x in bm]
+            f0 = nm[0][0]
+            forced = sorted({x[6] for x in nm if x[6] in BANDS})
+            ramped = sum(1 for x in nm if x[7] > 0)
+            det = f"{len(nm)} modes {f0:.0f}Hz+"
+            if forced:
+                det += " " + "/".join(forced)
+            if ramped:
+                det += f" {ramped} ramp"
+            head = f"{seg['mode'][:4]:4s} | {det}"
+        else:
+            head = (f"{seg['mode'][:4]:4s} | {seg['carrier']:.0f}Hz | {bs}Hz")
         # Both levels are shown in dB: what matters in a mix is the gap between
         # them, and a gap is only readable on one scale.
         tl = float(seg.get("tone_level", 1.0))
@@ -2646,8 +2681,7 @@ class BrainwaveStudio:
                    f"{20.0 * math.log10(max(ml, 1e-6)):+.0f}dB")
         else:
             mus = ""
-        return (f"{seg['mode'][:4]:4s} | {seg['carrier']:.0f}Hz | "
-                f"{bs}Hz | {seg['duration']:.0f}s{chk}{lvl}{rot}{extra}{mus}")
+        return (f"{head} | {seg['duration']:.0f}s{chk}{lvl}{rot}{extra}{mus}")
 
     def set_global_music(self):
         """The bed under the WHOLE session, on top of any per-segment music.
