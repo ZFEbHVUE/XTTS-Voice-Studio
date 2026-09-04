@@ -18,6 +18,9 @@ XTTS Voice Studio is a personal production suite for:
 - **Transcribing** audio and video to XTTS-ready scripts
 - **Separating voices** by gender from mixed audio sources
 - **Converting video** to audio in various formats
+- **Generating binaural, isochronic and monaural beats** and physically modelled
+  singing bowls, as multi-segment sessions with per-mode control — see
+  [BRAINWAVE.md](BRAINWAVE.md)
 
 Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) or directly from the command line.
 

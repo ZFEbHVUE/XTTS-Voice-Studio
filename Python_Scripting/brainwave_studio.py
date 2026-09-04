@@ -522,14 +522,13 @@ def normalise_mode(mode):
 
 
 def bowl_modes_to_text(modes):
-    head = "# freq_hz  amp  decay_s  beat_hz  delivery  band  ramp_to\n"
+    head = ("# freq_hz amp decay_s beat_hz beat_dB delivery band ramp_hz "
+           "duty stereo rot_rpm rot_depth\n")
     out = []
-    for m in modes:
-        f, a, d, b = m[0], m[1], m[2], m[3]
-        dl = m[4] if len(m) > 4 else "none"
-        bd = m[5] if len(m) > 5 else "none"
-        rp = m[6] if len(m) > 6 else 0.0
-        out.append(f"{f:g} {a:g} {d:g} {b:g} {dl} {bd} {rp:g}")
+    for mm in modes:
+        f, a, d, b, bdb, dl, bd, rp, du, sp, rr, rd = normalise_mode(mm)
+        out.append(f"{f:g} {a:g} {d:g} {b:g} {bdb:g} {dl} {bd} {rp:g} "
+                   f"{du:g} {sp:g} {rr:g} {rd:g}")
     return head + "\n".join(out)
 
 
@@ -611,19 +610,46 @@ def validate_segment(seg):
 
 
 def segments_to_text(segments):
-    """Serialize a list of segments into copyable Python code."""
+    """Serialize a list of segments into copyable Python code.
+
+    Everything a segment carries is written, not just the first few fields: a
+    session saved with a measured bowl, a rotation or a per-segment drone must
+    come back as it was. Only values that differ from the default are emitted,
+    so a plain segment stays a short readable line.
+    """
     lines = ["segments = ["]
     for s in segments:
         b = s["beat"]
         bs = f"({b[0]:g}, {b[1]:g})" if isinstance(b, tuple) else f"{b:g}"
-        duty = f', "duty": {s["duty"]:g}' if s.get("mode") == "isochronic" else ""
-        tl = (f', "tone_level": {s["tone_level"]:g}'
-              if abs(float(s.get("tone_level", 1.0)) - 1.0) > 1e-9 else "")
-        mus = (f', "music": {s["music"]!r}, "music_level": {s.get("music_level", 0.25):g}'
-               if s.get("music") else "")
-        lines.append(
-            f'    {{"mode": "{s["mode"]}", "carrier": {s["carrier"]:g}, '
-            f'"beat": {bs}, "duration": {s["duration"]:g}{duty}{tl}{mus}}},')
+        parts = [f'"mode": "{s["mode"]}"', f'"carrier": {s["carrier"]:g}',
+                 f'"beat": {bs}', f'"duration": {s["duration"]:g}']
+        if s.get("mode") == "isochronic":
+            parts.append(f'"duty": {s.get("duty", 0.5):g}')
+        for key, default in (("stereo_phase", 0.0), ("tone_level", 1.0),
+                             ("rot_rpm", 0.0), ("rot_depth", 1.0),
+                             ("drone", 0.0), ("noise", 0.0), ("duck", 0.0)):
+            v = float(s.get(key, default))
+            if abs(v - default) > 1e-9:
+                parts.append(f'"{key}": {v:g}')
+        if float(s.get("noise", 0.0)) > 0:
+            parts.append(f'"noise_color": {s.get("noise_color", "pink")!r}')
+        for flag in ("level_drone", "level_noise"):
+            if s.get(flag):
+                parts.append(f'"{flag}": True')
+        if s.get("tuning"):
+            parts.append(f'"tuning": {s["tuning"]!r}')
+        if s.get("chakra"):
+            parts.append(f'"chakra": {s["chakra"]!r}')
+        if s.get("bowl_modes"):
+            mm = ", ".join(
+                "(" + ", ".join(f"{x!r}" if isinstance(x, str) else f"{x:g}"
+                                for x in normalise_mode(one)) + ")"
+                for one in s["bowl_modes"])
+            parts.append(f'"bowl_modes": [{mm}]')
+        if s.get("music"):
+            parts.append(f'"music": {s["music"]!r}')
+            parts.append(f'"music_level": {s.get("music_level", 0.25):g}')
+        lines.append("    {" + ", ".join(parts) + "},")
     lines.append("]")
     return "\n".join(lines)
 
@@ -752,12 +778,16 @@ class ToneToolbox:
                     g1 = np.where(frac < du, np.sin(np.pi * frac / du) ** 2, 0.0)
                     base = amp * env * np.sin(ph)
                     # A gate that never fully closes when beat_dB is below 0:
-                    # the tone stays, only the pulsing gets shallower.
-                    mL = base * (gb + (1.0 - gb) * g1) if gb < 1 else base * g1
+                    # the tone stays, only the pulsing gets shallower. The two
+                    # terms were the wrong way round, which made the curve
+                    # V-shaped -- modulation fell to 50% at -6 dB then climbed
+                    # back to 100% at -50, so asking for almost no beating gave
+                    # the most. (1-gb) is the floor the gate never goes below.
+                    mL = base * ((1.0 - gb) + gb * g1)
                     if abs(sph_m) > 1e-6:
                         f2 = np.mod(frac + sph_m, 1.0)
                         g2 = np.where(f2 < du, np.sin(np.pi * f2 / du) ** 2, 0.0)
-                        mR = base * (gb + (1.0 - gb) * g2) if gb < 1 else base * g2
+                        mR = base * ((1.0 - gb) + gb * g2)
                     else:
                         mR = mL
                 else:                                   # mono: two tones summed
@@ -1067,12 +1097,12 @@ class ToneToolbox:
                             du = min(0.9, max(0.1, duty_m))
                             g = np.where(frac < du,
                                          np.sin(np.pi * frac / du) ** 2, 0.0)
-                            gl = s1 * (gb + (1.0 - gb) * g) if gb < 1 else s1 * g
+                            gl = s1 * ((1.0 - gb) + gb * g)
                             if abs(sph_m) > 1e-6:
                                 f2 = np.mod(frac + sph_m, 1.0)
                                 g2 = np.where(f2 < du,
                                               np.sin(np.pi * f2 / du) ** 2, 0.0)
-                                gr = s1 * (gb + (1.0 - gb) * g2) if gb < 1 else s1 * g2
+                                gr = s1 * ((1.0 - gb) + gb * g2)
                             else:
                                 gr = gl
                             mL, mR = gl, gr
@@ -1852,9 +1882,19 @@ class BrainwaveStudio:
                 initialfile="bowl.bowl", parent=win)
             if not path:
                 return
+            # Build the text BEFORE opening the file. open(path, "w") truncates
+            # immediately, so a failure while formatting left a 0-byte file
+            # behind -- which is exactly what happened while bowl_modes_to_text
+            # still expected the old 7-field mode. Never destroy the target
+            # until there is something to put in it.
+            try:
+                body = bowl_modes_to_text(got) + "\n"
+            except Exception as e:
+                pv.set(f"Could not format the table: {e}")
+                return
             try:
                 with open(path, "w", encoding="utf-8") as fh:
-                    fh.write(bowl_modes_to_text(got) + "\n")
+                    fh.write(body)
                 pv.set(f"Saved {len(got)} mode(s) to {os.path.basename(path)}")
             except Exception as e:
                 pv.set(f"Could not save: {e}")
@@ -2436,6 +2476,13 @@ class BrainwaveStudio:
             row=0, column=0, padx=2)
         ttk.Button(b3, text="\U0001f4c4 Copy (export)", command=self.export_session).grid(
             row=0, column=1, padx=2)
+        # Copy/Paste is for moving a session through the clipboard; Save/Load is
+        # for keeping one. Doing it by hand meant copying into a text editor and
+        # saving from there, which is work the tool should do.
+        ttk.Button(b3, text="\U0001f4be Save\u2026", command=self.save_session_file).grid(
+            row=0, column=2, padx=2)
+        ttk.Button(b3, text="\U0001f4c2 Load\u2026", command=self.load_session_file).grid(
+            row=0, column=3, padx=2)
 
         ttk.Label(frm, text="Set the tone and its music on the left, press Play\n"
                             "to check, then + Add -- the segment stores all of it.\n"
@@ -2906,6 +2953,73 @@ class BrainwaveStudio:
         kept = " (music kept)" if keep else ""
         self.status.set(f"Segment {i + 1} updated.{kept}")
 
+    def save_session_file(self):
+        """Write the whole session to a readable .seg file."""
+        if not self.segments:
+            self.status.set("Nothing to save -- add a segment first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save session", defaultextension=".seg",
+            filetypes=[("Session", "*.seg"), ("Text", "*.txt")],
+            initialfile="session.seg")
+        if not path:
+            return
+        # Build the text BEFORE opening the file: open(path, "w") truncates at
+        # once, so a failure while formatting would leave a 0-byte file behind.
+        try:
+            body = segments_to_text(self.segments) + "\n"
+        except Exception as e:
+            self.status.set(f"Could not format the session: {e}")
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            self.status.set(f"Saved {len(self.segments)} segment(s) to "
+                            f"{os.path.basename(path)}")
+        except Exception as e:
+            self.status.set(f"Could not save: {e}")
+
+    def load_session_file(self):
+        """Read a .seg file, replacing the current session."""
+        path = filedialog.askopenfilename(
+            title="Load session",
+            filetypes=[("Session", "*.seg *.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            raw = parse_segments(open(path, encoding="utf-8").read())
+        except Exception as e:
+            self.status.set(f"Could not read: {e}")
+            return
+        if not raw:
+            self.status.set("No usable segment in that file.")
+            return
+        append = False
+        if self.segments:
+            ans = messagebox.askyesnocancel(
+                "Add to the session?",
+                f"{len(raw)} segment(s) in {os.path.basename(path)}.\n\n"
+                f"Yes  - add them after the {len(self.segments)} already here\n"
+                f"No   - replace the session\n"
+                f"Cancel - do nothing")
+            if ans is None:
+                return
+            append = bool(ans)
+        if not append:
+            self.segments = []
+            self.seg_list.delete(0, "end")
+        bad = 0
+        for s in raw:
+            try:
+                self.segments.append(validate_segment(dict(s)))
+                self.seg_list.insert("end", self._seg_label(self.segments[-1]))
+            except Exception:
+                bad += 1
+        self._update_total()
+        self.status.set(f"{len(self.segments)} segment(s) in the session after "
+                        f"loading {os.path.basename(path)}"
+                        + (f" ({bad} skipped)" if bad else ""))
+
     def import_session(self):
         self._text_dialog(
             "Paste a session (Python 'segments' list)", "", self._apply_import)
@@ -2919,12 +3033,29 @@ class BrainwaveStudio:
         except Exception as e:
             messagebox.showerror("Import failed", str(e))
             return False
-        self.clear_segments()
+        # Append or replace, when there is something to lose. Building a long
+        # session out of shorter saved pieces is the obvious use, and a paste
+        # that always wiped the list made it impossible.
+        append = False
+        if self.segments:
+            ans = messagebox.askyesnocancel(
+                "Add to the session?",
+                f"{len(segs)} segment(s) pasted.\n\n"
+                f"Yes  - add them after the {len(self.segments)} already here\n"
+                f"No   - replace the session\n"
+                f"Cancel - do nothing")
+            if ans is None:
+                return False
+            append = bool(ans)
+        if not append:
+            self.clear_segments()
         for s in segs:
             self.segments.append(s)
             self.seg_list.insert("end", self._seg_label(s))
         self._update_total()
-        self.status.set(f"Session imported: {len(segs)} segments.")
+        self.status.set(f"{len(segs)} segment(s) "
+                        f"{'added' if append else 'imported'} "
+                        f"({len(self.segments)} total).")
         return True
 
     def export_session(self):

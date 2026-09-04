@@ -51,17 +51,32 @@ noise, ducking, tuning, and the segment's own music with its level.
    top of whatever music individual segments carry
 
 **Click a segment** to load all of it back for editing, then **`Update`**, or
-**`− Del`** to remove it. `Copy (export)` / `Paste (import)` move a session in
-and out as readable text.
+**`− Del`** to remove it.
 
-The list shows only what is actually set:
+### Keeping and sharing a session
+
+| Button | What it does |
+|---|---|
+| `📋 Paste (import)` / `📄 Copy (export)` | move a session through the clipboard |
+| `💾 Save…` / `📂 Load…` | keep one as a readable `.seg` file |
+
+Pasting or loading into a session that already has segments asks whether to
+**add** them after the existing ones or **replace** the list — building a long
+session out of shorter saved pieces is the obvious use.
+
+Everything a segment carries is written out, not just the first few fields: a
+measured bowl, a rotation, a per-segment drone or a forced band all come back as
+they were. Only values that differ from the default are emitted, so a plain
+segment stays one readable line.
+
+The list shows only what is actually set. A segment carrying measured bowl modes
+says so, because the main panel's carrier and beat are not read at all in that
+case:
 
 ```
-bina | 400Hz | 6.0Hz | 600s | beat -20dB | rot 2.0/min | drone 0.15 | ♪ ocean.mp3 -4dB
-bina | 400Hz | 4.0Hz | 600s
+bowl | 6 modes 473Hz+ Delta 1 ramp | 300s | beat -10dB | rot 6.0/min
+bina | 400Hz | 6.0Hz | 600s
 ```
-
----
 
 ## Levels
 
@@ -205,48 +220,52 @@ recording this took a 16-row table back to the 8 modes that carry the sound.
 **For a good recording:** one strike, let it ring to the end, nothing else in
 the file. The longer the tail, the more accurate the decay times.
 
+### Ramps restart with each strike
+
+A ramp set in the table (`beat_hz` → `ramp_hz`) completes once per strike, on the
+same period as the envelope — not spread over the whole segment.
+
+That distinction cost an evening. `▶ Play` with `Loop` renders only 12 s and
+repeats them, so the full ramp was obvious there; the same ramp in a 300 s
+segment took five minutes and was inaudible. The preview was promising something
+the segment never delivered, which made Play and Add sound like different
+instruments. Measured after the fix: identical behaviour in a 12 s and a 300 s
+segment, and identical across preview, session and export.
+
 ### A sequence of chakras
 
 **`Add all 7`**, beside the chakra buttons, appends one segment per chakra in
-order, each at the frequency of the chosen tuning. Every other setting on the
-left is kept, and the panel is put back where you left it afterwards.
+order, at the frequencies of the selected tuning. **`Add all 9`** does the same
+with the nine Solfeggio frequencies, labelled by frequency because 174 and 285
+match no chakra in any convention.
+
+Every other setting on the left is kept, and the panel is put back where you
+left it afterwards.
 
 **A sequence, not a sweep.** A bowl does not change pitch while it rings — its
-frequency comes from its geometry — so a glissando would sound like a
-speeded-up tape rather than like seven bowls. Each chakra is its own struck
-segment that decays before the next.
+frequency comes from its geometry — so a glissando would sound like a speeded-up
+tape rather than like a set of bowls.
 
 #### With a measured bowl loaded
 
 Measured modes override the carrier, so the chakra buttons would otherwise have
-no effect. Instead the bowl is **transposed** onto each chakra: everything
-scales by one factor, which is the same as playing bowls of different sizes from
-the same workshop — what a set of tuned bowls is.
-
-What is preserved, and what follows:
+no effect. Instead the bowl is **transposed** onto each step: everything scales
+by one factor, which is the same as playing bowls of different sizes from the
+same workshop.
 
 | | Behaviour |
 |---|---|
 | Ratios between modes | **unchanged** (verified identical to 0.002) |
-| Mode frequencies | scale with the factor |
-| Beat rates | scale too — the detuning is a fraction of the mode |
-| Decays | scale as 1/k: a smaller bowl rings shorter |
-| Amplitudes | untouched — they describe how it was struck |
-
-A 256 Hz bowl across `A=440`:
-
-```
-Root     261.6Hz  decay 34.3s  beat 0.92
-Sacral   293.7Hz  decay 30.5s  beat 1.03
-...
-Crown    493.9Hz  decay 18.1s  beat 1.74
-```
+| Mode frequencies, measured beats, decays | scale with the factor |
+| A beat forced onto a band | **kept** — it was chosen, not measured |
+| `beat_dB`, `duty`, `stereo`, rotation | **kept** — choices too |
 
 Past a factor of **2** a confirmation appears: beyond that the measured decays
-and beats no longer describe the real bowl, and you are listening to an
-extrapolation rather than to your instrument.
+and beats no longer describe the real bowl.
 
----
+Note that `Add all 7` gives every segment the same level. For a session where the
+level should climb from one chakra to the next, write the `.seg` by hand or
+generate it — the file format carries a level per segment.
 
 ## Parameter checks
 
@@ -361,13 +380,33 @@ skipped in the second case.
 ## Notes for future work
 
 Three paths render audio: `render()` for a single preview, `build_session()` for
-the session preview, and `stream_session()` for export. **Any new option must
-be wired into all three.** Four bugs have come from adding one on the preview
-path only — `tone_level` ignored on export, peak normalisation cancelling the
-beat level in three places, the bowl envelope missing from the streaming
-generator, and `level_drone` crashing the export.
+the session preview, and `stream_session()` for export. **Any new option must be
+wired into all three.** Bugs from adding one on the preview path only:
+`tone_level` ignored on export, peak normalisation cancelling the beat level in
+three places, the bowl envelope missing from the streaming generator, and
+`level_drone` crashing the export.
 
-Peak normalisation deserves its own warning: normalising a *mix* to peak
-silently undoes every level the user set. Only sources may be normalised (each
-generator to unit amplitude before its level is applied); the finished mix is
-touched only when it would clip, and it says so.
+**Never leave two definitions of the same function.** Rewriting
+`transpose_bowl_modes` and `analyse_bowl_wav` at the top of the file instead of
+in place left the stale versions further down, and Python keeps the last one —
+so a fix that measured correctly in isolation did nothing in the app. It
+happened three times.
+
+**Build the text before opening the file.** `open(path, "w")` truncates at once,
+so a failure while formatting leaves a 0-byte file behind. That is exactly how
+`Save…` produced empty `.bowl` files while `bowl_modes_to_text` still expected
+the old 7-field mode.
+
+**Peak normalisation on a mix silently undoes every level the user set.** Only
+sources may be normalised — each generator to unit amplitude before its level is
+applied. The finished mix is touched only when it would clip, and it says so.
+This is also why the `amp` column of a bowl is relative: the bowl normalises its
+own mix, so all four modes at 0.01 sound exactly like all four at 1.0. The
+overall level is `Beat level (dB)`, which is applied afterwards and is not
+normalised.
+
+**Check the sign of a level formula against a table.** `beat_dB` was inverted:
+`gb + (1-gb)·g` instead of `(1-gb) + gb·g`, which made the modulation curve
+V-shaped — 100 % at 0 dB, 50 % at −6, and back to 99.7 % at −50. Asking for
+almost no beating gave the most. A five-line table of measured values would have
+caught it immediately.
