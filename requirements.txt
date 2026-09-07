@@ -1,19 +1,62 @@
-# XTTS-Voice-Studio - Python dependencies
-# Install with: pip install -r requirements.txt
+# XTTS Voice Studio — pinned requirements
 #
-# Note: PyTorch must be installed via conda BEFORE running this:
-#   conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
+# These are the versions that actually run together, taken from a working
+# install rather than from what the packages claim to support. Several of the
+# pins exist because the unpinned version breaks something specific; the reason
+# is written next to each one, because "upgrade and see" costs an evening.
+#
+# Python 3.10 is required. 3.11 mostly works; 3.12+ has no wheels for parts of
+# the audio stack.
+#
+#   pip install -r requirements.txt
+#
+# torch is NOT pinned here: install it first, matched to your CUDA version, from
+# https://pytorch.org . For CUDA 12.1:
+#   pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+# CPU-only:
+#   pip install torch==2.5.1 torchaudio==2.5.1
 
-# Core TTS engine (Coqui XTTS v2 - community fork)
-coqui-tts
+# ── Core TTS ─────────────────────────────────────────────────────────────────
+TTS==0.22.0
+# transformers 4.34+ moved GenerationMixin and breaks TTS 0.22's XTTS loader.
+# The coqui-tts fork needs >=4.46 instead — the two are not interchangeable.
+transformers==4.33.0
 
-# Audio processing
-pydub
+# ── Numeric core ─────────────────────────────────────────────────────────────
+# numpy must stay below 2.0: numba (via librosa) and several audio wheels are
+# built against the 1.x ABI and fail to import with 2.x.
+numpy>=1.22,<2
+scipy>=1.11,<2
+scikit-learn>=1.3
 
-# Voice analyser
-librosa
-numpy
-scipy
+# ── Audio analysis and I/O ───────────────────────────────────────────────────
+librosa==0.10.0
+soundfile>=0.12
+praat-parselmouth>=0.4.3
+pydub>=0.25
+einops>=0.6
+encodec==0.1.1
 
-# Audio transcriber (Whisper)
-openai-whisper
+# ── Speaker identity, separation, denoising ──────────────────────────────────
+speechbrain>=1.0
+demucs>=4.0
+
+# ── Interface and plots ──────────────────────────────────────────────────────
+# matplotlib 3.10 removed FigureCanvas.tostring_rgb, which older training code
+# still calls. Not an issue for this project's own plots, but pin the major
+# version so a future removal does not surprise anyone.
+matplotlib>=3.7,<4
+# pygame is used ONLY for audio preview. Export and generation work without it,
+# which matters on a headless machine or under WSL without an audio server.
+pygame>=2.5
+
+# ── Optional ─────────────────────────────────────────────────────────────────
+# noisereduce   — one of the dereverberation methods; install if you use it
+# nara-wpe      — WPE dereverberation
+# deepfilternet — DeepFilterNet denoising (needs git at install time)
+# torchcrepe    — GPU F0 extraction for the voice separator
+
+# ── Not installable with pip ─────────────────────────────────────────────────
+# ffmpeg      — MP3/FLAC/OGG output, video extraction.  apt install ffmpeg
+# rubberband  — time-stretch and age shift.             apt install rubberband-cli
+# tkinter     — the GUI itself.                         apt install python3-tk

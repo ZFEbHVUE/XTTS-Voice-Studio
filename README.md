@@ -30,6 +30,22 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## Installation
 
+### The short way
+
+```bash
+git clone https://github.com/ZFEbHVUE/XTTS-Voice-Studio
+cd XTTS-Voice-Studio
+./install.sh
+```
+
+Creates the conda environment, installs the pinned dependencies, checks the
+system tools pip cannot provide, and adds a launcher to the applications menu
+and the desktop. `--cpu` for a CPU-only torch, `--no-icon` to skip the launcher.
+Running it twice is safe: an existing environment is reused, not rebuilt.
+
+It does NOT install conda itself, nor the system packages — those need `sudo`,
+and it tells you the exact `apt` line instead of asking for your password.
+
 ### Requirements
 
 - Python 3.10+
@@ -1031,12 +1047,18 @@ Using **multiple reference files** (2–3 clips) significantly improves cloning 
 The pipeline runs natively on Windows (Python 3.11 recommended — some packages
 have no wheels for 3.14 yet). Points that cost time:
 
-**Version constraints.** `requirements.txt` does not pin these and it should:
+**Version constraints** are pinned in `requirements.txt`, taken from a working
+install rather than from what the packages claim to support. The ones worth
+knowing about:
 
 ```
-torch>=2.0,<2.9          # 2.9+ requires torchcodec, which needs ffmpeg full-shared
-transformers>=4.46,<5    # coqui-tts needs isin_mps_friendly, removed in v5
-numpy>=1.22,<2           # the audio stack is not uniformly ready for 2.x
+TTS==0.22.0              # the original Coqui package
+transformers==4.33.0     # 4.34+ moves GenerationMixin and breaks TTS 0.22's
+                         # XTTS loader. The coqui-tts FORK needs >=4.46 instead:
+                         # the two packages are not interchangeable.
+numpy>=1.22,<2           # numba and several audio wheels are built against 1.x
+torch==2.5.1             # install first, matched to your CUDA version; 2.9+
+                         # pulls torchcodec, which needs the full-shared ffmpeg
 ```
 
 **ffmpeg must be the "full-shared" build** if you stay on torch ≥ 2.9 — the
