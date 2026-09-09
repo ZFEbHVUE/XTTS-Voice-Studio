@@ -66,7 +66,8 @@ def browse_files(var, filetypes=None, initialdir=None):
     paths = filedialog.askopenfilenames(filetypes=filetypes,
                                         initialdir=d)
     if paths:
-        var.set(" ".join(paths))
+        # Semicolon, not space: a path can contain spaces, a semicolon cannot.
+        var.set(" ; ".join(paths))
 
 # Global audio player (one at a time)
 _player_state = {'proc': None, 'btn': None}
@@ -135,6 +136,27 @@ def play_toggle(path, btn=None):
 def play_file(path):
     play_toggle(path, None)
 
+
+
+def split_paths(text):
+    """Split a multi-file field into paths, tolerating spaces in names.
+
+    Splitting on whitespace was wrong: half the sound libraries ship files
+    called "Chant du coq (ID 0283).wav", and each word became a missing file.
+    Semicolons and newlines are used first because neither can appear in a
+    path; whitespace is only a fallback, and then only when every piece it
+    produces actually exists on disk.
+    """
+    if not text or not text.strip():
+        return []
+    raw = text.replace("\n", ";")
+    if ";" in raw:
+        return [p.strip() for p in raw.split(";") if p.strip()]
+    parts = text.split()
+    if len(parts) > 1 and all(os.path.exists(p) for p in parts):
+        return parts                      # old-style, still valid
+    single = text.strip()
+    return [single] if single else []
 
 def add_row(parent, label, var, row, filetypes=None, save=False, multi=False, initialdir=None):
     parent.grid_columnconfigure(1, weight=1)
@@ -389,9 +411,57 @@ def _bind_default_text(v_lang, v_text, extra=''):
     v_lang.trace_add('write', _apply)
     _apply()
 
+
+def scrollable_tab(nb, title):
+    """Add a notebook tab whose content scrolls vertically.
+
+    The Generator tab grows with every voice and every punctual sound added, so
+    on a laptop screen the lower rows and the Generate button end up out of
+    reach. The tab itself cannot be resized, hence the canvas.
+
+    Returns (scrolling_frame, fixed_footer). The console and the Run/Stop row
+    belong in the footer: putting them inside the scroll meant they slid out of
+    sight as soon as a voice or a sound was added, and the window opened with
+    neither of them visible.
+    """
+    outer = ttk.Frame(nb)
+    nb.add(outer, text=title)
+    outer.grid_rowconfigure(0, weight=1)
+    outer.grid_columnconfigure(0, weight=1)
+
+    canvas = tk.Canvas(outer, highlightthickness=0)
+    vsb = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+    canvas.configure(yscrollcommand=vsb.set)
+    canvas.grid(row=0, column=0, sticky='nsew')
+    vsb.grid(row=0, column=1, sticky='ns')
+
+    inner = ttk.Frame(canvas)
+    win = canvas.create_window((0, 0), window=inner, anchor='nw')
+
+    def _on_inner(_e=None):
+        canvas.configure(scrollregion=canvas.bbox('all'))
+    def _on_canvas(e):
+        # Keep the content as wide as the visible area, so entries stretch
+        # instead of leaving a dead strip on the right.
+        canvas.itemconfigure(win, width=e.width)
+    inner.bind('<Configure>', _on_inner)
+    canvas.bind('<Configure>', _on_canvas)
+
+    def _wheel(e):
+        if str(canvas) not in str(e.widget) and e.widget is not canvas:
+            pass
+        canvas.yview_scroll(-1 if getattr(e, 'num', 0) == 4 or getattr(e, 'delta', 0) > 0 else 1,
+                            'units')
+    for seq in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+        canvas.bind_all(seq, _wheel, add='+')
+
+    footer = ttk.Frame(outer)
+    footer.grid(row=1, column=0, columnspan=2, sticky='ew')
+    footer.grid_columnconfigure(1, weight=1)
+    return inner, footer
+
 def tab_generator(nb):
-    f = ttk.Frame(nb)
-    nb.add(f, text="[Gen] Generator")
+    f, foot = scrollable_tab(nb, "[Gen] Generator")
     f.grid_columnconfigure(1, weight=1)
     f.grid_rowconfigure(7, weight=1)
 
@@ -453,7 +523,62 @@ def tab_generator(nb):
     btn_add_voice.config(command=add_gen_voice)
 
     add_row(f, "Ambient",       v_ambient, 3, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_AMBIENT)
-    add_row(f, "Punctual music (1+)", v_music, 4, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], multi=True, initialdir=DIR_PUNCTUAL)
+    # ── Punctual sounds — one row per sound, numbered like the voices ────────
+    # A single field separated by spaces broke on every library file called
+    # "Chant du coq (ID 0283).wav"; one row per sound removes the question of
+    # separators entirely, and the number shown is the one to use in [music=N].
+    music_frame = tk.LabelFrame(f, text="Punctual sounds", padx=4, pady=2)
+    music_frame.grid(row=4, column=0, columnspan=3, sticky='ew', padx=6, pady=3)
+    music_frame.grid_columnconfigure(1, weight=1)
+    music_rows_gen = []
+
+    btn_add_music = tk.Button(music_frame, text="+ Add sound",
+                              bg='#2d6a2d', fg='white')
+    btn_add_music.pack(anchor='w', padx=4, pady=2)
+
+    def _renumber_music():
+        for i, (lbl, _v, _rf) in enumerate(music_rows_gen, start=1):
+            lbl.config(text=f"music_{i}")
+
+    def add_music_row(path=""):
+        v_path = tk.StringVar(value=path)
+        row_f = tk.Frame(music_frame)
+        row_f.pack(fill='x', padx=2, pady=1, before=btn_add_music)
+        lbl = tk.Label(row_f, text=f"music_{len(music_rows_gen) + 1}",
+                       width=9, anchor='w')
+        lbl.pack(side='left')
+        tk.Entry(row_f, textvariable=v_path).pack(side='left', fill='x',
+                                                  expand=True, padx=3)
+
+        def browse_one(v=v_path):
+            p = filedialog.askopenfilename(
+                filetypes=[("Audio", "*.wav *.mp3 *.flac *.ogg"), ("All", "*.*")],
+                initialdir=_ensure_dir(DIR_PUNCTUAL))
+            if p:
+                v.set(p)
+        tk.Button(row_f, text="Browse", width=8,
+                  command=browse_one).pack(side='left', padx=2)
+
+        entry = (lbl, v_path, row_f)
+
+        def remove(e=entry):
+            e[2].destroy()
+            if e in music_rows_gen:
+                music_rows_gen.remove(e)
+            _renumber_music()
+        tk.Button(row_f, text="X", width=2, fg='red',
+                  command=remove).pack(side='left', padx=1)
+        music_rows_gen.append(entry)
+
+    add_music_row()
+    btn_add_music.config(command=lambda: add_music_row())
+
+    # Kept so the rest of the code (and older saved settings) still see one
+    # field: it mirrors the rows, joined with the separator that cannot appear
+    # in a path.
+    def _sync_music_var(*_a):
+        v_music.set(" ; ".join(v.get().strip()
+                               for _l, v, _r in music_rows_gen if v.get().strip()))
 
     # ── MP3 output options ────────────────────────────────────────────────────
     v_gen_mp3_bitrate = tk.StringVar(value='192')
@@ -989,8 +1114,8 @@ def tab_generator(nb):
     v_script.trace_add('write', on_script_change)
 
     # Console output
-    console_frame = ttk.LabelFrame(f, text="Console")
-    console_frame.grid(row=8, column=0, columnspan=3, sticky='ew', padx=6, pady=4)
+    console_frame = ttk.LabelFrame(foot, text="Console")
+    console_frame.grid(row=0, column=0, columnspan=3, sticky='ew', padx=6, pady=4)
     # Row 7 (the editor) is the only one that grows when the window is resized:
     # the two toolbars above it are fixed height, and log reading needs less
     # room than writing a meditation script.
@@ -1023,12 +1148,13 @@ def tab_generator(nb):
                os.path.join(SCRIPTS_DIR, 'guided_meditation_generator_v23.py'),
                v_script.get(), v_output.get()]
         cmd += voice_args
-        if v_ambient.get(): cmd += v_ambient.get().split()
-        if v_music.get():   cmd += v_music.get().split()
+        if v_ambient.get(): cmd += split_paths(v_ambient.get())
+        _mus = [v.get().strip() for _l, v, _r in music_rows_gen if v.get().strip()]
+        if _mus:            cmd += _mus
         cmd += ['--mp3-bitrate', v_gen_mp3_bitrate.get(), '--mp3-mode', v_gen_mp3_mode.get()]
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Run", lancer, 9)
+    make_btn(foot, ">  Run", lancer, 1)
 
 
 LANGS = ['FR','EN','ES','DE','IT','PT','PL','TR','RU','NL','CS','AR','ZH-CN','HU','KO','JA','HI']
@@ -1235,7 +1361,7 @@ def tab_curate(nb):
     def _suggest_out(*_):
         # Auto-fill "<first_ref>_curated.wav" when output is empty
         if v_cur_input.get().strip() and not v_cur_output.get().strip():
-            first = v_cur_input.get().split()[0]
+            first = (split_paths(v_cur_input.get()) or [''])[0]
             base, _ext = os.path.splitext(first)
             v_cur_output.set(base + "_curated.wav")
     v_cur_input.trace_add('write', _suggest_out)
@@ -1258,7 +1384,7 @@ def tab_curate(nb):
     console = add_console(f, 5)
 
     def lancer(btn, stop_btn=None):
-        refs = [r for r in v_cur_input.get().split() if r.strip()]
+        refs = split_paths(v_cur_input.get())
         if not refs:
             log(console, "[ERR] At least one voice reference required."); return
         if not v_cur_output.get().strip():
@@ -2135,7 +2261,7 @@ def tab_validator(nb):
     def _update_total():
         total = 1
         for vp, vv, _ in param_rows:
-            vals = [x for x in vv.get().split() if x.strip()]
+            vals = split_paths(vv.get())
             if vals:
                 total *= len(vals)
         lbl_total.config(text=f"Total: {total} combination{'s' if total>1 else ''}")
@@ -2223,7 +2349,7 @@ def tab_validator(nb):
     console = add_console(f, row)
 
     def lancer(btn, stop_btn=None):
-        refs = [r for r in v_val_voices.get().split() if r.strip()]
+        refs = split_paths(v_val_voices.get())
         if not refs:
             log(console, "[ERR] At least one voice reference required."); return
         output = v_val_output.get().strip()
@@ -2335,7 +2461,7 @@ def tab_optimize(nb):
     console = add_console(f, 8)
 
     def lancer(btn, stop_btn=None):
-        refs = [r for r in v_opt_voices.get().split() if r.strip()]
+        refs = split_paths(v_opt_voices.get())
         if not refs:
             log(console, "[ERR] At least one voice reference required."); return
         if not v_opt_xtts.get().strip():
@@ -2403,7 +2529,7 @@ def tab_rvc(nb):
 
     def _rvc_suggest(*_):
         if v_rvc_refs.get().strip() and not v_rvc_ds.get().strip():
-            base = os.path.splitext(os.path.basename(v_rvc_refs.get().split()[0]))[0]
+            base = os.path.splitext(os.path.basename((split_paths(v_rvc_refs.get()) or [''])[0]))[0]
             v_rvc_ds.set(os.path.join(XTTS_ROOT, 'RVC_datasets', base))
     v_rvc_refs.trace_add('write', _rvc_suggest)
 
@@ -2464,7 +2590,7 @@ def tab_rvc(nb):
     console = add_console(f, 15)
 
     def lancer_dataset(btn, stop_btn=None):
-        refs = [r for r in v_rvc_refs.get().split() if r.strip()]
+        refs = split_paths(v_rvc_refs.get())
         if not refs:
             log(console, "[ERR] Raw voice reference(s) required."); return
         if not v_rvc_ds.get().strip():

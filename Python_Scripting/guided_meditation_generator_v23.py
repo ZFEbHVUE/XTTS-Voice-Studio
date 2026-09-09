@@ -1184,6 +1184,18 @@ def process_parallel_block(inner_segments, voice_files, tts_instances,
                 cur_config = cfg
                 cur_xtts   = xtts_params_by_voice.get(vn, xtts_params_by_voice.get(0, DEFAULT_XTTS_PARAMS.copy()))
 
+        # Punctual sound. It cannot be generated here: the main loop schedules
+        # music at an ABSOLUTE position and overlays it at the end, and a
+        # parallel block does not know where it will sit until it is placed.
+        # So record it against the current track and hand the relative offsets
+        # back to the caller, which knows the block's start.
+        elif seg.startswith('[music='):
+            mm = re.search(r'\[music=(\d+)\]', seg)
+            if mm:
+                ensure_track(cur_voice)
+                tracks[cur_voice].append(('music', int(mm.group(1))))
+                print(f"  [PARALLEL] Voice {cur_voice}: music #{mm.group(1)} cue")
+
         # Pause
         elif seg.startswith('[pause='):
             m = re.search(r'\[pause=([\d.]+)s?(?:,start)?\]', seg)
@@ -1203,10 +1215,11 @@ def process_parallel_block(inner_segments, voice_files, tts_instances,
 
     if not tracks:
         print(f"  [PARALLEL] Empty block — skipped")
-        return AudioSegment.empty(), 0, 0
+        return AudioSegment.empty(), 0, 0, []
 
     # ── Generate audio for each voice track ──────────────────────────────────
     track_audios = {}   # {voice_num: AudioSegment}
+    track_cues   = {}   # {voice_num: [(offset_in_track_ms, music_idx), ...]}
     sentences_count = 0
 
     for vn in track_order:
@@ -1215,7 +1228,13 @@ def process_parallel_block(inner_segments, voice_files, tts_instances,
         print(f"\n  [PARALLEL] Generating track for voice {vn} ({len(items)} items)...")
 
         for item in items:
-            if item[0] == 'pause':
+            if item[0] == 'music':
+                # Position within THIS track; turned into an absolute one below.
+                track_cues.setdefault(vn, []).append((len(track_audio), item[1]))
+                print(f"      [*] Voice {vn}: music #{item[1]} at "
+                      f"{len(track_audio)/1000:.1f}s in the block")
+
+            elif item[0] == 'pause':
                 dur_ms = item[1]
                 track_audio += AudioSegment.silent(duration=dur_ms)
                 print(f"      [*] Voice {vn}: silence {dur_ms}ms")
@@ -1266,10 +1285,23 @@ def process_parallel_block(inner_segments, voice_files, tts_instances,
         print(f"  [PARALLEL] Mixed voice {vn} at position {start_ms/1000:.2f}s "
               f"(duration {len(track_audios[vn])/1000:.2f}s)")
 
+    # Turn each cue's position inside its track into a position inside the
+    # block, by adding that voice's start. The caller adds the block's own
+    # start to get an absolute timeline position.
+    cues = []
+    for idx, vn in enumerate(voices_ordered):
+        start_ms = get_start_ms(idx)
+        for off_ms, music_idx in track_cues.get(vn, []):
+            cues.append((start_ms + off_ms, music_idx))
+    cues.sort()
+    if cues:
+        print("  [PARALLEL] Music cues in this block: "
+              + ", ".join(f"#{i} at {t/1000:.1f}s" for t, i in cues))
+
     print(f"  [PARALLEL] Block complete — total duration {len(mixed)/1000:.2f}s, "
           f"{sentences_count} sentences generated\n")
 
-    return mixed, len(mixed), sentences_count
+    return mixed, len(mixed), sentences_count, cues
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1464,14 +1496,31 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
 
             # Generate and mix parallel voices
             t_parallel_start = time.time()
-            mixed_audio, block_dur_ms, n_sentences = process_parallel_block(
+            mixed_audio, block_dur_ms, n_sentences, block_cues = process_parallel_block(
                 inner_segments, voice_files, tts_instances,
                 xtts_params_by_voice, offsets, temp_file
             )
 
             if block_dur_ms > 0:
+                block_start_ms = position_ms
                 voice_audio += mixed_audio
                 position_ms += block_dur_ms
+                # Schedule the block's punctual sounds now that its start on the
+                # timeline is known. Before this they were dropped in silence:
+                # the block ignored [music=] entirely, so a cue written inside a
+                # parallel section simply never played.
+                for rel_ms, midx in block_cues:
+                    if midx <= len(music_files) and midx in music_configs:
+                        fpath = music_files[midx - 1]
+                        dur_sec, vol_db = music_configs[midx]
+                        at_ms = block_start_ms + rel_ms
+                        music_to_apply.append((at_ms, fpath, dur_sec, vol_db))
+                        print(f"  [*] Music #{midx} at {at_ms/1000:.1f}s "
+                              f"(inside the parallel block): "
+                              f"{os.path.basename(fpath)}")
+                    else:
+                        print(f"  [!] Music #{midx} cued in the parallel block "
+                              f"but not declared — ignored")
                 last_audio        = mixed_audio
                 last_sentence_pos = position_ms - block_dur_ms
 
