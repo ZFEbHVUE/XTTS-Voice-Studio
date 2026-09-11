@@ -1164,8 +1164,7 @@ LANGS = ['FR','EN','ES','DE','IT','PT','PL','TR','RU','NL','CS','AR','ZH-CN','HU
 # ── Tab: Auto pipeline ────────────────────────────────────────────────────────
 
 def tab_auto(nb):
-    f = ttk.Frame(nb)
-    nb.add(f, text="[Auto] Pipeline")
+    f, foot = scrollable_tab(nb, "[Auto] Pipeline")
     f.grid_columnconfigure(0, weight=1)
 
     voices_frame = tk.LabelFrame(f, text="Voices (reference + language)")
@@ -1284,7 +1283,7 @@ def tab_auto(nb):
              fg='gray', font=("Arial", 8), justify='left', wraplength=560,
              anchor='w').grid(row=6, column=0, columnspan=3, sticky='w', padx=8)
 
-    console = add_console(f, 8)
+    console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
         voices = [(v.get().strip(), l.get(), p.get().strip())
@@ -1329,14 +1328,13 @@ def tab_auto(nb):
             cmd += ['--keep-preset-history']
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Run full pipeline", lancer, 7)
+    make_btn(foot, ">  Run full pipeline", lancer, 1)
 
 
 # ── Tab: Curation ─────────────────────────────────────────────────────────────
 
 def tab_curate(nb):
-    f = ttk.Frame(nb)
-    nb.add(f, text="[Cur] Curation")
+    f, foot = scrollable_tab(nb, "[Cur] Curation")
     f.grid_columnconfigure(1, weight=1)
 
     v_cur_input   = tk.StringVar()
@@ -1381,7 +1379,7 @@ def tab_curate(nb):
              fg='gray', font=("Arial", 8), justify='left', wraplength=560,
              anchor='w').grid(row=3, column=0, columnspan=3, sticky='w', padx=8)
 
-    console = add_console(f, 5)
+    console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
         refs = split_paths(v_cur_input.get())
@@ -1399,7 +1397,7 @@ def tab_curate(nb):
         cmd += ['--device', v_cur_device.get()]
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Curate", lancer, 4)
+    make_btn(foot, ">  Curate", lancer, 1)
 
     frm_cho = tk.Frame(f)
     frm_cho.grid(row=6, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
@@ -1418,8 +1416,7 @@ def tab_curate(nb):
 
 
 def tab_analyser(nb):
-    f = ttk.Frame(nb)
-    nb.add(f, text="[Ana] Analyser")
+    f, foot = scrollable_tab(nb, "[Ana] Analyser")
     f.grid_columnconfigure(0, weight=1)
     f.grid_rowconfigure(2, weight=1)
 
@@ -1525,7 +1522,7 @@ def tab_analyser(nb):
     tk.Label(ctrl_frame, text="Prec = precise mode  |  F0: auto/crepe/pyin  |  Analysis: Praat / Librosa",
              fg='gray', font=('Arial',8)).pack(side='left', padx=6)
 
-    console = add_console(f, 2)
+    console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
         valids = [(vp.get(), vl.get(), vn.get(), vs.get(), vpr.get(), vf0.get(),
@@ -1637,7 +1634,7 @@ def tab_analyser(nb):
 
         threading.Thread(target=_run_all, daemon=True).start()
 
-    make_btn(f, "> Analyse", lancer, 3)
+    make_btn(foot, "> Analyse", lancer, 1)
 
     # Hand-off: push the analysed {} / [] into the Validator or Comparator fields
     frm_ho = tk.Frame(f)
@@ -1660,8 +1657,7 @@ def tab_analyser(nb):
 # ── Tab: Transcription ──────────────────────────────────────────────────────
 
 def tab_transcribe(nb):
-    f = ttk.Frame(nb)
-    nb.add(f, text="[Txt] Transcription")
+    f, foot = scrollable_tab(nb, "[Txt] Transcription")
     f.grid_columnconfigure(1, weight=1)
 
     v_input  = tk.StringVar()
@@ -1703,7 +1699,7 @@ def tab_transcribe(nb):
     tk.Checkbutton(f, text="Pitch annotation [p:±N]", variable=v_pitch).grid(
         row=6, column=1, sticky='w', padx=4, pady=3)
 
-    console = add_console(f, 7)
+    console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
         if not v_input.get() or not v_output.get():
@@ -1723,14 +1719,13 @@ def tab_transcribe(nb):
             if v_pitch.get(): cmd.append('--pitch')
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Transcribe", lancer, 6)
+    make_btn(foot, ">  Transcribe", lancer, 1)
 
 
 # ── Tab: Voice Separation ───────────────────────────────────────────────────
 
 def tab_extract(nb):
-    f = ttk.Frame(nb)
-    nb.add(f, text="[Vox] Voice sep.")
+    f, foot = scrollable_tab(nb, "[Vox] Voice sep.")
     f.grid_columnconfigure(1, weight=1)
 
     v_input      = tk.StringVar()
@@ -1909,7 +1904,7 @@ def tab_extract(nb):
              fg='grey').pack(side='left')
 
     # row 15 : console
-    console = add_console(f, 16)
+    console = add_console(foot, 0)
 
     def _build_cmd(with_output=True):
         cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'extract_voices.py'),
@@ -1962,16 +1957,15 @@ def tab_extract(nb):
         cmd = _build_cmd(with_output=False) + ['--analyze']
         run_cmd(cmd, console, btn, stop_btn)
 
-    btn_sep, stop_sep = make_btn(f, ">  Separate", lancer,   17)
-    btn_ana, stop_ana = make_btn(f, "[?] Analyze", analyser, 18)
+    btn_sep, stop_sep = make_btn(foot, ">  Separate", lancer,   17)
+    btn_ana, stop_ana = make_btn(foot, "[?] Analyze", analyser, 1)
     btn_ana.config(bg='#7d5a2d')
 
 
 # ── Tab: Pitch ──────────────────────────────────────────────────────────────
 
 def tab_pitch(nb):
-    f = ttk.Frame(nb)
-    nb.add(f, text="[Pit] Pitch")
+    f, foot = scrollable_tab(nb, "[Pit] Pitch")
     f.grid_columnconfigure(1, weight=1)
 
     v_clone  = tk.StringVar()
@@ -2008,7 +2002,7 @@ def tab_pitch(nb):
     ttk.Combobox(f, textvariable=v_device, width=8, state='readonly',
         values=['cpu','cuda']).grid(row=6, column=1, sticky='w', padx=4)
 
-    console = add_console(f, 8)
+    console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
         if not v_clone.get() or not v_output.get():
@@ -2021,14 +2015,13 @@ def tab_pitch(nb):
                '--device', v_device.get()]
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Apply pitch", lancer, 6)
+    make_btn(foot, ">  Apply pitch", lancer, 1)
 
 
 # ── Tab: Video to MP3 ───────────────────────────────────────────────────────
 
 def tab_convert(nb):
-    f = ttk.Frame(nb)
-    nb.add(f, text="[Vid] Video->MP3")
+    f, foot = scrollable_tab(nb, "[Vid] Video->MP3")
     f.grid_columnconfigure(1, weight=1)
 
     v_input  = tk.StringVar()
@@ -2087,7 +2080,7 @@ def tab_convert(nb):
         values=['0.70','0.80','0.85','0.90','1.0','1.10','1.25','1.5']).pack(side='left')
     tk.Label(frm_vid_tempo, text="(pitch preserved — slower < 1.0 < faster)", fg='grey').pack(side='left', padx=(6,0))
 
-    console = add_console(f, 6)
+    console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
         if not v_input.get() or not v_output.get():
@@ -2133,15 +2126,14 @@ def tab_convert(nb):
             cmd = base_args + ['-sample_fmt', 's16', v_output.get()]
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  Convert", lancer, 5)
+    make_btn(foot, ">  Convert", lancer, 1)
 
 
 
 # ── Tab: Validator ──────────────────────────────────────────────────────────
 
 def tab_validator(nb):
-    f = tk.Frame(nb)
-    nb.add(f, text="[Val] Validator")
+    f, foot = scrollable_tab(nb, "[Val] Validator")
 
     v_val_voices  = tk.StringVar()
     v_val_lang    = tk.StringVar(value=DEFAULT_LANG)
@@ -2346,7 +2338,7 @@ def tab_validator(nb):
     ).grid(row=0, column=1, padx=2)
 
     row += 1
-    console = add_console(f, row)
+    console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
         refs = split_paths(v_val_voices.get())
@@ -2387,7 +2379,7 @@ def tab_validator(nb):
                 HANDOFF['win_xtts'] = s
         run_cmd(cmd, console, btn, stop_btn, line_callback=_val_on_line)
 
-    make_btn(f, ">  Generate", lancer, row + 1)
+    make_btn(foot, ">  Generate", lancer, row + 1)
 
     # Register as a target (Analyser -> Validator) and add hand-off to Comparator
     TARGETS['val_xtts']  = v_val_xtts
@@ -2405,8 +2397,7 @@ def tab_validator(nb):
 # ── Tab: Optimiser ────────────────────────────────────────────────────────────
 
 def tab_optimize(nb):
-    f = ttk.Frame(nb)
-    nb.add(f, text="[Opt] Optimiser")
+    f, foot = scrollable_tab(nb, "[Opt] Optimiser")
     f.grid_columnconfigure(1, weight=1)
 
     v_opt_voices = tk.StringVar()
@@ -2458,7 +2449,7 @@ def tab_optimize(nb):
     tk.Label(f, text="Device", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_opt_device, values=['cpu', 'cuda'], width=8, state='readonly').grid(row=6, column=1, sticky='w', padx=4)
 
-    console = add_console(f, 8)
+    console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
         refs = split_paths(v_opt_voices.get())
@@ -2486,7 +2477,7 @@ def tab_optimize(nb):
                 HANDOFF['win_xtts'] = s
         run_cmd(cmd, console, btn, stop_btn, line_callback=_opt_on_line)
 
-    make_btn(f, ">  Optimise", lancer, 7)
+    make_btn(foot, ">  Optimise", lancer, 1)
 
     frm_oho = tk.Frame(f)
     frm_oho.grid(row=9, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
@@ -2504,8 +2495,7 @@ def tab_optimize(nb):
 # ── Tab: RVC (timbre conversion) ─────────────────────────────────────────────
 
 def tab_rvc(nb):
-    f = ttk.Frame(nb)
-    nb.add(f, text="[RVC] Timbre")
+    f, foot = scrollable_tab(nb, "[RVC] Timbre")
     f.grid_columnconfigure(1, weight=1)
 
     # ── 1. Dataset (train data for Applio) ───────────────────────────────────
@@ -2587,7 +2577,7 @@ def tab_rvc(nb):
     add_row(f, "Real reference", v_rvc_measref, 13,
             [("Audio", "*.wav *.mp3"), ("All", "*.*")], initialdir=DIR_VOICES)
 
-    console = add_console(f, 15)
+    console = add_console(foot, 0)
 
     def lancer_dataset(btn, stop_btn=None):
         refs = split_paths(v_rvc_refs.get())
@@ -2627,9 +2617,9 @@ def tab_rvc(nb):
         cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'speaker_identity.py'), ref] + cands
         run_cmd(cmd, console, btn, stop_btn)
 
-    make_btn(f, ">  1. Build dataset", lancer_dataset, 4)
-    make_btn(f, ">  2. Convert", lancer_convert, 14)
-    make_btn(f, ">  3. Measure identity (before/after)", lancer_measure, 16)
+    make_btn(foot, ">  1. Build dataset", lancer_dataset, 1)
+    make_btn(foot, ">  2. Convert", lancer_convert, 1)
+    make_btn(foot, ">  3. Measure identity (before/after)", lancer_measure, 1)
 
 
 
@@ -2657,8 +2647,7 @@ def tab_brainwave(nb):
 
 
 def tab_comparator(nb):
-    f = tk.Frame(nb)
-    nb.add(f, text="[Cmp] Comparator")
+    f, foot = scrollable_tab(nb, "[Cmp] Comparator")
     f.grid_columnconfigure(1, weight=1)
 
     v_cmp_ref      = tk.StringVar()
@@ -2764,7 +2753,7 @@ def tab_comparator(nb):
              fg='gray', font=('Arial', 8)).pack(side='left', padx=6)
 
     row += 1
-    console = add_console(f, row)
+    console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
         ref = v_cmp_ref.get().strip()
@@ -2815,7 +2804,7 @@ def tab_comparator(nb):
         cmd = build_cmd(v_cmp_audio.get().strip(), output, opt_output, n_iter, conv_thr)
         run_cmd(cmd, console, btn, stop_btn, line_callback=_on_line)
 
-    make_btn(f, ">  Compare & Optimise", lancer, row + 1)
+    make_btn(foot, ">  Compare & Optimise", lancer, row + 1)
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
