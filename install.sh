@@ -90,6 +90,15 @@ python -c "import tkinter" >/dev/null 2>&1 \
     && echo "    tkinter: found" \
     || { echo "    tkinter: MISSING"; MISSING+=("python3-tk"); }
 
+# zenity is optional: without it the app falls back to Tk's own file dialog,
+# which works but shows no sizes and offers no copy, paste or delete.
+if command -v zenity >/dev/null 2>&1; then
+    echo "    zenity: found (system file chooser will be used)"
+else
+    echo "    zenity: not found (optional — Tk's basic file dialog will be used)"
+    echo "            sudo apt install zenity   for sizes, sorting and copy/paste"
+fi
+
 if [ ${#MISSING[@]} -gt 0 ]; then
     warn "Install the missing ones with your package manager, for example:"
     echo "    sudo apt install ${MISSING[*]/rubberband/rubberband-cli}"

@@ -52,6 +52,9 @@ and it tells you the exact `apt` line instead of asking for your password.
 - Miniconda or Anaconda (recommended)
 - CUDA 12.x + compatible GPU (optional but significantly faster)
 - `ffmpeg` and `rubberband-cli` (system packages)
+- `zenity` (optional) — gives the file dialogs the system chooser, with sizes,
+  sorting, copy/paste and delete. Without it Tk's own dialog is used, which
+  works but shows none of that.
 
 ### Step 1 — Clone the repository
 
@@ -123,6 +126,10 @@ pip install -r requirements.txt
 
 # System tools (ffmpeg for audio/video, rubberband for pitch-preserving tempo):
 sudo apt install ffmpeg rubberband-cli
+
+# Optional: the system file chooser instead of Tk's bare one. Nothing breaks
+# without it -- the app falls back to Tk silently.
+sudo apt install zenity
 ```
 
 Run this in the `xtts` env on EVERY machine you clone the repo to — git syncs
