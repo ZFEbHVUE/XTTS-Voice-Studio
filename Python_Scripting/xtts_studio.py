@@ -1,3 +1,32 @@
+def split_paths(text):
+    """Split a multi-file field into paths, tolerating spaces in names.
+
+    Splitting on whitespace alone was wrong: half the sound libraries ship files
+    called "Chant du coq (ID 0283).wav", and each word became a missing file.
+    Splitting never is wrong too: voice rows have always held several references
+    separated by spaces, and that is the main quality lever in XTTS.
+
+    So: semicolons and newlines win, since neither can appear in a path. Failing
+    that, whitespace is tried and kept only when the pieces look like real
+    paths -- every one of them exists, or every one of them ends in an audio or
+    text extension. Anything else is one path with spaces in it.
+    """
+    if not text or not text.strip():
+        return []
+    raw = text.replace("\n", ";")
+    if ";" in raw:
+        return [p.strip() for p in raw.split(";") if p.strip()]
+    parts = text.split()
+    if len(parts) > 1:
+        if all(os.path.exists(p) for p in parts):
+            return parts
+        exts = ('.wav', '.mp3', '.flac', '.ogg', '.aiff', '.aif', '.m4a', '.txt')
+        if all(p.lower().endswith(exts) for p in parts):
+            return parts
+    single = text.strip()
+    return [single] if single else []
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -42,10 +71,28 @@ DIR_AMBIENT   = os.path.join(XTTS_ROOT, "Ambient_Musics")
 DIR_PUNCTUAL  = os.path.join(XTTS_ROOT, "Punctual_sounds")
 DIR_MP3       = os.path.join(XTTS_ROOT, "MP3toTXT")
 DIR_TXT       = os.path.join(XTTS_ROOT, "Song_to_TXT_with_Pauses")
+# .med projects: the script plus everything it depends on. Its own folder,
+# because a project is not a prompt -- Prompts/ holds the text alone.
+DIR_PROJECTS  = os.path.join(XTTS_ROOT, "Meditation_Projects")
 
 def _ensure_dir(d):
-    """Return directory if it exists, otherwise HOME."""
-    return d if os.path.isdir(d) else os.path.expanduser("~")
+    """Return the directory, creating it when it is one of ours.
+
+    Every DIR_* below XTTS_ROOT belongs to the app and is meant to be filled --
+    Voice_Presets is already created on its first save, and there is no reason
+    for Meditation_Projects or any other to behave differently. A folder that
+    does not exist yet used to send the dialog to HOME, so the first save landed
+    anywhere. Anything outside XTTS_ROOT is left alone and still falls back.
+    """
+    if os.path.isdir(d):
+        return d
+    try:
+        if os.path.abspath(d).startswith(os.path.abspath(XTTS_ROOT) + os.sep):
+            os.makedirs(d, exist_ok=True)
+            return d
+    except Exception:
+        pass
+    return os.path.expanduser("~")
 
 # ── File chooser ─────────────────────────────────────────────────────────────
 # Tk's own dialog shows no file sizes, cannot sort, and offers no copy, paste or
@@ -563,12 +610,12 @@ def tab_generator(nb):
     v_ambient = tk.StringVar()
     v_music   = tk.StringVar()
 
-    add_row(f, "Script (.txt)",  v_script,  0, [("Text","*.txt"),("All","*.*")], initialdir=DIR_PROMPTS)
-    add_row(f, "Output (wav/mp3)", v_output, 1, [("WAV","*.wav"),("MP3","*.mp3"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")], save=True, initialdir=DIR_OUTPUT)
+    add_row(f, "Script (.txt)",  v_script,  1, [("Text","*.txt"),("All","*.*")], initialdir=DIR_PROMPTS)
+    add_row(f, "Output (wav/mp3)", v_output, 2, [("WAV","*.wav"),("MP3","*.mp3"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")], save=True, initialdir=DIR_OUTPUT)
 
     # ── Voices — one row per voice, each with multi-ref support ──────────────
     voices_frame = tk.LabelFrame(f, text="Voices", padx=4, pady=2)
-    voices_frame.grid(row=2, column=0, columnspan=3, sticky='ew', padx=6, pady=3)
+    voices_frame.grid(row=3, column=0, columnspan=3, sticky='ew', padx=6, pady=3)
     voices_frame.grid_columnconfigure(1, weight=1)
     voice_rows_gen = []
 
@@ -576,9 +623,9 @@ def tab_generator(nb):
                               bg='#2d6a2d', fg='white')
     btn_add_voice.pack(anchor='w', padx=4, pady=2)
 
-    def add_gen_voice_row(num):
+    def add_gen_voice_row(num, path=""):
         v_num  = tk.IntVar(value=num)
-        v_refs = tk.StringVar()
+        v_refs = tk.StringVar(value=path)
         row_f  = tk.Frame(voices_frame)
         row_f.pack(fill='x', padx=2, pady=1, before=btn_add_voice)
         row_f.grid_columnconfigure(1, weight=1)
@@ -615,13 +662,13 @@ def tab_generator(nb):
 
     btn_add_voice.config(command=add_gen_voice)
 
-    add_row(f, "Ambient",       v_ambient, 3, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_AMBIENT)
+    add_row(f, "Ambient",       v_ambient, 4, [("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_AMBIENT)
     # ── Punctual sounds — one row per sound, numbered like the voices ────────
     # A single field separated by spaces broke on every library file called
     # "Chant du coq (ID 0283).wav"; one row per sound removes the question of
     # separators entirely, and the number shown is the one to use in [music=N].
     music_frame = tk.LabelFrame(f, text="Punctual sounds", padx=4, pady=2)
-    music_frame.grid(row=4, column=0, columnspan=3, sticky='ew', padx=6, pady=3)
+    music_frame.grid(row=5, column=0, columnspan=3, sticky='ew', padx=6, pady=3)
     music_frame.grid_columnconfigure(1, weight=1)
     music_rows_gen = []
 
@@ -676,14 +723,136 @@ def tab_generator(nb):
     # ── MP3 output options ────────────────────────────────────────────────────
     v_gen_mp3_bitrate = tk.StringVar(value='192')
     v_gen_mp3_mode    = tk.StringVar(value='cbr')
-    tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
+    tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
     frm_gen_mp3 = tk.Frame(f)
-    frm_gen_mp3.grid(row=5, column=1, sticky='w', padx=4)
+    frm_gen_mp3.grid(row=6, column=1, sticky='w', padx=4)
     ttk.Combobox(frm_gen_mp3, textvariable=v_gen_mp3_bitrate, width=6, state='readonly',
         values=['128','160','192','256','320']).pack(side='left')
     ttk.Combobox(frm_gen_mp3, textvariable=v_gen_mp3_mode, width=5, state='readonly',
         values=['cbr','vbr']).pack(side='left', padx=6)
     tk.Label(frm_gen_mp3, text="(only used if output is .mp3)", fg='grey').pack(side='left')
+
+    # Project files, on the right of the MP3 row: a prompt on its own says
+    # nothing about which voices and which sounds went with it, so reopening a
+    # session meant remembering. A .med carries the lot, the script text
+    # included, and is therefore worth sharing as a single file.
+    proj_frame = tk.LabelFrame(f, text="Project", padx=4, pady=2)
+    proj_frame.grid(row=0, column=0, columnspan=3, sticky='ew', padx=6, pady=(4, 3))
+    proj_bar = tk.Frame(proj_frame)
+    proj_bar.pack(anchor='w')
+
+    def save_project():
+        path = filedialog.asksaveasfilename(
+            title="Save project", defaultextension=".med",
+            filetypes=[("Meditation project", "*.med"), ("All", "*.*")],
+            initialdir=_ensure_dir(DIR_PROJECTS))
+        if not path:
+            return
+        sounds = [v.get().strip() for _l, v, _r in music_rows_gen if v.get().strip()]
+        voices = [v.get().strip() for _n, v, _f in voice_rows_gen if v.get().strip()]
+        # Build the whole text before touching the file: opening it truncates
+        # at once, so a failure here would leave an empty project behind.
+        try:
+            # One line per voice. A single voice row can hold SEVERAL reference
+            # files -- XTTS averages their speaker embeddings, which is the main
+            # quality lever -- so writing every row into one "voices =" line
+            # would have made it impossible to tell where voice 1 ended and
+            # voice 2 began, since both use the same separator.
+            voice_block = "".join(f"voice       = {v}\n" for v in voices)
+            body = (
+                "# XTTS Voice Studio project\n"
+                f"script_path = {v_script.get().strip()}\n"
+                f"output      = {v_output.get().strip()}\n"
+                + voice_block
+                + f"ambient     = {v_ambient.get().strip()}\n"
+                + f"sounds      = {' ; '.join(sounds)}\n"
+                + f"mp3_bitrate = {v_gen_mp3_bitrate.get()}\n"
+                + f"mp3_mode    = {v_gen_mp3_mode.get()}\n"
+                + "--- script ---\n"
+                + editor.get('1.0', 'end-1c'))
+        except Exception as e:
+            log(console, f"[ERR] Could not build the project: {e}")
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as fh:
+                fh.write(body)
+            log(console, f"[OK] Project saved: {os.path.basename(path)} "
+                         f"({len(voices)} voice(s), {len(sounds)} sound(s))")
+        except Exception as e:
+            log(console, f"[ERR] Could not save: {e}")
+
+    def load_project():
+        path = filedialog.askopenfilename(
+            title="Load project",
+            filetypes=[("Meditation project", "*.med"), ("All", "*.*")],
+            initialdir=_ensure_dir(DIR_PROJECTS))
+        if not path:
+            return
+        try:
+            raw = open(path, encoding='utf-8').read()
+        except Exception as e:
+            log(console, f"[ERR] Could not read: {e}")
+            return
+        head, sep, script = raw.partition("--- script ---\n")
+        if not sep:
+            log(console, "[ERR] Not a project file (no script section).")
+            return
+        cfg = {}
+        voice_lines = []
+        for line in head.splitlines():
+            if line.startswith('#') or '=' not in line:
+                continue
+            k, _, v = line.partition('=')
+            k, v = k.strip(), v.strip()
+            if k == 'voice':
+                voice_lines.append(v)       # one per row, refs kept together
+            elif k == 'voices' and v:
+                # Older projects wrote every voice on one line; recover what we
+                # can, one reference per row.
+                voice_lines.extend(split_paths(v))
+            else:
+                cfg[k] = v
+
+        v_script.set(cfg.get('script_path', ''))
+        v_output.set(cfg.get('output', ''))
+        v_ambient.set(cfg.get('ambient', ''))
+        if cfg.get('mp3_bitrate'):
+            v_gen_mp3_bitrate.set(cfg['mp3_bitrate'])
+        if cfg.get('mp3_mode'):
+            v_gen_mp3_mode.set(cfg['mp3_mode'])
+
+        # Rebuild the rows rather than filling the existing ones: the project
+        # may hold more or fewer than are on screen.
+        for _n, _v, rf in list(voice_rows_gen):
+            rf.destroy()
+        voice_rows_gen.clear()
+        for p in voice_lines:
+            add_gen_voice_row(len(voice_rows_gen) + 1, p)
+        if not voice_rows_gen:
+            add_gen_voice_row(1)
+
+        for _l, _v, rf in list(music_rows_gen):
+            rf.destroy()
+        music_rows_gen.clear()
+        for p in split_paths(cfg.get('sounds', '')):
+            add_music_row(p)
+        if not music_rows_gen:
+            add_music_row()
+
+        editor.delete('1.0', 'end')
+        editor.insert('1.0', script)
+        update_line_numbers()
+        log(console, f"[OK] Project loaded: {os.path.basename(path)} "
+                     f"({len(voice_rows_gen)} voice(s), "
+                     f"{len(music_rows_gen)} sound(s))")
+
+    tk.Button(proj_bar, text="Save project\u2026", width=13,
+              command=save_project).pack(side='left', padx=2)
+    tk.Button(proj_bar, text="Load project\u2026", width=13,
+              command=load_project).pack(side='left', padx=2)
+    tk.Label(proj_bar, text="a .med holds the script, the voices, the sounds "
+                            "and the output path", fg='grey').pack(side='left',
+                                                                   padx=(10, 0))
 
     # ── Éditeur de prompt ────────────────────────────────────────────────────
     editor_frame = ttk.LabelFrame(f, text="Prompt Editor")
@@ -1282,8 +1451,10 @@ def tab_generator(nb):
         voice_args = []
         valid_rows = [(vn, vr, vf) for vn, vr, vf in voice_rows_gen if vr.get().strip()]
         for i, (_vnum, _vrefs, _vframe) in enumerate(valid_rows):
-            refs = _vrefs.get().strip()
-            files = [rf.strip() for rf in refs.split() if rf.strip() and rf.strip() != '+']
+            # Same tolerant splitting as everywhere else: a reference file whose
+            # name contains a space -- common enough -- was being cut into
+            # fragments here and each fragment passed as a separate file.
+            files = [rf for rf in split_paths(_vrefs.get()) if rf != '+']
             voice_args += files
             if i < len(valid_rows) - 1:
                 voice_args.append('--')  # separator between voices
@@ -1693,9 +1864,9 @@ def tab_analyser(nb):
             cmd += ['--start-num', str(vnum)]
             if vseed != 0:
                 cmd += ['--seed', str(vseed)]
-            # support multiple space-separated reference files per voice
-            ref_files = [f for f in vpath.split() if f.strip()]
-            cmd += ref_files
+            # Several reference files per voice, split tolerantly so a name
+            # containing a space is not cut into pieces.
+            cmd += split_paths(vpath)
             cmd += [vlang]
             cmds.append(cmd)
 
@@ -2981,7 +3152,11 @@ def main():
     v_player_path = tk.StringVar()
     tk.Entry(player_bar, textvariable=v_player_path, width=50).pack(side='left', padx=4, fill='x', expand=True)
     def _pbrowse():
-        p = filedialog.askopenfilename(filetypes=[("Audio","*.wav *.mp3 *.flac *.ogg"),("All","*.*")], initialdir=DIR_MP3)
+        # Output_Song_files, not MP3toTXT: the player is there to listen to
+        # what was just generated, and that is where it lands.
+        p = filedialog.askopenfilename(
+            filetypes=[("Audio", "*.wav *.mp3 *.flac *.ogg"), ("All", "*.*")],
+            initialdir=_ensure_dir(DIR_OUTPUT))
         if p: v_player_path.set(p)
     tk.Button(player_bar, text="Browse", width=8, command=_pbrowse).pack(side='left', padx=2)
     play_btn = tk.Button(player_bar, text="> Play", width=8, bg='#1a6b9e', fg='white', font=('Arial',9,'bold'))
