@@ -570,6 +570,32 @@ The blocks paste straight into a prompt. In `[Gen]`, the preset bar inserts,
 saves, deletes and browses them; `--preset-name` names them per voice from the
 pipeline, `--no-save-preset` disables the automatic save.
 
+### Projects (`.med`)
+
+**`Save project…`** and **`Load project…`**, above the script field, keep a whole
+session in one readable file: the script text itself, each voice with its
+reference files, the ambient bed, the punctual sounds, the output path and the
+MP3 settings. A prompt on its own says nothing about what went with it.
+
+```
+# XTTS Voice Studio project
+script_path = .../Prompts/meditation.txt
+output      = .../Output_Song_files/session.wav
+voice       = .../anna_close.wav ; .../anna_room.wav
+voice       = .../lea.wav
+ambient     = .../pad.mp3
+sounds      = .../bowl.wav ; .../gong.wav
+mp3_bitrate = 192
+mp3_mode    = cbr
+--- script ---
+<the whole prompt>
+```
+
+One line per voice, because a voice row can hold several references — see
+below. Projects live in `Meditation_Projects/`, created on first use. Loading
+rebuilds the voice and sound rows to match the file, so a project with four
+voices opens with four rows.
+
 ### Multi-reference voices
 
 Multiple reference files per voice significantly improve cloning quality — XTTS averages the speaker embeddings:
