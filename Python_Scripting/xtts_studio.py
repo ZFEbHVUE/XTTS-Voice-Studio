@@ -7,6 +7,7 @@ Graphical interface for all XTTS-Voice-Studio scripts.
 
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, simpledialog, messagebox
+import re
 import subprocess
 import threading
 import sys
@@ -688,7 +689,7 @@ def tab_generator(nb):
     editor_frame = ttk.LabelFrame(f, text="Prompt Editor")
     editor_frame.grid(row=7, column=0, columnspan=3, sticky='nsew', padx=6, pady=4)
     editor_frame.grid_columnconfigure(0, weight=1)
-    editor_frame.grid_rowconfigure(3, weight=1)   # editor row expands
+    editor_frame.grid_rowconfigure(4, weight=1)   # editor row expands
 
     # Editor toolbar
     btn_bar = tk.Frame(editor_frame)
@@ -739,8 +740,14 @@ def tab_generator(nb):
     # ── Insert bar: pauses, ambient and punctual music ────────────────────
     # Inserts the exact tag syntax at the caret so it never has to be
     # memorised or mistyped.
+    # Two rows, not one: the bar grew with every insert button added and ran
+    # off the right edge, so Declare, Trigger, offset and Parallel could only
+    # be reached by widening the window. Pauses and ambient on the first row,
+    # music and the parallel block on the second.
     ins_bar = tk.Frame(editor_frame)
-    ins_bar.grid(row=1, column=0, columnspan=2, sticky='w', padx=4, pady=(0, 2))
+    ins_bar.grid(row=1, column=0, columnspan=2, sticky='w', padx=4, pady=(0, 1))
+    ins_bar2 = tk.Frame(editor_frame)
+    ins_bar2.grid(row=2, column=0, columnspan=2, sticky='w', padx=4, pady=(0, 2))
 
     v_pause_dur = tk.StringVar(value='2')
     v_music_num = tk.StringVar(value='1')
@@ -812,27 +819,74 @@ def tab_generator(nb):
               command=lambda: _insert(f"ambient_volume={_num(v_amb_vol, '-12')}"),
               width=8).pack(side='left', padx=2)
 
-    ttk.Separator(ins_bar, orient='vertical').pack(side='left', fill='y', padx=6, pady=2)
-
-    tk.Label(ins_bar, text="music #").pack(side='left')
-    tk.Entry(ins_bar, textvariable=v_music_num, width=3).pack(side='left')
-    tk.Label(ins_bar, text="s").pack(side='left', padx=(4, 0))
-    tk.Entry(ins_bar, textvariable=v_music_dur, width=4).pack(side='left')
-    tk.Label(ins_bar, text="dB").pack(side='left', padx=(4, 0))
-    tk.Entry(ins_bar, textvariable=v_music_vol, width=4).pack(side='left', padx=(0, 4))
-    tk.Button(ins_bar, text="Declare",
+    tk.Label(ins_bar2, text="Music:", fg='#444').pack(side='left', padx=(0, 4))
+    tk.Label(ins_bar2, text="music #").pack(side='left')
+    tk.Entry(ins_bar2, textvariable=v_music_num, width=3).pack(side='left')
+    tk.Label(ins_bar2, text="s").pack(side='left', padx=(4, 0))
+    tk.Entry(ins_bar2, textvariable=v_music_dur, width=4).pack(side='left')
+    tk.Label(ins_bar2, text="dB").pack(side='left', padx=(4, 0))
+    tk.Entry(ins_bar2, textvariable=v_music_vol, width=4).pack(side='left', padx=(0, 4))
+    tk.Button(ins_bar2, text="Declare",
               command=lambda: _insert(
                   f"music_{v_music_num.get().strip() or '1'}="
                   f"{_num(v_music_dur, '16')}s,{_signed(v_music_vol, '-15')}"),
               width=8).pack(side='left', padx=2)
-    tk.Button(ins_bar, text="Trigger",
+    tk.Button(ins_bar2, text="Trigger",
               command=lambda: _insert(f"[music={v_music_num.get().strip() or '1'}]",
                                       inline=True),
               width=8).pack(side='left', padx=2)
 
+    ttk.Separator(ins_bar2, orient='vertical').pack(side='left', fill='y', padx=6, pady=2)
+
+    # Parallel block: two or more voices speaking at once. offset= takes ONE
+    # value (every non-first voice shifted by it) or a comma-separated list,
+    # one absolute start time per voice from the second on -- "1s,5s" puts
+    # voice 2 at 1s and voice 3 at 5s. Left empty, all voices start together.
+    v_par_off = tk.StringVar(value="")
+    tk.Label(ins_bar2, text="offset").pack(side='left')
+    tk.Entry(ins_bar2, textvariable=v_par_off, width=12).pack(side='left', padx=(0, 2))
+    tk.Label(ins_bar2, text="s, any separator", fg='#777',
+             font=("Arial", 8)).pack(side='left', padx=(0, 4))
+
+    def _insert_parallel():
+        # Accept whatever separator comes to hand -- "1 2 5", "1,2,5", "1; 2; 5"
+        # or "1s 5s 4s" -- and always emit commas, because that is the only
+        # thing the generator's parser splits on: spaces gave it a single
+        # unreadable run and the offsets silently came out empty. Stripping
+        # spaces without treating them as separators is what produced
+        # "offset=1s5s4s".
+        raw = v_par_off.get().strip()
+        nums = re.findall(r'[\d.]+', raw)
+        if nums:
+            head = "[parallel, offset=" + ",".join(f"{n}s" for n in nums) + "]"
+        else:
+            head = "[parallel]"
+        try:
+            # Wrap the selection when there is one -- writing the voice lines
+            # first and bracketing them afterwards is the natural order.
+            if editor.tag_ranges('sel'):
+                body = editor.get('sel.first', 'sel.last').rstrip('\n')
+                editor.delete('sel.first', 'sel.last')
+                editor.insert('insert', f"{head}\n{body}\n[/parallel]\n")
+            else:
+                pos = editor.index('insert')
+                at_start = pos == editor.index('insert linestart')
+                before = '' if at_start else '\n'
+                editor.insert('insert', f"{before}{head}\n")
+                mark = editor.index('insert')
+                editor.insert('insert', "\n[/parallel]\n")
+                editor.mark_set('insert', mark)   # caret inside the block
+            editor.focus_set()
+            update_line_numbers()
+        except Exception as e:
+            print(f"[!] parallel insert failed: {e}")
+
+    tk.Button(ins_bar2, text="Parallel", command=_insert_parallel,
+              width=8).pack(side='left', padx=2)
+
     # ── Voice presets: save the {} / [] pair once, paste it into any script ──
-    ins_bar2 = tk.Frame(editor_frame)
-    ins_bar2.grid(row=2, column=0, columnspan=2, sticky='w', padx=4, pady=(0, 2))
+    preset_bar = tk.Frame(editor_frame)
+    preset_bar.grid(row=3, column=0, columnspan=2, sticky='w', padx=4, pady=(0, 2))
 
     # Shared with the tools: the pipeline writes here automatically, so a run
     # finished in the console shows up in this list without any copy-paste.
@@ -907,14 +961,14 @@ def tab_generator(nb):
         VP.delete(n); _refresh_presets()
         _status(f"Preset '{n}' deleted")
 
-    tk.Label(ins_bar2, text="Voice preset:", fg='#444').pack(side='left', padx=(0, 4))
-    cb_preset = ttk.Combobox(ins_bar2, textvariable=v_preset, width=22, state='readonly')
+    tk.Label(preset_bar, text="Voice preset:", fg='#444').pack(side='left', padx=(0, 4))
+    cb_preset = ttk.Combobox(preset_bar, textvariable=v_preset, width=22, state='readonly')
     cb_preset.pack(side='left', padx=2)
-    tk.Button(ins_bar2, text="Insert", command=_insert_preset,
+    tk.Button(preset_bar, text="Insert", command=_insert_preset,
               width=7).pack(side='left', padx=2)
-    tk.Button(ins_bar2, text="Save current", command=_save_preset,
+    tk.Button(preset_bar, text="Save current", command=_save_preset,
               width=12).pack(side='left', padx=2)
-    tk.Button(ins_bar2, text="Delete", command=_delete_preset,
+    tk.Button(preset_bar, text="Delete", command=_delete_preset,
               width=7).pack(side='left', padx=2)
     def _browse_preset():
         """Open any preset file, from Voice_Presets/ or anywhere else — presets
@@ -938,18 +992,18 @@ def tab_generator(nb):
         _status(f"{e.get('name', os.path.basename(p))} — "
                 + '  |  '.join(b for b in bits if b))
 
-    tk.Button(ins_bar2, text="Browse...", command=_browse_preset,
+    tk.Button(preset_bar, text="Browse...", command=_browse_preset,
               width=9).pack(side='left', padx=2)
-    tk.Button(ins_bar2, text="Refresh", command=lambda: _refresh_presets(),
+    tk.Button(preset_bar, text="Refresh", command=lambda: _refresh_presets(),
               width=8).pack(side='left', padx=2)
-    tk.Label(ins_bar2, text="(saved in Voice_Presets/ — the pipeline writes "
+    tk.Label(preset_bar, text="(saved in Voice_Presets/ — the pipeline writes "
                             "there; Refresh after a run)",
              fg='grey', font=("Arial", 8)).pack(side='left', padx=(8, 0))
     cb_preset.bind('<<ComboboxSelected>>', _show_preset_info)
 
     # ── Editor area with line numbers ─────────────────────────────────────
     editor_container = tk.Frame(editor_frame)
-    editor_container.grid(row=3, column=0, sticky='nsew', padx=4, pady=2)
+    editor_container.grid(row=4, column=0, sticky='nsew', padx=4, pady=2)
     editor_container.grid_columnconfigure(1, weight=1)
     editor_container.grid_rowconfigure(0, weight=1)
 
@@ -963,7 +1017,7 @@ def tab_generator(nb):
     editor.grid(row=0, column=1, sticky='nsew')
 
     scroll_e = ttk.Scrollbar(editor_frame, orient='vertical')
-    scroll_e.grid(row=3, column=1, sticky='ns')
+    scroll_e.grid(row=4, column=1, sticky='ns')
 
     def sync_scroll(*args):
         editor.yview(*args)
@@ -1174,7 +1228,7 @@ def tab_generator(nb):
     status_var = tk.StringVar(value="Ready  |  Ctrl+S: Save  |  Ctrl+H: Find/Replace  |  Ctrl+G: Go to line  |  Right-click: menu")
     status_lbl = tk.Label(editor_frame, textvariable=status_var,
                           anchor='w', font=('Arial', 8), fg='gray')
-    status_lbl.grid(row=4, column=0, columnspan=2, sticky='ew', padx=4)
+    status_lbl.grid(row=5, column=0, columnspan=2, sticky='ew', padx=4)
 
     _refresh_presets()          # now that the status bar can receive messages
 

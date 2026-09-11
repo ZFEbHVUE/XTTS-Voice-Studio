@@ -580,13 +580,44 @@ generator.py script.txt output.wav ref1.wav ref2.wav ref3.wav -- hollie.wav
 
 ### Parallel voice overlay
 
+Two or more voices speaking at the same time. Each `{N,...}` switches to that
+voice's track; `offset=` gives the absolute start of voices 2, 3, ... on the
+block's timeline, voice 1 always starting at 0.
+
+**One element per line.** The blocks, the text, the pauses and the sound cues
+each need their own line — this is the one place in the script where a tag
+sharing a line with text is a mistake waiting to happen.
+
 ```
 [parallel, offset=1s,5s]
-{1, 42, ...} [1, FR, ...] First voice starts immediately.
-{2, 0, ...}  [2, FR, ...] Second voice enters at 1s.
-{3, 0, ...}  [3, FR, ...] Third voice enters at 5s.
+{1, 42, 0, 275, 100, 250, 0.72, 55, 0.88, 4.5, 1, 51, 4, 0}
+[1, FR, 0.88, 6, -5, 1, -1, 75, 7000, 0.35, 0.35, 0.3, 0, 0, 0, 1]
+First voice, starts immediately.
+[music=1]
+{2, 42, 0, 224, 100, 250, 0.72, 55, 0.88, 4.5, 1, 51, 4, 0}
+[2, FR, 0.88, 3, -5, 1, -2, 95, 8000, 0.25, 0.35, 0.7, 0, 0, 0, 1]
+Second voice, enters at 1s.
+[pause=4s]
+And continues after a pause of its own.
+{3, 42, 0, 420, 100, 250, 0.72, 55, 0.88, 4.5, 1, 47, 4, 0}
+[3, EN, 0.88, 1, -5, 1, -2, 85, 7500, 0.35, 0.35, 0.5, 0, 0, 0, 1]
+Third voice, enters at 5s.
 [/parallel]
 ```
+
+`offset=` takes one value (every later voice shifted by it) or one per voice
+from the second on. In the **[Gen]** tab the `Parallel` button writes the block
+around the current selection, and its `offset` field accepts `1 2 5`, `1,2,5`,
+`1; 2; 5` or `1s 5s 4s` — it always emits the commas the parser needs.
+
+**Punctual sounds work inside the block.** A `[music=N]` cue is scheduled at the
+position it occupies in its own voice's track, plus that voice's offset, plus
+where the block itself sits in the script. Pauses, per-voice levels and every
+other tag behave as they do outside.
+
+A note on what a parallel block is for: two voices saying the *same* sentence a
+second apart produce a flanging echo rather than an overlay. It is meant for
+complementary material — a guide and a translation, a voice and a response.
 
 ---
 
