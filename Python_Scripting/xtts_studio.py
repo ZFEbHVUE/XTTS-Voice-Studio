@@ -46,28 +46,120 @@ def _ensure_dir(d):
     """Return directory if it exists, otherwise HOME."""
     return d if os.path.isdir(d) else os.path.expanduser("~")
 
+# ── File chooser ─────────────────────────────────────────────────────────────
+# Tk's own dialog shows no file sizes, cannot sort, and offers no copy, paste or
+# delete. When zenity is present -- it ships with most GTK desktops -- the real
+# system chooser is used instead, and every Browse button in the app benefits.
+# Falls back to Tk silently when it is not, so nothing breaks elsewhere.
+import shutil as _shutil
+
+_ZENITY = _shutil.which("zenity")
+
+
+def _zenity_filters(filetypes):
+    """Turn Tk's [(label, "*.wav *.mp3")] into zenity's --file-filter form."""
+    out = []
+    for label, pats in (filetypes or []):
+        pats = " ".join(p for p in str(pats).split() if p)
+        if pats:
+            out += ["--file-filter", f"{label} | {pats}"]
+    return out
+
+
+def _zenity_pick(filetypes=None, initialdir=None, save=False, multiple=False,
+                 title="Choose a file"):
+    """Return a list of paths, or None when zenity is unavailable or cancelled."""
+    if not _ZENITY:
+        return None
+    cmd = [_ZENITY, "--file-selection", f"--title={title}"]
+    if save:
+        cmd += ["--save", "--confirm-overwrite"]
+    if multiple:
+        # \n is impossible in a path on Linux, unlike zenity's default "|".
+        cmd += ["--multiple", "--separator=\n"]
+    if initialdir:
+        d = initialdir if initialdir.endswith(os.sep) else initialdir + os.sep
+        cmd += [f"--filename={d}"]
+    cmd += _zenity_filters(filetypes)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception:
+        return None
+    if r.returncode != 0:          # cancelled, or zenity failed
+        return [] if r.returncode == 1 else None
+    return [p for p in r.stdout.strip().split("\n") if p]
+
+
+# Replace Tk's three dialogs once, rather than editing every call site: the
+# app opens files from a dozen places (prompt editor, presets, per-row Browse
+# buttons) and they all deserve the better chooser. Each wrapper falls back to
+# the original when zenity is missing or is given positional arguments.
+_TK_OPEN  = filedialog.askopenfilename
+_TK_MULTI = filedialog.askopenfilenames
+_TK_SAVE  = filedialog.asksaveasfilename
+
+
+def _ask_open(*a, **kw):
+    if a:
+        return _TK_OPEN(*a, **kw)
+    p = _zenity_pick(kw.get("filetypes"), kw.get("initialdir"),
+                     title=kw.get("title", "Choose a file"))
+    if p is None:
+        return _TK_OPEN(**kw)
+    return p[0] if p else ""
+
+
+def _ask_multi(*a, **kw):
+    if a:
+        return _TK_MULTI(*a, **kw)
+    p = _zenity_pick(kw.get("filetypes"), kw.get("initialdir"),
+                     multiple=True, title=kw.get("title", "Choose files"))
+    if p is None:
+        return _TK_MULTI(**kw)
+    return tuple(p)
+
+
+def _ask_save(*a, **kw):
+    if a:
+        return _TK_SAVE(*a, **kw)
+    p = _zenity_pick(kw.get("filetypes"), kw.get("initialdir"), save=True,
+                     title=kw.get("title", "Save as"))
+    if p is None:
+        return _TK_SAVE(**kw)
+    if not p:
+        return ""
+    # zenity does not add the extension the filter implies; Tk does.
+    path = p[0]
+    ext = kw.get("defaultextension")
+    if ext and not os.path.splitext(path)[1]:
+        path += ext
+    return path
+
+
+filedialog.askopenfilename  = _ask_open
+filedialog.askopenfilenames = _ask_multi
+filedialog.asksaveasfilename = _ask_save
+
+
 def browse_file(var, filetypes=None, save=False, initialdir=None):
     if filetypes is None:
         filetypes = [("All", "*.*")]
     d = _ensure_dir(initialdir) if initialdir else None
-    if save:
-        path = filedialog.asksaveasfilename(filetypes=filetypes,
-                                            initialdir=d)
-    else:
-        path = filedialog.askopenfilename(filetypes=filetypes,
-                                          initialdir=d)
+    ask = filedialog.asksaveasfilename if save else filedialog.askopenfilename
+    path = ask(filetypes=filetypes, initialdir=d)
     if path:
         var.set(path)
+
 
 def browse_files(var, filetypes=None, initialdir=None):
     if filetypes is None:
         filetypes = [("All", "*.*")]
     d = _ensure_dir(initialdir) if initialdir else None
-    paths = filedialog.askopenfilenames(filetypes=filetypes,
-                                        initialdir=d)
+    paths = list(filedialog.askopenfilenames(filetypes=filetypes, initialdir=d))
     if paths:
         # Semicolon, not space: a path can contain spaces, a semicolon cannot.
         var.set(" ; ".join(paths))
+
 
 # Global audio player (one at a time)
 _player_state = {'proc': None, 'btn': None}
