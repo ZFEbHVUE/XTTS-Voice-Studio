@@ -192,33 +192,57 @@ Short tables still work: a 4-column list — or a bare column of frequencies rea
 off a phone analyser — parses fine, the later fields taking the values that
 reproduce the plain measured behaviour.
 
-### Measuring your own bowl
+### Measuring a real instrument
 
-**`Analyse a WAV…`** extracts the modes from a recording and fills the table.
+**`Analyse a WAV…`** reads a recording and fills the table. It handles two very
+different kinds of sound and picks between them itself:
 
-Method: the spectrum of the whole take gives the frequencies; each mode is then
-band-pass filtered on its own and its envelope followed — the slope of
-log(envelope) is the decay, and the envelope's residual ripple is that mode's
-beat rate.
+| | What it is | What is measured |
+|---|---|---|
+| **struck** | a bowl hit once and left to ring | frequencies, each partial's decay, its beat |
+| **drone** | a held note — didgeridoo, saxophone, tanpura, a bowl played with the mallet | frequencies and amplitudes over the steady part, the breath as each mode's beat |
 
-Validated against a synthetic bowl with known values:
+They need separate readers because the struck one fits the slope of each
+partial's decay, and a held note has no decay to fit: the fit fails, falls back
+to 30 s, and the frequencies end up measured on an attack that never happened.
 
-| Real | Measured |
-|---|---|
-| 256.0 Hz, decay 20 s, beat 0.90 | **256.4 Hz, 22.2 s, 0.87** |
-| 704.0 Hz, 8 s, 2.10 | **705.1 Hz, 7.9 s, 2.06** |
-| 1326.0 Hz, 3.5 s, 3.40 | **1325.9 Hz, 3.5 s, 3.33** |
+The choice is measured, not guessed — time spent near the peak, the start/end
+ratio, and how long the sound takes to reach full level. The third matters: a
+bowl with a very long ring looks flat over a short take and would otherwise
+pass for held. The verdict is printed, and the small **struck** and **drone**
+buttons force it either way.
 
-Frequencies to better than 0.2 %.
+**Method.** For a struck sound, the spectrum of the whole take gives the
+frequencies; each mode is then band-pass filtered on its own and its envelope
+followed — the slope of log(envelope) is the decay, the residual ripple is that
+mode's beat rate. For a held one, the same peaks are read on the steady part
+only, amplitudes are averaged over it, and decays are set long on purpose since
+there are none to measure.
 
-Modes below **2 %** of the strongest one are dropped: that far down the analyser
-is picking up measurement noise rather than the bowl, and those rows arrive with
-tell-tale nonsense — a 1700 Hz partial ringing for 30 s (the fallback value when
-the decay fit fails), or the same mode found twice a few Hz apart. On a real
-recording this took a 16-row table back to the 8 modes that carry the sound.
+Validated against synthetic instruments with known values:
 
-**For a good recording:** one strike, let it ring to the end, nothing else in
-the file. The longer the tail, the more accurate the decay times.
+| Instrument | Real | Measured |
+|---|---|---|
+| Bowl | 256.0 Hz, decay 20 s, beat 0.90 | **256.4 Hz, 22.2 s, 0.87** |
+| Bowl | 704.0 Hz, 8 s, 2.10 | **705.1 Hz, 7.9 s, 2.06** |
+| Didgeridoo | 73 / 146 / 219 Hz, breath 4.0 Hz | **exact, breath 3.93 Hz** |
+| Saxophone | 233 / 466 / 699 Hz | **234.4 / 467.4 / 700.4 Hz** |
+
+Modes below **2 %** of the strongest are dropped: that far down the reader is
+picking up measurement noise rather than the instrument, and those rows arrive
+with tell-tale nonsense — a 1700 Hz partial ringing for 30 s, or the same mode
+found twice a few Hz apart. On a real recording this took a 16-row table back to
+the 8 modes that carry the sound. The threshold is editable and works on the
+table as it stands, so raising it and lowering it again brings every mode back.
+
+**For a good recording:** one note. Let it ring for a struck sound, hold it for
+a drone, and keep the file free of anything else. A phrase that changes pitch
+mixes several fundamentals and the analysis means nothing.
+
+Note that a drone reading gives you the instrument's harmonic colour, not the
+instrument: the attack, the vibrato and the breath movement that make a
+saxophone recognisable are not there. For a meditation bed that is exactly what
+is wanted; as an imitation it is not.
 
 ### Ramps restart with each strike
 

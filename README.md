@@ -604,6 +604,10 @@ Multiple reference files per voice significantly improve cloning quality — XTT
 generator.py script.txt output.wav ref1.wav ref2.wav ref3.wav -- hollie.wav
 ```
 
+The optimiser now **searches over combinations** of those references rather than
+averaging them all and hoping. Which subset works best is not obvious — a
+denoised take can drag a clean one down — and it was never tested before.
+
 ### Parallel voice overlay
 
 Two or more voices speaking at the same time. Each `{N,...}` switches to that
