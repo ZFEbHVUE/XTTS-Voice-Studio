@@ -641,8 +641,23 @@ def main():
             AXES = [('vol', -18, 18), ('eq_low', -6, 6), ('eq_mid', -6, 6),
                     ('eq_high', -6, 6), ('hp', 40, 150), ('lp', 6000, 16000),
                     ('NR', 0, 0.5), ('comp', 0, 0.6), ('de-ess', 0, 0.5)]
-            x0 = _np.array([float(opt.get(k, 0)) for k, _, _ in AXES])
             bounds = [(lo, hi) for _, lo, hi in AXES]
+            lower = _np.array([lo for _, lo, _ in AXES], dtype=float)
+            upper = _np.array([hi for _, _, hi in AXES], dtype=float)
+
+            # The closed-loop tone fit can legitimately leave an EQ value just
+            # outside the identity optimiser's deliberately conservative bounds
+            # (for example eq_high=+6.4 while the identity search is capped at +6).
+            # SciPy's differential_evolution rejects an out-of-bounds x0, so make
+            # the starting point feasible for BOTH DE and Nelder-Mead.
+            x0_raw = _np.array([float(opt.get(k, 0)) for k, _, _ in AXES], dtype=float)
+            x0 = _np.clip(x0_raw, lower, upper)
+            if not _np.allclose(x0_raw, x0):
+                clipped = []
+                for (k, _, _), before, after in zip(AXES, x0_raw, x0):
+                    if abs(float(before) - float(after)) > 1e-12:
+                        clipped.append(f"{k} {before:g}->{after:g}")
+                print("  optimiser start clipped to bounds: " + ", ".join(clipped))
 
             evals = [0]
             def identity_of(x, wav_in, wav_out):
@@ -661,31 +676,70 @@ def main():
             print(f"  start (tone-fitted block): identity {base_id:.4f}")
 
             if args.optimise_audio == 'de':
+                # STRICT evaluation budget -------------------------------------------------
+                # scipy's DE budget is population_size * (maxiter + 1).  With init='sobol'
+                # the population is rounded UP to the next power of two, which is why the
+                # old popsize=10/maxiter>=5 configuration silently produced ~768 DE calls
+                # before the Nelder-Mead polish.  Here --optimise-budget is a REAL cap for
+                # the complete identity search (baseline + DE + local polish).
+                total_budget = max(64, int(args.optimise_budget))
+
+                # A smaller Sobol population is still broad enough for these 9 bounded axes
+                # while leaving useful room for local polish.  scipy rounds 6*9=54 -> 64.
+                de_popsize = 6
+                n_free = sum(1 for lo, hi in bounds if hi > lo)
+                requested_pop = max(1, de_popsize * n_free)
+                sobol_pop = 1 << int(_np.ceil(_np.log2(requested_pop)))
+
+                # Reserve roughly 25% of the budget for Nelder-Mead (up to 120 calls).
+                # The baseline evaluation above already consumed one call.
+                reserve_polish = min(120, max(40, total_budget // 4))
+                de_allowance = max(sobol_pop, total_budget - evals[0] - reserve_polish)
+                de_generations = max(0, de_allowance // sobol_pop - 1)
+
+                print(f"  strict optimisation budget: {total_budget} evaluations max "
+                      f"(Sobol population {sobol_pop}, DE generations {de_generations})")
+
                 # Seed the population with the tone-fitted block. Without it,
-                # differential evolution never evaluates the starting point and
-                # can return something WORSE after hundreds of evaluations —
-                # which is exactly what happens on a flat, noisy landscape.
+                # differential evolution may return something WORSE on a flat/noisy
+                # landscape.  x0 replaces one population member; it does not add a call.
                 try:
                     res = differential_evolution(
-                        neg_identity, bounds, maxiter=max(5, args.optimise_budget // 90),
-                        popsize=10, tol=1e-4, seed=0, polish=False, init='sobol', x0=x0)
+                        neg_identity, bounds, maxiter=de_generations,
+                        popsize=de_popsize, tol=1e-4, seed=0, polish=False,
+                        init='sobol', x0=x0)
                 except TypeError:            # older scipy has no x0=
                     res = differential_evolution(
-                        neg_identity, bounds, maxiter=max(5, args.optimise_budget // 90),
-                        popsize=10, tol=1e-4, seed=0, polish=False, init='sobol')
-                xb = res.x
-                print(f"  differential evolution: {evals[0]} evaluations")
-                r2 = minimize(neg_identity, xb, method='Nelder-Mead',
-                              options={'maxiter': 120, 'xatol': 1e-3, 'fatol': 1e-5})
-                if r2.fun < res.fun:
-                    xb = r2.x
-                print(f"  + Nelder-Mead polish: {evals[0]} total evaluations")
+                        neg_identity, bounds, maxiter=de_generations,
+                        popsize=de_popsize, tol=1e-4, seed=0, polish=False,
+                        init='sobol')
+                xb = _np.clip(res.x, lower, upper)
+                print(f"  differential evolution: {evals[0]} / {total_budget} evaluations")
+
+                # Spend ONLY the remaining budget on local polish.  maxfev, unlike
+                # maxiter, limits objective evaluations directly.
+                remaining = max(0, total_budget - evals[0])
+                if remaining >= 10:
+                    r2 = minimize(
+                        neg_identity, xb, method='Nelder-Mead', bounds=bounds,
+                        options={'maxiter': 120, 'maxfev': remaining,
+                                 'xatol': 1e-3, 'fatol': 1e-5})
+                    r2x = _np.clip(r2.x, lower, upper)
+                    if r2.fun < res.fun:
+                        xb = r2x
+                    print(f"  + Nelder-Mead polish: {evals[0]} / {total_budget} total evaluations")
+                else:
+                    print(f"  + Nelder-Mead polish skipped: only {remaining} evaluations remain")
             else:
-                r = minimize(neg_identity, x0, method='Nelder-Mead',
-                             options={'maxiter': args.optimise_budget,
-                                      'xatol': 1e-3, 'fatol': 1e-5})
-                xb = _np.clip(r.x, [b[0] for b in bounds], [b[1] for b in bounds])
-                print(f"  Nelder-Mead: {evals[0]} evaluations")
+                # Local optimiser: --optimise-budget is also a strict objective-call cap.
+                total_budget = max(16, int(args.optimise_budget))
+                remaining = max(1, total_budget - evals[0])
+                r = minimize(
+                    neg_identity, x0, method='Nelder-Mead', bounds=bounds,
+                    options={'maxiter': total_budget, 'maxfev': remaining,
+                             'xatol': 1e-3, 'fatol': 1e-5})
+                xb = _np.clip(r.x, lower, upper)
+                print(f"  Nelder-Mead: {evals[0]} / {total_budget} evaluations")
 
             best_id, best_blk = identity_of(xb, raw, cand)
             if best_id < base_id:
