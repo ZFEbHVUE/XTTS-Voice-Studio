@@ -65,6 +65,7 @@ def _handoff_set(target_name, value):
 
 XTTS_ROOT     = os.path.dirname(SCRIPTS_DIR)  # parent of Python_Scripting/
 DIR_PROMPTS   = os.path.join(XTTS_ROOT, "Prompts")
+LOGS_DIR      = os.path.join(XTTS_ROOT, "Logs")
 DIR_OUTPUT    = os.path.join(XTTS_ROOT, "Output_Song_files")
 DIR_VOICES    = os.path.join(XTTS_ROOT, "Voices_Cloning")
 DIR_AMBIENT   = os.path.join(XTTS_ROOT, "Ambient_Musics")
@@ -332,16 +333,85 @@ def _no_window():
     return {}
 
 
+
+def save_console(widget, what="log"):
+    """Write the console to a file.
+
+    Selecting and copying depends on the window manager, the keyboard layout
+    and which widget owns the X selection -- it fails often enough that a long
+    run's output could not be kept at all. Writing to a file depends on none of
+    that.
+    """
+    txt = widget.get('1.0', 'end-1c')
+    if not txt.strip():
+        return
+    import datetime as _dt
+    stamp = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = filedialog.asksaveasfilename(
+        title="Save console output", defaultextension=".txt",
+        filetypes=[("Text", "*.txt"), ("All files", "*.*")],
+        initialfile=f"{what}_{stamp}.txt",
+        initialdir=_ensure_dir(LOGS_DIR))
+    if not path:
+        return
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(txt)
+        widget.config(state='normal')
+        widget.insert('end', f"\n[OK] Console saved to {path}\n")
+        widget.see('end')
+    except Exception as e:
+        widget.config(state='normal')
+        widget.insert('end', f"\n[ERR] Could not save: {e}\n")
+        widget.see('end')
+
+
+def copy_console(widget):
+    """Copy everything to the clipboard, without relying on a selection."""
+    txt = widget.get('1.0', 'end-1c')
+    if not txt.strip():
+        return
+    try:
+        widget.clipboard_clear()
+        widget.clipboard_append(txt)
+        widget.update()          # keep it after the window closes
+    except Exception:
+        pass
+
+
 def add_console(parent, start_row):
+    """Console plus its own Save/Copy/Clear bar, in one grid cell.
+
+    The bar cannot go on the next grid row: in every tab that row already holds
+    the Run/Stop buttons. So console and bar share a container, which occupies
+    the single cell the caller asked for.
+    """
     parent.grid_rowconfigure(start_row, weight=1)
     parent.grid_columnconfigure(1, weight=1)
+
+    box = tk.Frame(parent)
+    box.grid(row=start_row, column=0, columnspan=3, sticky='nsew', padx=8, pady=4)
+    box.grid_rowconfigure(0, weight=1)
+    box.grid_columnconfigure(0, weight=1)
+
     console = scrolledtext.ScrolledText(
-        parent, height=18, bg='#1e1e1e', fg='#d4d4d4',
+        box, height=18, bg='#1e1e1e', fg='#d4d4d4',
         font=('Courier', 9), state='normal')
-    console.grid(row=start_row, column=0, columnspan=3,
-                 sticky='nsew', padx=8, pady=4)
+    console.grid(row=0, column=0, sticky='nsew')
     _make_readonly(console)
+
+    bar = tk.Frame(box)
+    bar.grid(row=1, column=0, sticky='w', pady=(2, 0))
+    tk.Button(bar, text="\U0001f4be Save log\u2026", width=12,
+              command=lambda: save_console(console)).pack(side='left', padx=(0, 3))
+    tk.Button(bar, text="Copy all", width=9,
+              command=lambda: copy_console(console)).pack(side='left', padx=3)
+    tk.Button(bar, text="Clear", width=7,
+              command=lambda: (console.config(state='normal'),
+                               console.delete('1.0', 'end'))).pack(side='left',
+                                                                   padx=3)
     return console
+
 
 def log(console, text):
     if _root:
@@ -1510,7 +1580,75 @@ def tab_auto(nb):
         def remove():
             row_f.destroy(); auto_rows.remove(entry)
         tk.Button(row_f, text="✕", command=remove).pack(side='left', padx=1)
-        entry = (v_path, v_lang, row_f, v_pname)
+
+        # What the reference actually contains, measured as soon as a path is
+        # entered. "Not enough voiced material to curate" is a late and opaque
+        # way to learn that a file is 6 s long or nearly silent; the numbers
+        # that decide it are cheap to read here.
+        info = tk.StringVar(value="")
+        row_suggest = [None]          # what curation could keep from this file
+        tk.Label(voices_frame, textvariable=info, fg='#555',
+                 font=("Arial", 8), anchor='w').pack(fill='x', padx=(28, 4))
+
+        def _probe(*_a):
+            p = v_path.get().strip()
+            if not p or not os.path.isfile(p):
+                info.set("")
+                return
+            info.set("reading\u2026")
+            def work():
+                try:
+                    import soundfile as _sf
+                    import numpy as _np
+                    d = _sf.info(p)
+                    y, sr = _sf.read(p, dtype='float32', always_2d=False)
+                    if getattr(y, 'ndim', 1) > 1:
+                        y = y.mean(axis=1)
+                    rms = float(_np.sqrt(_np.mean(y ** 2))) or 1e-12
+                    peak = float(_np.max(_np.abs(y))) or 1e-12
+                    # Voiced share from a relative threshold, as everywhere else:
+                    # 30 dB below the loud level, so a quiet take is not called
+                    # silent.
+                    hop = max(1, int(0.02 * sr))
+                    fr = _np.array([_np.sqrt(_np.mean(y[i:i + hop] ** 2))
+                                    for i in range(0, max(len(y) - hop, 1), hop)])
+                    if len(fr):
+                        db = 20 * _np.log10(fr + 1e-10)
+                        voiced = float(_np.mean(db > _np.percentile(db, 90) - 30))
+                    else:
+                        voiced = 0.0
+                    txt = (f"{d.duration:.1f}s  {d.samplerate} Hz  "
+                           f"{'mono' if d.channels == 1 else f'{d.channels}ch'}  |  "
+                           f"RMS {20 * _np.log10(rms):.1f} dBFS  "
+                           f"peak {20 * _np.log10(peak):.1f}  "
+                           f"voiced {voiced * 100:.0f}%")
+                    # What curation can actually work with, and a value that
+                    # leaves it something to choose from. Asking for more than
+                    # the file holds is the "Not enough voiced material" error,
+                    # which only appears after the model has loaded.
+                    usable = d.duration * voiced
+                    sugg = max(5.0, round(usable * 0.8))
+                    row_suggest[0] = sugg
+                    txt += f"  |  usable ~{usable:.0f}s"
+                    warn = []
+                    try:
+                        keep = float(v_a_keep.get())
+                    except Exception:
+                        keep = 45.0
+                    if usable < keep:
+                        warn.append(f"Keep s is {keep:g} — use {sugg:g} or less")
+                    if 20 * _np.log10(peak) < -20:
+                        warn.append("very quiet")
+                    if warn:
+                        txt += "   [!] " + "; ".join(warn)
+                    info.set(txt)
+                except Exception as e:
+                    info.set(f"could not read: {e}")
+            threading.Thread(target=work, daemon=True).start()
+
+        v_path.trace_add('write', _probe)
+
+        entry = (v_path, v_lang, row_f, v_pname, row_suggest)
         auto_rows.append(entry)
 
     add_auto_row()
@@ -1522,6 +1660,13 @@ def tab_auto(nb):
     v_a_keep   = tk.StringVar(value='45')
     v_a_wacc   = tk.StringVar(value='0.6')
     v_a_wid    = tk.StringVar(value='0.4')
+    # What the optimiser's second term measures. ECAPA is robust to pitch
+    # shifts by design -- it has to recognise someone who speaks higher today
+    # -- so a clone 33 Hz off with a much brighter spectrum can score ABOVE one
+    # that sits right on the reference. Measured on this project: 0.6465 vs
+    # 0.6039, and the ear ranked them the other way round. 'timbre' scores the
+    # distance in pitch, brightness and HNR instead.
+    v_a_obj    = tk.StringVar(value='identity')
     v_a_curate = tk.BooleanVar(value=True)
     v_a_autotx = tk.BooleanVar(value=True)
     v_a_beams  = tk.BooleanVar(value=False)
@@ -1538,10 +1683,31 @@ def tab_auto(nb):
     frm_a = tk.Frame(f); frm_a.grid(row=2, column=0, columnspan=3, sticky='w', padx=6, pady=3)
     tk.Label(frm_a, text="Seeds").pack(side='left', padx=(6, 2))
     tk.Entry(frm_a, textvariable=v_a_seeds, width=20).pack(side='left')
+    def _auto_keep():
+        """Set Keep s from the shortest reference on screen.
+
+        --keep-seconds is ONE value for every voice in the pipeline run, so the
+        shortest file decides: asking for more than it holds fails the whole
+        run, and the error only surfaces after the model has loaded.
+        """
+        vals = [s[0] for _v, _l, _f, _p, s in auto_rows if s[0]]
+        if not vals:
+            log(console, "[*] Nothing measured yet — pick a reference first.")
+            return
+        v_a_keep.set(f"{min(vals):g}")
+        log(console, f"[*] Keep s set to {min(vals):g} "
+                     f"(shortest of {len(vals)} reference(s))")
+
     for lbl, var, w in [("Budget", v_a_budget, 4), ("Keep s", v_a_keep, 4),
                         ("w_acc", v_a_wacc, 4), ("w_id", v_a_wid, 4)]:
         tk.Label(frm_a, text=lbl).pack(side='left', padx=(8, 2))
         tk.Entry(frm_a, textvariable=var, width=w).pack(side='left')
+        if lbl == "Keep s":
+            tk.Button(frm_a, text="auto", width=4, command=_auto_keep).pack(
+                side='left', padx=(2, 0))
+    tk.Label(frm_a, text="Objective").pack(side='left', padx=(8, 2))
+    ttk.Combobox(frm_a, textvariable=v_a_obj, width=9, state='readonly',
+                 values=['identity', 'timbre', 'both']).pack(side='left')
     tk.Label(frm_a, text="Device").pack(side='left', padx=(8, 2))
     ttk.Combobox(frm_a, textvariable=v_a_device, values=['cpu', 'cuda'],
                  width=6, state='readonly').pack(side='left')
@@ -1604,7 +1770,7 @@ def tab_auto(nb):
 
     def lancer(btn, stop_btn=None):
         voices = [(v.get().strip(), l.get(), p.get().strip())
-                  for v, l, _, p in auto_rows if v.get().strip()]
+                  for v, l, _, p, _s in auto_rows if v.get().strip()]
         if not voices:
             log(console, "[ERR] At least one voice required."); return
         cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'xtts_pipeline.py')]
@@ -1615,6 +1781,8 @@ def tab_auto(nb):
         cmd += ['--keep-seconds', v_a_keep.get().strip() or '45']
         cmd += ['--w-accent', v_a_wacc.get().strip() or '0.6']
         cmd += ['--w-identity', v_a_wid.get().strip() or '0.4']
+        if v_a_obj.get() != 'identity':
+            cmd += ['--objective', v_a_obj.get()]
         cmd += ['--device', v_a_device.get()]
         if not v_a_curate.get():
             cmd += ['--no-curate']
@@ -1672,6 +1840,56 @@ def tab_curate(nb):
             multi=True, initialdir=DIR_VOICES)
     add_row(f, "Curated output", v_cur_output, 1,
             [("WAV", "*.wav")], save=True, initialdir=DIR_VOICES)
+
+    # Same readout as the pipeline: what the references hold, and how much
+    # curation can keep. Asking for more fails only once the model has loaded.
+    cur_info = tk.StringVar(value="")
+    tk.Label(f, textvariable=cur_info, fg='#555', font=("Arial", 8),
+             anchor='w', justify='left').grid(row=5, column=0, columnspan=3,
+                                              sticky='w', padx=10)
+
+    def _probe_cur(*_a):
+        paths = [p for p in split_paths(v_cur_input.get()) if os.path.isfile(p)]
+        if not paths:
+            cur_info.set("")
+            return
+        cur_info.set("reading\u2026")
+
+        def work():
+            try:
+                import soundfile as _sf
+                import numpy as _np
+                total = 0.0
+                lines = []
+                for p in paths:
+                    d = _sf.info(p)
+                    y, sr = _sf.read(p, dtype='float32', always_2d=False)
+                    if getattr(y, 'ndim', 1) > 1:
+                        y = y.mean(axis=1)
+                    hop = max(1, int(0.02 * sr))
+                    fr = _np.array([_np.sqrt(_np.mean(y[i:i + hop] ** 2))
+                                    for i in range(0, max(len(y) - hop, 1), hop)])
+                    voiced = 0.0
+                    if len(fr):
+                        db = 20 * _np.log10(fr + 1e-10)
+                        voiced = float(_np.mean(db > _np.percentile(db, 90) - 30))
+                    total += d.duration * voiced
+                    lines.append(f"{os.path.basename(p)}: {d.duration:.1f}s "
+                                 f"voiced {voiced * 100:.0f}%")
+                sugg = max(5.0, round(total * 0.8))
+                txt = "  |  ".join(lines) + f"\nusable ~{total:.0f}s across "
+                txt += f"{len(paths)} file(s) — suggest Keep s {sugg:g}"
+                try:
+                    if total < float(v_cur_keep.get()):
+                        txt += f"   [!] Keep s is {v_cur_keep.get()}, too high"
+                except Exception:
+                    pass
+                cur_info.set(txt)
+            except Exception as e:
+                cur_info.set(f"could not read: {e}")
+        threading.Thread(target=work, daemon=True).start()
+
+    v_cur_input.trace_add('write', _probe_cur)
 
     def _suggest_out(*_):
         # Auto-fill "<first_ref>_curated.wav" when output is empty

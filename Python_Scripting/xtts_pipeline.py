@@ -84,6 +84,11 @@ def main():
     p.add_argument('--seeds', default='0 42 100 180 200',
                    help='Seeds screened by the optimiser (default: "0 42 100 180 200")')
     p.add_argument('--budget', type=int, default=60, help='Optimiser generation budget (default: 60)')
+    p.add_argument('--objective', choices=['identity', 'timbre', 'both'],
+                   default='identity',
+                   help="What the optimiser's second term measures: ECAPA "
+                        "identity (default), timbre closeness (pitch, "
+                        "brightness, HNR), or both.")
     p.add_argument('--w-accent', type=float, default=0.6)
     p.add_argument('--w-identity', type=float, default=0.4)
     p.add_argument('--keep-seconds', type=float, default=45.0, help='Curated reference length (default: 45)')
@@ -216,6 +221,8 @@ def main():
                '--budget', str(args.budget), '--method', 'rsm',
                '--w-accent', str(args.w_accent), '--w-identity', str(args.w_identity),
                '--whisper-model', args.whisper_model]
+        if args.objective != 'identity':
+            cmd += ['--objective', args.objective]
         if args.probe_beams:
             cmd += ['--probe-beams', '--beam-width', str(args.beam_width)]
         if args.device:

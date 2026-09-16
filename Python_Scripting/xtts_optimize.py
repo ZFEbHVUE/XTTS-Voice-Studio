@@ -113,6 +113,74 @@ def read_text(args, lang="en"):
     return _dt(lang)
 
 
+
+# ── Timbre distance ──────────────────────────────────────────────────────────
+# Why this exists: ECAPA cosine is what every score here has been built on, and
+# it is robust to pitch shifts BY DESIGN -- it has to recognise someone who
+# speaks higher today than yesterday. Measured on a real case, a clone 33 Hz
+# above the reference with a spectral centroid 900 Hz brighter scored 0.6465
+# while an XTTS clone 24 Hz below and 9 Hz from the reference's centroid scored
+# 0.6039. The ear ranked them the other way round, and unambiguously.
+#
+# So this measures what the ear notices and ECAPA forgives: how far the voice
+# sits in pitch, how bright it is, and how clean. Each term is divided by a gap
+# that is audible on its own, so a distance of 1.0 in any one of them is about
+# as wrong as 1.0 in another.
+TIMBRE_SCALE = {
+    'f0_semitones': 2.0,    # 2 st off is a different-sounding voice
+    'centroid_hz': 300.0,   # 300 Hz of brightness is plainly audible
+    'hnr_db': 3.0,          # 3 dB of harmonic-to-noise is a change of texture
+}
+
+
+def timbre_features(path, sr_target=22050):
+    """Median F0, spectral centroid and HNR of a file -- the three the ear uses.
+
+    Returns None when the file holds no usable voiced material, so a failed
+    generation is skipped rather than scored as a perfect match.
+    """
+    try:
+        import numpy as _np
+        import librosa as _lb
+        y, sr = _lb.load(path, sr=sr_target, mono=True)
+        if len(y) < sr // 4:
+            return None
+        f0, voiced, _ = _lb.pyin(y, fmin=60, fmax=500, sr=sr,
+                                 frame_length=2048, hop_length=512)
+        fv = f0[~_np.isnan(f0)]
+        if len(fv) < 8:
+            return None
+        cen = float(_np.mean(_lb.feature.spectral_centroid(y=y, sr=sr)))
+        # HNR from the harmonic/percussive split: cheap, and consistent between
+        # the two files being compared, which is all that matters here.
+        h, p = _lb.effects.hpss(y)
+        eh = float(_np.mean(h ** 2)) + 1e-12
+        ep = float(_np.mean(p ** 2)) + 1e-12
+        return {'f0': float(_np.median(fv)),
+                'centroid': cen,
+                'hnr': float(10.0 * _np.log10(eh / ep))}
+    except Exception:
+        return None
+
+
+def timbre_distance(ref, clone):
+    """0 = same timbre. Each term normalised by an audible gap; see TIMBRE_SCALE."""
+    import numpy as _np
+    if not ref or not clone:
+        return None
+    st = abs(12.0 * _np.log2(max(clone['f0'], 1e-6) / max(ref['f0'], 1e-6)))
+    d_f0 = st / TIMBRE_SCALE['f0_semitones']
+    d_cen = abs(clone['centroid'] - ref['centroid']) / TIMBRE_SCALE['centroid_hz']
+    d_hnr = abs(clone['hnr'] - ref['hnr']) / TIMBRE_SCALE['hnr_db']
+    return float(d_f0 + d_cen + d_hnr)
+
+
+def timbre_score(ref, clone):
+    """Turn the distance into something to MAXIMISE, like every other score."""
+    d = timbre_distance(ref, clone)
+    return None if d is None else float(1.0 / (1.0 + d))
+
+
 def _unique(seq):
     out = []
     for x in seq:
@@ -160,6 +228,13 @@ def main():
     ap.add_argument("--probe-texts", type=int, default=2)
     ap.add_argument("--budget", type=int, default=60,
                     help="Sampling-search generation budget (default 60)")
+    ap.add_argument("--objective", choices=["identity", "timbre", "both"],
+                    default="identity",
+                    help="What the second term of the score measures. "
+                         "identity (default): ECAPA cosine, as before. "
+                         "timbre: closeness in pitch, brightness and HNR -- "
+                         "what the ear notices and ECAPA forgives by design. "
+                         "both: the mean of the two.")
     ap.add_argument("--w-accent", type=float, default=0.6)
     ap.add_argument("--w-identity", type=float, default=0.4)
     ap.add_argument("--rounds", type=int, default=2)
@@ -233,7 +308,10 @@ def main():
     print(f"  References : {len(all_refs)}")
     for i, r in enumerate(all_refs, 1):
         print(f"    {i}. {os.path.basename(r)}")
-    print(f"  Objective  : {args.w_accent:.2f}.accent + {args.w_identity:.2f}.identity")
+    _second = {'identity': 'identity', 'timbre': 'timbre',
+               'both': 'identity+timbre'}[args.objective]
+    print(f"  Objective  : {args.w_accent:.2f}.accent + "
+          f"{args.w_identity:.2f}.{_second}")
     print(f"  Budgets    : conditioning {args.cond_budget} gens + sampling {args.budget} gens")
     print(f"  Search text: {len(probe_texts)} sentence(s); hold-out {len(holdout_texts)}")
     print("=" * 72)
@@ -259,6 +337,23 @@ def main():
 
     tmpdir = tempfile.mkdtemp(prefix="xtts_opt_")
     wa, wi = float(args.w_accent), float(args.w_identity)
+    # Measured once: the reference does not change during the search.
+    ref_timbre = None
+    if args.objective in ('timbre', 'both'):
+        # Averaged over every reference, like the identity target above: one
+        # take can sit a little higher or brighter than the speaker usually is.
+        feats = [f for f in (timbre_features(r) for r in all_refs) if f]
+        if feats:
+            ref_timbre = {k: float(np.mean([f[k] for f in feats]))
+                          for k in ('f0', 'centroid', 'hnr')}
+        if ref_timbre:
+            print(f"  Reference timbre: F0 {ref_timbre['f0']:.0f} Hz, "
+                  f"centroid {ref_timbre['centroid']:.0f} Hz, "
+                  f"HNR {ref_timbre['hnr']:.1f} dB")
+        else:
+            print("  [!] Could not measure the reference timbre -- "
+                  "falling back to identity")
+            args.objective = 'identity'
 
     sample_evals = [0]
     cond_evals = [0]
@@ -327,7 +422,7 @@ def main():
             return None
 
         latents = get_latents(c)
-        frs, ids, per = [], [], []
+        frs, ids, per, tms = [], [], [], []
         for txt in texts:
             if counter[0] >= limit:
                 return None
@@ -346,9 +441,23 @@ def main():
             )
             ps = pron.score(wav, lang=lang, target_text=txt)
             ident = enc.cosine(ref_emb, enc.embed(wav))
+            # The second term of the objective, whichever it is. A file whose
+            # timbre cannot be measured keeps its identity score rather than
+            # being scored as perfect.
+            if args.objective == 'identity' or ref_timbre is None:
+                second = float(ident)
+            else:
+                ts = timbre_score(ref_timbre, timbre_features(wav))
+                if ts is None:
+                    second = float(ident)
+                elif args.objective == 'timbre':
+                    second = ts
+                else:
+                    second = 0.5 * float(ident) + 0.5 * ts
             frs.append(float(ps["score"]))
             ids.append(float(ident))
-            per.append(wa * frs[-1] + wi * ids[-1])
+            tms.append(second)
+            per.append(wa * frs[-1] + wi * second)
             if device == "cuda":
                 try:
                     torch.cuda.empty_cache()
@@ -357,11 +466,13 @@ def main():
 
         fr = float(np.mean(frs))
         identity = float(np.mean(ids))
-        score = wa * fr + wi * identity
+        second_m = float(np.mean(tms)) if tms else identity
+        score = wa * fr + wi * second_m
         sd = float(np.std(per, ddof=1)) if len(per) > 1 else 0.0
         sem = sd / np.sqrt(len(per)) if len(per) > 1 else 0.0
         rec = {
             "score": score, "french": fr, "identity": identity,
+            "timbre": second_m if args.objective != 'identity' else None,
             "seed": int(seed), "per_text": per, "sd": sd, "sem": sem,
             "worst": min(per), "cond": dict(c),
             "temp": float(prm["temp"]), "rep_pen": float(prm["rep_pen"]),
