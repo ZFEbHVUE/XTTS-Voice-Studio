@@ -1512,6 +1512,20 @@ def tab_generator(nb):
     console.grid(row=0, column=0, sticky='ew', padx=4, pady=4)
     _make_readonly(console)
 
+    # This tab builds its console by hand rather than through add_console, so
+    # it needs the same bar explicitly.
+    _gen_bar = tk.Frame(console_frame)
+    _gen_bar.grid(row=1, column=0, sticky='w', padx=4, pady=(0, 4))
+    tk.Button(_gen_bar, text="\U0001f4be Save log\u2026", width=12,
+              command=lambda: save_console(console, "generator")).pack(
+                  side='left', padx=(0, 3))
+    tk.Button(_gen_bar, text="Copy all", width=9,
+              command=lambda: copy_console(console)).pack(side='left', padx=3)
+    tk.Button(_gen_bar, text="Clear", width=7,
+              command=lambda: (console.config(state='normal'),
+                               console.delete('1.0', 'end'))).pack(side='left',
+                                                                   padx=3)
+
     def lancer(btn, stop_btn=None):
         # Sauvegarder automatiquement avant de lancer
         if editor.get('1.0', 'end-1c').strip():
