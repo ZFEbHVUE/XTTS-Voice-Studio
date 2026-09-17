@@ -853,6 +853,35 @@ It prints a ranked table and the winning `{}` block to paste into the Comparator
 Use it instead of hand-sweeping in the Validator when you want the optimum rather
 than an A/B listen.
 
+#### What the score measures — `--objective`
+
+| Value | Second term of the score |
+|---|---|
+| `identity` *(default)* | ECAPA cosine against the reference embedding |
+| `timbre` | closeness in pitch, brightness and harmonic-to-noise ratio |
+| `both` | the mean of the two |
+
+ECAPA is robust to pitch shifts **by design** — it has to recognise someone who
+speaks higher today than yesterday. That is right for speaker verification and
+wrong for choosing between clones. Measured here: a clone sitting 33 Hz above
+the reference with a spectral centroid 900 Hz brighter scored **0.6465**, while
+one 24 Hz below and 9 Hz from the reference's centroid scored **0.6039**.
+Listening ranked them the other way round, unambiguously.
+
+`timbre` scores the distance the ear notices instead:
+
+```
+d = |ΔF0| / 2 semitones  +  |Δcentroid| / 300 Hz  +  |ΔHNR| / 3 dB
+```
+
+Each term divided by a gap that is audible on its own, so one unit of any of
+them is about as wrong as one unit of another. On the case above it reverses the
+ranking. On one voice it also gave the better result on unseen text — **0.701**
+against 0.636 — so the two measures are not simply trading places.
+
+The default stays `identity`; nothing changes unless asked. In the **[Auto]
+Pipeline** tab the selector sits next to the weights.
+
 ---
 
 ## Measurement & optimisation reference
