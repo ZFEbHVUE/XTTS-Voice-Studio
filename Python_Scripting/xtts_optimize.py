@@ -468,12 +468,17 @@ def main():
         identity = float(np.mean(ids))
         second_m = float(np.mean(tms)) if tms else identity
         score = wa * fr + wi * second_m
+        # The median alongside the mean: one exceptional generation can carry
+        # a mean past two mediocre ones, and on a meditation of a hundred
+        # sentences the typical result matters more than the best.
+        median = float(np.median(per)) if per else score
         sd = float(np.std(per, ddof=1)) if len(per) > 1 else 0.0
         sem = sd / np.sqrt(len(per)) if len(per) > 1 else 0.0
         rec = {
             "score": score, "french": fr, "identity": identity,
             "timbre": second_m if args.objective != 'identity' else None,
             "seed": int(seed), "per_text": per, "sd": sd, "sem": sem,
+            "median": median,
             "worst": min(per), "cond": dict(c),
             "temp": float(prm["temp"]), "rep_pen": float(prm["rep_pen"]),
             "top_p": float(prm["top_p"]), "top_k": int(prm["top_k"]),
@@ -544,6 +549,31 @@ def main():
             r = test_cond(c)
             if r and (best_r is None or r["score"] > best_r["score"]):
                 best_r, best_cond = r, dict(c)
+
+        # C2b: the two are searched one after the other, so the pairs that were
+        # never tried are exactly the ones where the winner of C1 is not the
+        # best partner for the winner of C2 -- 30/8 is unreachable once 15 won
+        # on chunk=4. Rather than a full grid, revisit the neighbourhood of both
+        # winners: a handful of pairs, and only when there is budget left.
+        if cond_evals[0] < args.cond_budget - 2:
+            gw, cw = best_cond["gpt_cond_len"], best_cond["gpt_cond_chunk_len"]
+            near_g = _unique([x for x in lens
+                              if 0.5 * gw <= x <= 2.0 * gw])[:3]
+            near_c = _unique([x for x in chunks
+                              if 0.5 * cw <= x <= 2.0 * cw])[:3]
+            pairs = [(g, c) for g in near_g for c in near_c
+                     if c <= g and (g, c) != (gw, cw)]
+            if pairs:
+                print("\n  C2b — gpt_cond_len x chunk (pairs the sequential "
+                      "search cannot reach)")
+                for g, ch in pairs:
+                    if cond_evals[0] >= args.cond_budget:
+                        break
+                    c = dict(best_cond)
+                    c["gpt_cond_len"], c["gpt_cond_chunk_len"] = g, ch
+                    r = test_cond(c)
+                    if r and (best_r is None or r["score"] > best_r["score"]):
+                        best_r, best_cond = r, dict(c)
 
         # C3: reference normalization
         print("\n  C3 — sound_norm_refs")
@@ -786,6 +816,18 @@ def main():
             noise = max(0.01, np.hypot(best.get("sem", 0), held.get("sem", 0)))
             print(f"  HELD-OUT score {held['score']:.3f} ±{held['sd']:.3f} "
                   f"(accent {held['french']:.3f}, identity {held['identity']:.3f})")
+            if len(held.get("per_text", [])) > 1:
+                gap = held["median"] - held["score"]
+                print(f"  HELD-OUT median {held['median']:.3f} "
+                      f"({gap:+.3f} vs the mean)")
+                # A median well below the mean means one sentence came out much
+                # better than the rest: the settings suit that sentence, not the
+                # voice. Worth saying, since the mean alone hides it.
+                if gap < -2 * noise:
+                    print(f"  [!] One sentence is carrying the mean "
+                          f"(per-sentence: "
+                          f"{', '.join(f'{x:.3f}' for x in held['per_text'])}). "
+                          f"Judge on the median.")
             print(f"  Search -> hold-out drop {drop:+.3f}; noise ~{noise:.3f}")
             if drop > 2 * noise:
                 print("  [!] Some overfitting remains; use more probe texts before raising budget.")

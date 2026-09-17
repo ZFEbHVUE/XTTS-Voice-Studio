@@ -1766,8 +1766,11 @@ def tab_auto(nb):
     # intent — a named row is stored, an empty one is not. A second control
     # could only contradict it.
     v_a_hist = tk.BooleanVar(value=False)
-    tk.Checkbutton(frm_d, text="Never overwrite: save re-runs as 'name (2)', "
-                                "'name (3)'...",
+    # Covers the clone and the curated reference too, not just the preset:
+    # comparing two runs by ear is the only way to judge them, and the clone
+    # was being overwritten every time.
+    tk.Checkbutton(frm_d, text="Never overwrite: keep the previous preset, "
+                               "curated reference and clone (_2, _3...)",
                    variable=v_a_hist).pack(side='left', padx=6)
     tk.Label(frm_d, text="(fill 'save as' on a voice row to store it; empty rows "
                          "are processed but not saved)",

@@ -76,6 +76,23 @@ def set_lang(audio_block, lang):
     return re.sub(r'^(\[\s*\d+\s*,\s*)[A-Za-z-]+', lambda m: m.group(1) + lang, audio_block.strip())
 
 
+
+def _free_name(path):
+    """First unused name in the <stem>_2, _3 ... series.
+
+    Underscore, not "(2)": a parenthesised name has to be quoted on every
+    command line and trips the path splitting elsewhere in the project, and
+    these files are handled by hand far more often than presets are.
+    """
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{stem}_{n}{ext}"):
+        n += 1
+    return f"{stem}_{n}{ext}"
+
+
 def main():
     p = argparse.ArgumentParser(description='One-shot XTTS voice pipeline (curate -> analyse -> optimise -> fit)')
     p.add_argument('--voice', nargs=2, action='append', metavar=('WAV', 'LANG'),
@@ -109,7 +126,9 @@ def main():
                         "Repeat it once per voice; pass '-' to skip that voice. "
                         "Default: derived from each reference file.")
     p.add_argument('--keep-preset-history', action='store_true',
-                   help="Never overwrite: a re-run of the same voice is stored as "
+                   help="Never overwrite: a re-run of the same voice keeps the "
+                        "previous preset, curated reference and clone, numbering "
+                        "the new ones _2, _3 ... Stored as "
                         "'<name> (2)', '(3)'... so two runs can be compared. "
                         "Without it, the previous preset for that name is replaced.")
     p.add_argument('--precise', action='store_true', default=True,
@@ -163,6 +182,11 @@ def main():
         else:
             base, _ = os.path.splitext(ref)
             work = base + '_curated.wav'
+            if args.keep_preset_history and args.recurate:
+                # Only when re-curating: without --recurate an existing curated
+                # file is REUSED on purpose, and numbering it would silently
+                # curate again every run.
+                work = _free_name(work)
             if os.path.exists(work) and not args.recurate:
                 print(f"[*] Curated file already exists -> reusing {os.path.basename(work)} "
                       f"(--recurate to redo)")
@@ -248,6 +272,11 @@ def main():
         # ── 4. Closed-loop tone fit ───────────────────────────────────────────
         base, _ = os.path.splitext(ref)
         clone_out = base + '_pipeline_clone.wav'
+        if args.keep_preset_history:
+            # The clone is what gets listened to, and comparing two runs by ear
+            # is the only way to judge them -- overwriting it destroys the very
+            # thing the comparison needs.
+            clone_out = _free_name(clone_out)
         cmd = [py, S('voice_comparator.py'), work, lang,
                '--xtts-block', xtts_win, '--audio-block', audio_block,
                '--output-optimised', clone_out,
