@@ -1,0 +1,17 @@
+# name: Trio Racine-Coeur-Couronne (casque)
+# freq_hz amp decay_s beat_hz beat_dB delivery band ramp_hz duty stereo rot_rpm rot_depth strike_s strike_offset
+256 1 36 6 -3 bina Theta 0 0.5 0 0 1 30 0
+704 0.5 10.43 1.1 -6 mono none 0 0.5 0 1.5 0.3 30 0
+1326.1 0.3 5.25 2.3 -10 mono none 0 0.5 0 0 1 30 0
+2089 0.15 3.27 0 0 mono none 0 0.5 0 0 1 30 0
+2985 0.08 2.26 0 0 mono none 0 0.5 0 0 1 30 0
+341.3 1 27 6 -3 bina Theta 0 0.5 0 0 1 20 7
+938.6 0.5 7.83 1.1 -6 mono none 0 0.5 0 1.5 0.3 20 7
+1767.9 0.3 3.94 2.3 -10 mono none 0 0.5 0 0 1 20 7
+2785 0.15 2.45 0 0 mono none 0 0.5 0 0 1 20 7
+3979.6 0.08 1.7 0 0 mono none 0 0.5 0 0 1 20 7
+480 1 19.2 6 -3 bina Theta 0 0.5 0 0 1 45 15
+1320 0.5 5.57 1.1 -6 mono none 0 0.5 0 1.5 0.3 45 15
+2486.4 0.3 2.8 2.3 -10 mono none 0 0.5 0 0 1 45 15
+3916.8 0.15 1.74 0 0 mono none 0 0.5 0 0 1 45 15
+5596.8 0.08 1.5 0 0 mono none 0 0.5 0 0 1 45 15

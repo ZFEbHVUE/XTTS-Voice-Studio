@@ -1,0 +1,7 @@
+# name: Chakra 1 Racine (casque)
+# freq_hz amp decay_s beat_hz beat_dB delivery band ramp_hz duty stereo rot_rpm rot_depth strike_s strike_offset
+256 1 36 6 -3 bina Theta 0 0.5 0 0 1 0 0
+704 0.5 10.43 1.1 -6 mono none 0 0.5 0 1.5 0.3 0 0
+1326.1 0.3 5.25 2.3 -10 mono none 0 0.5 0 0 1 0 0
+2089 0.15 3.27 0 0 mono none 0 0.5 0 0 1 0 0
+2985 0.08 2.26 0 0 mono none 0 0.5 0 0 1 0 0

@@ -1,0 +1,7 @@
+# name: Chakra 4 Cœur (casque)
+# freq_hz amp decay_s beat_hz beat_dB delivery band ramp_hz duty stereo rot_rpm rot_depth strike_s strike_offset
+341.3 1 27 6 -3 bina Theta 0 0.5 0 0 1 0 0
+938.6 0.5 7.83 1.1 -6 mono none 0 0.5 0 1.5 0.3 0 0
+1767.9 0.3 3.94 2.3 -10 mono none 0 0.5 0 0 1 0 0
+2785 0.15 2.45 0 0 mono none 0 0.5 0 0 1 0 0
+3979.6 0.08 1.7 0 0 mono none 0 0.5 0 0 1 0 0

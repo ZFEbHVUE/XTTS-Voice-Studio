@@ -1,0 +1,7 @@
+# name: Chakra 2 Sacré (hp)
+# freq_hz amp decay_s beat_hz beat_dB delivery band ramp_hz duty stereo rot_rpm rot_depth strike_s strike_offset
+288 1 32 6 -12 iso Theta 0 0.5 0 0 1 0 0
+792 0.5 9.28 1.1 -6 mono none 0 0.5 0 1.5 0.3 0 0
+1491.8 0.3 4.67 2.3 -10 mono none 0 0.5 0 0 1 0 0
+2350.1 0.15 2.9 0 0 mono none 0 0.5 0 0 1 0 0
+3358.1 0.08 2.01 0 0 mono none 0 0.5 0 0 1 0 0

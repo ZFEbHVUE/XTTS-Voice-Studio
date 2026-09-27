@@ -1,5 +1,5 @@
 """
-brainwave_studio.py — Standalone GUI: binaural / isochronic / monaural
+brainwave_studio.py - Standalone GUI: binaural / isochronic / monaural
 tones + Tibetan bowl, band & chakra presets (3 tuning systems),
 multi-segment SESSION mode, pink/white/brown noise, DRONE masking.
 
@@ -28,6 +28,80 @@ try:
     _HAS_PYGAME = True
 except Exception:
     _HAS_PYGAME = False
+
+
+# Where bowls and sessions live by default: next to Python_Scripting/, the same
+# way voice presets have their own folder. Created on first use, so a fresh clone
+# needs nothing. The dialogs only START there -- any other folder still works.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BOWL_DIR = os.path.join(_REPO_ROOT, "Brainwave_Presets", "Bowls")
+SESSION_DIR = os.path.join(_REPO_ROOT, "Brainwave_Presets", "Sessions")
+MUSIC_DIR = os.path.join(_REPO_ROOT, "Brainwave_Presets", "Music")
+
+
+def preset_dir(path):
+    """Return path, creating it if needed; fall back to the home folder."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except OSError:
+        return os.path.expanduser("~")
+
+
+def music_to_portable(path):
+    """How a music path is written into a .seg.
+
+    A file inside Brainwave_Presets/Music is written RELATIVE to that folder,
+    so the session opens on every machine where the repo is cloned, whatever
+    the user name in /home. Anything else stays absolute, as before.
+    """
+    if not path:
+        return path
+    p = os.path.abspath(os.path.expanduser(str(path)))
+    try:
+        rel = os.path.relpath(p, MUSIC_DIR)
+    except ValueError:                           # other drive on Windows
+        return str(path)
+    return rel if not rel.startswith("..") else str(path)
+
+
+def resolve_music(path, base_dir=None):
+    """Find the file a .seg refers to, most specific place first:
+    the path as written, then relative to Brainwave_Presets/Music, then next to
+    the .seg itself, then by file name alone in the Music folder -- which
+    rescues a session saved with an absolute path on another machine."""
+    if not path:
+        return path
+    p = os.path.expanduser(str(path))
+    cands = [p] if os.path.isabs(p) else []
+    cands.append(os.path.join(MUSIC_DIR, p))
+    if base_dir:
+        cands.append(os.path.join(base_dir, p))
+    cands.append(os.path.join(MUSIC_DIR, os.path.basename(p)))
+    for c in cands:
+        if os.path.isfile(c):
+            return os.path.abspath(c)
+    return p                                     # not found: left as written
+
+
+def parse_global_music(text):
+    """Read the optional 'global_music = {...}' line of a .seg, or None."""
+    try:
+        tree = ast.parse(text or "")
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "global_music"
+                for t in node.targets):
+            try:
+                val = ast.literal_eval(node.value)
+            except (ValueError, SyntaxError):
+                return None
+            if isinstance(val, dict) and val.get("music"):
+                return {"music": str(val["music"]),
+                        "music_level": float(val.get("music_level", 0.25))}
+    return None
 
 
 BANDS = {"Delta": 2.0, "Theta": 6.0, "Alpha": 10.0, "Beta": 18.0, "Gamma": 40.0}
@@ -372,12 +446,12 @@ def transpose_bowl_modes(modes, target_hz, scale_decay=True):
     k = float(target_hz) / f0
     out = []
     for mm in modes:
-        f, a, d, b, bdb, dl, bd, rp, du, sp, rr, rd = normalise_mode(mm)
+        f, a, d, b, bdb, dl, bd, rp, du, sp, rr, rd, ss, so = normalise_mode(mm)
         nd = (d / k) if (scale_decay and k > 0) else d
         nb = b if bd in BANDS else b * k
         nr = rp if bd in BANDS else rp * k
         out.append((round(f * k, 1), a, round(max(nd, 0.05), 2), round(nb, 2),
-                    bdb, dl, bd, round(nr, 2), du, sp, rr, rd))
+                    bdb, dl, bd, round(nr, 2), du, sp, rr, rd, ss, so))
     return out
 
 
@@ -607,7 +681,7 @@ def parse_bowl_modes(text):
     """Read a bowl table. One mode per line, whitespace separated:
 
         freq_hz amp decay_s beat_hz beat_dB delivery band ramp_hz
-        duty stereo_phase rot_rpm rot_depth
+        duty stereo_phase rot_rpm rot_depth strike_s strike_offset
 
     Only the frequency is required; every later field falls back to the value
     that reproduces the plain measured behaviour. A 4-column table -- or a bare
@@ -624,6 +698,8 @@ def parse_bowl_modes(text):
       duty     : gate width, iso only
       stereo_phase : offset of the gate between ears, iso only
       rot_rpm / rot_depth : this mode's own slow pan
+      strike_s      : own strike period in seconds, 0 = with the whole bowl
+      strike_offset : delay before this mode's first strike, in seconds
     """
     modes = []
     for raw in (text or "").splitlines():
@@ -659,8 +735,19 @@ def parse_bowl_modes(text):
                       min(0.9, max(0.1, num(8, 0.5))),
                       min(0.5, max(0.0, num(9, 0.0))),
                       max(0.0, num(10, 0.0)),
-                      min(1.0, max(0.0, num(11, 1.0)))))
+                      min(1.0, max(0.0, num(11, 1.0))),
+                      max(0.0, num(12, 0.0)),
+                      max(0.0, num(13, 0.0))))
     return modes
+
+
+def bowl_name_from_text(text):
+    """The name stored in a .bowl file ('# name: ...'), or ''."""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line.lower().startswith("# name:"):
+            return line.split(":", 1)[1].strip()
+    return ""
 
 
 def mode_beat(mode, duration, sr, n, cycle_s=None):
@@ -688,31 +775,77 @@ def mode_beat(mode, duration, sr, n, cycle_s=None):
     return np.linspace(start, end, n)
 
 
+def strike_envelope(t, decay, period, offset=0.0, explicit=False, sr=44100):
+    """Envelope of one mode struck every `period` seconds from `offset`.
+
+    Automatic strikes (explicit=False) reproduce the historic behaviour exactly:
+    the envelope simply restarts, cutting the tail.
+
+    Explicit strikes let the previous strikes keep ringing, as a real bowl does
+    when it is struck again while still sounding: the tails add up. Summed over
+    every strike so far this is a geometric series, so no loop is needed. A
+    4 ms attack softens each new strike. Nothing sounds before `offset`.
+    """
+    period = max(float(period), 0.05)
+    dec = max(float(decay), 0.05)
+    tm = t - float(offset)
+    alive = tm >= 0.0
+    tmp = np.where(alive, tm, 0.0)
+    x = np.mod(tmp, period)
+    if not explicit:
+        return np.where(alive, np.exp(-x / dec), 0.0)
+    k = np.floor(tmp / period)                   # strikes before the current one
+    r = math.exp(-period / dec)
+    tail = (1.0 - r ** (k + 1.0)) / (1.0 - r) if r < 1.0 else (k + 1.0)
+    env = np.exp(-x / dec) * tail
+    atk = np.clip(x / 0.004, 0.0, 1.0)
+    # the attack only shapes the NEW strike, not the ringing tail underneath
+    env = env - np.exp(-x / dec) * (1.0 - atk)
+    return np.where(alive, env, 0.0)
+
+
+def strike_gain(decay, period, explicit):
+    """Steady-state level reached by overlapping strikes (1 when automatic)."""
+    if not explicit:
+        return 1.0
+    r = math.exp(-max(period, 0.05) / max(decay, 0.05))
+    return 1.0 / (1.0 - r) if r < 1.0 else 1.0
+
+
 def normalise_mode(mode):
-    """Accept a short mode and always hand back twelve fields.
+    """Accept a short mode and always hand back fourteen fields.
 
     freq, amp, decay_s, beat_hz, beat_db, delivery, band, ramp_hz,
-    duty, stereo_phase, rot_rpm, rot_depth
+    duty, stereo_phase, rot_rpm, rot_depth, strike_s, strike_offset
+
+    strike_s 0 means "automatic": the mode is struck together with the rest of
+    the bowl, every longest-decay seconds -- the historic behaviour. A value
+    above 0 gives the mode its own strike period, and strike_offset delays its
+    first strike. Several bowls in one table can then be played each at their
+    own pace, like a practitioner with a set of bowls in front of them.
 
     Old 4- and 7-field tables still parse: the extra fields take the values
     that reproduce the previous behaviour, so nothing that worked stops
     working.
     """
-    d = [None, 1.0, 10.0, 0.0, 0.0, "mono", "none", 0.0, 0.5, 0.0, 0.0, 1.0]
+    d = [None, 1.0, 10.0, 0.0, 0.0, "mono", "none", 0.0, 0.5, 0.0, 0.0, 1.0,
+         0.0, 0.0]
     m = list(mode) + d[len(mode):]
     return (float(m[0]), float(m[1]), float(m[2]), float(m[3]), float(m[4]),
             str(m[5]), str(m[6]), float(m[7]), float(m[8]), float(m[9]),
-            float(m[10]), float(m[11]))
+            float(m[10]), float(m[11]), max(0.0, float(m[12])),
+            max(0.0, float(m[13])))
 
 
-def bowl_modes_to_text(modes):
-    head = ("# freq_hz amp decay_s beat_hz beat_dB delivery band ramp_hz "
-           "duty stereo rot_rpm rot_depth\n")
+def bowl_modes_to_text(modes, name=""):
+    head = f"# name: {name}\n" if name else ""
+    head += ("# freq_hz amp decay_s beat_hz beat_dB delivery band ramp_hz "
+             "duty stereo rot_rpm rot_depth strike_s strike_offset\n")
     out = []
     for mm in modes:
-        f, a, d, b, bdb, dl, bd, rp, du, sp, rr, rd = normalise_mode(mm)
+        f, a, d, b, bdb, dl, bd, rp, du, sp, rr, rd, ss, so = normalise_mode(mm)
         out.append(f"{f:g} {a:g} {d:g} {b:g} {bdb:g} {dl} {bd} {rp:g} "
-                   f"{du:g} {sp:g} {rr:g} {rd:g}")
+                   f"{du:g} {sp:g} {rr:g} {rd:g} {ss:g} {so:g}")
     return head + "\n".join(out)
 
 
@@ -784,8 +917,18 @@ def validate_segment(seg):
     # theta bed and a foreground isochronic cue needs a different balance in
     # each part, and a single global value cannot express that.
     seg["tone_level"] = float(seg.get("tone_level", 1.0))
+    # Optional level of the GLOBAL music while this segment plays. Absent =
+    # the session's global level.
+    if seg.get("global_level") is not None:
+        seg["global_level"] = max(0.0, float(seg["global_level"]))
+    else:
+        seg.pop("global_level", None)
+    if seg.get("bowl_name"):
+        seg["bowl_name"] = str(seg["bowl_name"])
+    else:
+        seg.pop("bowl_name", None)
     if seg.get("music"):
-        seg["music"] = str(seg["music"])
+        seg["music"] = resolve_music(str(seg["music"]))
         seg["music_level"] = float(seg.get("music_level", 0.25))
     else:
         seg.pop("music", None)
@@ -793,7 +936,7 @@ def validate_segment(seg):
     return seg
 
 
-def segments_to_text(segments):
+def segments_to_text(segments, global_music=None):
     """Serialize a list of segments into copyable Python code.
 
     Everything a segment carries is written, not just the first few fields: a
@@ -824,6 +967,10 @@ def segments_to_text(segments):
             parts.append(f'"tuning": {s["tuning"]!r}')
         if s.get("chakra"):
             parts.append(f'"chakra": {s["chakra"]!r}')
+        if s.get("bowl_name"):
+            parts.append(f'"bowl_name": {s["bowl_name"]!r}')
+        if s.get("global_level") is not None:
+            parts.append(f'"global_level": {float(s["global_level"]):g}')
         if s.get("bowl_modes"):
             mm = ", ".join(
                 "(" + ", ".join(f"{x!r}" if isinstance(x, str) else f"{x:g}"
@@ -831,10 +978,16 @@ def segments_to_text(segments):
                 for one in s["bowl_modes"])
             parts.append(f'"bowl_modes": [{mm}]')
         if s.get("music"):
-            parts.append(f'"music": {s["music"]!r}')
+            parts.append(f'"music": {music_to_portable(s["music"])!r}')
             parts.append(f'"music_level": {s.get("music_level", 0.25):g}')
         lines.append("    {" + ", ".join(parts) + "},")
     lines.append("]")
+    # The global bed is part of the session: without it a saved session came
+    # back without the music it was built around.
+    if global_music and global_music.get("music"):
+        lines.append(f'global_music = {{"music": '
+                     f'{music_to_portable(global_music["music"])!r}, '
+                     f'"music_level": {float(global_music.get("music_level", 0.25)):g}}}')
     return "\n".join(lines)
 
 
@@ -933,15 +1086,20 @@ class ToneToolbox:
             # end if nothing asked for a difference.
             outL = np.zeros(n)
             outR = np.zeros(n)
+            auto_period = max(longest_env, 1.0)
             for mm in modes:
                 (f, amp, dec, b0, bdb, deliv, band, rp,
-                 duty_m, sph_m, rr_m, rd_m) = normalise_mode(mm)
-                env = np.exp(-tt / max(dec, 0.05))
+                 duty_m, sph_m, rr_m, rd_m, ss_m, so_m) = normalise_mode(mm)
+                explicit = ss_m > 0 or so_m > 0
+                period = ss_m if ss_m > 0 else auto_period
+                if explicit:
+                    env = strike_envelope(t, dec, period, so_m, True, self.sr)
+                else:
+                    env = np.exp(-tt / max(dec, 0.05))
                 # The ramp restarts with each strike: the envelope resets on
-                # `longest_env`, so the beat does too. Otherwise a long segment
+                # its period, so the beat does too. Otherwise a long segment
                 # spread the ramp over minutes and it vanished.
-                bt = mode_beat(mm, duration, self.sr, n,
-                               cycle_s=longest_env)
+                bt = mode_beat(mm, duration, self.sr, n, cycle_s=period)
                 # Phase from the cumulative frequency, so a ramp is followed
                 # instead of being read once at its start value.
                 ph = 2.0 * np.pi * np.cumsum(np.full(n, f)) / self.sr
@@ -1059,6 +1217,31 @@ class ToneToolbox:
     def _mix(a, b):
         m = min(len(a), len(b))
         return a[:m] + b[:m]
+
+    def _global_gain(self, segments, xfade, level, start, m):
+        """Level of the GLOBAL music for samples [start, start+m).
+
+        Each segment may set its own "global_level"; the others use the session
+        level. At a boundary the level glides over the crossfade, the same way
+        the segments themselves blend, so a louder or quieter bed never jumps.
+        """
+        nx = self._n(xfade)
+        starts, levels, s0 = [], [], 0
+        for k, seg in enumerate(segments):
+            starts.append(s0)
+            levels.append(float(seg.get("global_level", level)))
+            s0 += self._n(seg["duration"]) - (nx if k < len(segments) - 1 else 0)
+        starts = np.asarray(starts)
+        levels = np.asarray(levels)
+        idx = start + np.arange(m)
+        k = np.clip(np.searchsorted(starts, idx, side="right") - 1, 0, len(levels) - 1)
+        g = levels[k]
+        if nx > 0:
+            prev = np.maximum(k - 1, 0)
+            frac = (idx - starts[k]) / float(nx)
+            glide = (k > 0) & (frac < 1.0)
+            g = np.where(glide, levels[prev] + (levels[k] - levels[prev]) * frac, g)
+        return g
 
     def _crossfade_concat(self, parts, xfade):
         nx = self._n(xfade)
@@ -1188,8 +1371,10 @@ class ToneToolbox:
         # Drone and noise were applied here, once, over the whole session; they
         # are per segment now (see the loop above). Only the global music bed
         # remains a session-wide layer.
-        if music is not None and music_level > 0:
-            mm = _MusicStream(music, music_level, self.sr).read(len(full))
+        if music is not None:
+            mm = (_MusicStream(music, 1.0, self.sr).read(len(full))
+                  * self._global_gain(segments, xfade, music_level, 0,
+                                      len(full))[:, None])
             if duck > 0:
                 mm = mm * _Ducker(duck, self.sr).gains(tones)
             full = self._mix(full, mm)
@@ -1250,22 +1435,34 @@ class ToneToolbox:
             if bmodes:
                 nm = [normalise_mode(mm) for mm in bmodes]
                 ph = np.zeros(2 * len(nm))
-                norm = 1.0 / (2.0 * max(sum(mm[1] for mm in nm), 1e-9))
                 longest = max(mm[2] for mm in nm)
+                auto_period = max(longest, 1.0)
+                expl = [(mm[12] > 0 or mm[13] > 0) for mm in nm]
+                per = [(mm[12] if mm[12] > 0 else auto_period) for mm in nm]
+                # Overlapping explicit strikes ring louder than one strike; the
+                # headroom accounts for it so the stream can never clip. With
+                # automatic strikes every gain is 1 and this is the old formula.
+                norm = 1.0 / (2.0 * max(sum(mm[1] * strike_gain(mm[2], per[j], expl[j])
+                                            for j, mm in enumerate(nm)), 1e-9))
                 # Beat curves are computed over the WHOLE segment then sliced,
                 # so a ramp is continuous across blocks instead of restarting.
                 curves = [mode_beat(mm, seg["duration"], self.sr, n,
-                                    cycle_s=longest) for mm in bmodes]
+                                    cycle_s=per[j]) for j, mm in enumerate(bmodes)]
                 gate_acc = np.zeros(len(nm))
                 for i0 in range(0, n, block):
                     i1 = min(n, i0 + block)
                     ln = i1 - i0
-                    tt = np.mod((t0 + np.arange(ln)) / self.sr, max(longest, 1.0))
+                    tabs_b = (t0 + np.arange(ln)) / self.sr
+                    tt = np.mod(tabs_b, max(longest, 1.0))
                     oL = np.zeros(ln)
                     oR = np.zeros(ln)
                     for j, (f, amp, dec, b0, bdb, deliv, band, rp,
-                            duty_m, sph_m, rr_m, rd_m) in enumerate(nm):
-                        env = np.exp(-tt / max(dec, 0.05))
+                            duty_m, sph_m, rr_m, rd_m, ss_m, so_m) in enumerate(nm):
+                        if expl[j]:
+                            env = strike_envelope(tabs_b, dec, per[j], so_m,
+                                                  True, self.sr)
+                        else:
+                            env = np.exp(-tt / max(dec, 0.05))
                         bt = curves[j][i0:i1]
                         p1 = ph[2 * j] + two_pi * f * np.arange(1, ln + 1) / self.sr
                         ph[2 * j] = p1[-1] % two_pi
@@ -1572,11 +1769,13 @@ class ToneToolbox:
                     music_arrays[p] = load_music(p, self.sr)
                 seg_mlev = max(seg_mlev, float(s.get("music_level", 0.25)))
         # fixed, clip-safe gain (streaming cannot normalize after the fact)
-        mlev = music_level if music is not None else 0.0
+        mlev = (max([music_level] + [float(s.get("global_level", 0.0))
+                                     for s in segments])
+                if music is not None else 0.0)
         gain = 0.9 / max(self.amp + drone + noise + mlev + seg_mlev, 1e-9)
         # Drone and noise are per segment now; nothing global left but the bed.
         dr = nz = None
-        mus = _MusicStream(music, mlev, self.sr) if music is not None else None
+        mus = _MusicStream(music, 1.0, self.sr) if music is not None else None
         gduck = _Ducker(duck, self.sr) if (duck > 0 and mus is not None) else None
         # Always use the per-segment generator now: it carries drone, noise,
         # ducking and rotation, not just music, so it must run even when no
@@ -1598,7 +1797,8 @@ class ToneToolbox:
                     if nz is not None:
                         chunk = chunk + nz.read(m)
                     if mus is not None:
-                        mm = mus.read(m)
+                        mm = mus.read(m) * self._global_gain(
+                            segments, xfade, music_level, written, m)[:, None]
                         if gduck is not None:
                             mm = mm * gduck.gains(tones)
                         chunk = chunk + mm
@@ -1712,7 +1912,10 @@ def load_music(path, sr=44100):
 class _MusicStream:
     """Serve a stereo music buffer in arbitrary chunks, looped seamlessly."""
     def __init__(self, audio, level, sr, xfade=0.05):
-        self.a = np.ascontiguousarray(audio, dtype=np.float64)
+        # A COPY: the loop seam is blended in place below, and a view would
+        # rewrite the caller's array -- every Play session used to blend the
+        # stored global music a little more at its start.
+        self.a = np.array(audio, dtype=np.float64, copy=True)
         self.level, self.pos, self.n = level, 0, len(self.a)
         nx = min(int(xfade * sr), self.n // 4)
         if nx > 0 and self.n > 2 * nx:              # pre-blend the loop seam once
@@ -1888,7 +2091,7 @@ class BrainwaveStudio:
         self.pframe.grid_remove()
         if not self.audio_ok:
             self.status.set(f"Audio preview unavailable ({self.audio_err or 'no device'}) "
-                            "— export still works.")
+                            "- export still works.")
         else:
             self.status.set("Ready. Binaural -> use headphones.")
         self._update_advice()
@@ -1940,7 +2143,7 @@ class BrainwaveStudio:
         cols = [("freq_hz", 9), ("amp", 6), ("decay_s", 7), ("beat_hz", 7),
                 ("beat_dB", 7), ("delivery", 8), ("band", 7), ("ramp_hz", 7),
                 ("duty", 6), ("stereo", 6), ("rot/min", 7), ("depth", 6),
-                ("note \u2192 freq", 15)]
+                ("strike_s", 7), ("offset_s", 7), ("note -> freq", 15)]
         for c, (name, w) in enumerate(cols):
             ttk.Label(grid, text=name, width=w,
                       font=("Arial", 8, "bold")).grid(row=0, column=c, padx=1, pady=2)
@@ -1952,6 +2155,10 @@ class BrainwaveStudio:
                 note_vals.append(f"{tn[:3]} {nm} {fq:g}")
         note_vals += [f"Sol {f:g}" for f in SOLFEGGIO_9]
 
+        # The bowl's name travels with it: into the .bowl file, into the
+        # segment, into the .seg -- so "LaSonotheque 1109" is still called that
+        # a month later instead of being "6 modes 473 Hz".
+        name_var = tk.StringVar(value=getattr(self, "bowl_name", "") or "")
         rows = []
         # The last complete set of modes, so the threshold can be raised and
         # lowered without losing anything.
@@ -1959,7 +2166,7 @@ class BrainwaveStudio:
 
         def add_row(vals=None):
             (f, a, d, b, bdb, dl, bd, rp,
-             du, sp, rr, rd) = normalise_mode(vals or (0.0,))
+             du, sp, rr, rd, ss, so) = normalise_mode(vals or (0.0,))
             r = len(rows) + 1
             ws = []
             for c, v, w in ((0, f"{f:g}" if f else "", 9), (1, f"{a:g}", 6),
@@ -1976,13 +2183,14 @@ class BrainwaveStudio:
             cb_b.set(bd); cb_b.grid(row=r, column=6, padx=1)
             ws += [cb_d, cb_b]
             for c, v, w in ((7, f"{rp:g}", 7), (8, f"{du:g}", 6), (9, f"{sp:g}", 6),
-                            (10, f"{rr:g}", 7), (11, f"{rd:g}", 6)):
+                            (10, f"{rr:g}", 7), (11, f"{rd:g}", 6),
+                            (12, f"{ss:g}", 7), (13, f"{so:g}", 7)):
                 e = ttk.Entry(grid, width=w)
                 e.insert(0, v)
                 e.grid(row=r, column=c, padx=1, pady=1)
                 ws.append(e)
             cb_n = ttk.Combobox(grid, width=14, state="readonly", values=note_vals)
-            cb_n.grid(row=r, column=12, padx=1)
+            cb_n.grid(row=r, column=14, padx=1)
 
             def _note(_e=None, _f=ws[0], _cb=cb_n):
                 s = _cb.get().split()
@@ -2000,8 +2208,8 @@ class BrainwaveStudio:
             cb_d.bind("<<ComboboxSelected>>", _grey)
             _grey()
 
-            btn = ttk.Button(grid, text="\u2715", width=3)
-            btn.grid(row=r, column=13, padx=2)
+            btn = ttk.Button(grid, text="X", width=3)
+            btn.grid(row=r, column=15, padx=2)
             entry = {"w": ws + [cb_n], "btn": btn}
 
             def _del():
@@ -2051,7 +2259,9 @@ class BrainwaveStudio:
                             min(0.9, max(0.1, num(w[8], 0.5))),
                             min(0.5, max(0.0, num(w[9], 0.0))),
                             max(0.0, num(w[10], 0.0)),
-                            min(1.0, max(0.0, num(w[11], 1.0)))))
+                            min(1.0, max(0.0, num(w[11], 1.0))),
+                            max(0.0, num(w[12], 0.0)),
+                            max(0.0, num(w[13], 0.0))))
             return got
 
         # ── files ────────────────────────────────────────────────────────────
@@ -2060,10 +2270,12 @@ class BrainwaveStudio:
             if not got:
                 pv.set("Nothing to save.")
                 return
+            stem = (name_var.get().strip() or "bowl").replace(" ", "_").replace("/", "-")
             path = filedialog.asksaveasfilename(
                 title="Save bowl", defaultextension=".bowl",
                 filetypes=[("Bowl", "*.bowl"), ("Text", "*.txt")],
-                initialfile="bowl.bowl", parent=win)
+                initialdir=preset_dir(BOWL_DIR),
+                initialfile=f"{stem}.bowl", parent=win)
             if not path:
                 return
             # Build the text BEFORE opening the file. open(path, "w") truncates
@@ -2072,7 +2284,7 @@ class BrainwaveStudio:
             # still expected the old 7-field mode. Never destroy the target
             # until there is something to put in it.
             try:
-                body = bowl_modes_to_text(got) + "\n"
+                body = bowl_modes_to_text(got, name_var.get().strip()) + "\n"
             except Exception as e:
                 pv.set(f"Could not format the table: {e}")
                 return
@@ -2087,11 +2299,14 @@ class BrainwaveStudio:
             path = filedialog.askopenfilename(
                 title="Load bowl",
                 filetypes=[("Bowl", "*.bowl *.txt"), ("All files", "*.*")],
-                parent=win)
+                initialdir=preset_dir(BOWL_DIR), parent=win)
             if not path:
                 return
             try:
-                modes = parse_bowl_modes(open(path, encoding="utf-8").read())
+                raw_txt = open(path, encoding="utf-8").read()
+                modes = parse_bowl_modes(raw_txt)
+                name_var.set(bowl_name_from_text(raw_txt) or
+                             os.path.splitext(os.path.basename(path))[0])
             except Exception as e:
                 pv.set(f"Could not read: {e}")
                 return
@@ -2112,7 +2327,7 @@ class BrainwaveStudio:
                            ("All files", "*.*")], parent=win)
             if not path:
                 return
-            pv.set("Analysing\u2026")
+            pv.set("Analysing...")
             win.update_idletasks()
             try:
                 modes, kind = analyse_any_wav(path)
@@ -2125,6 +2340,7 @@ class BrainwaveStudio:
                 return
             full_set[0] = list(modes)
             _fill(modes)
+            name_var.set(os.path.splitext(os.path.basename(path))[0])
             pv.set(f"{len(modes)} mode(s) read as a {kind} sound from "
                    f"{os.path.basename(path)}. If that is wrong, use the "
                    f"struck or drone button instead.")
@@ -2139,7 +2355,7 @@ class BrainwaveStudio:
                            ("All files", "*.*")], parent=win)
             if not path:
                 return
-            pv.set("Analysing the steady part\u2026")
+            pv.set("Analysing the steady part...")
             win.update_idletasks()
             try:
                 modes = analyse_drone_wav(path)
@@ -2152,6 +2368,7 @@ class BrainwaveStudio:
                 return
             full_set[0] = list(modes)
             _fill(modes)
+            name_var.set(os.path.splitext(os.path.basename(path))[0])
             pv.set(f"{len(modes)} mode(s) from the steady part of "
                    f"{os.path.basename(path)}. Decays are set long on purpose: "
                    f"a held sound has none. Check by ear.")
@@ -2163,7 +2380,7 @@ class BrainwaveStudio:
                            ("All files", "*.*")], parent=win)
             if not path:
                 return
-            pv.set("Analysing\u2026")
+            pv.set("Analysing...")
             win.update_idletasks()
             try:
                 modes = analyse_bowl_wav(path, min_amp=0.0)
@@ -2176,6 +2393,7 @@ class BrainwaveStudio:
                 return
             full_set[0] = list(modes)
             _fill(modes)
+            name_var.set(os.path.splitext(os.path.basename(path))[0])
             pv.set(f"{len(modes)} mode(s) measured from {os.path.basename(path)}. "
                    f"Set a threshold above and press Apply to drop the faint "
                    f"ones, then check by ear.")
@@ -2186,7 +2404,7 @@ class BrainwaveStudio:
         # depends on the recording. Editable, so it can be judged by ear.
         tf = ttk.Frame(win)
         tf.grid(row=3, column=0, sticky="w", padx=10, pady=(6, 0))
-        ttk.Label(tf, text="Keep modes \u2265").pack(side="left")
+        ttk.Label(tf, text="Keep modes >=").pack(side="left")
         v_minamp = tk.StringVar(value="2")
         ttk.Entry(tf, textvariable=v_minamp, width=5).pack(side="left", padx=2)
         ttk.Label(tf, text="% of the strongest").pack(side="left")
@@ -2224,23 +2442,28 @@ class BrainwaveStudio:
         ttk.Label(pf, text="Start from:").pack(side="left")
         for nm in BOWL_PRESETS:
             ttk.Button(pf, text=nm.replace("Generic ", ""), width=8,
-                       command=lambda n=nm: _fill(BOWL_PRESETS[n])).pack(side="left", padx=2)
+                       command=lambda n=nm: (_fill(BOWL_PRESETS[n]),
+                                             name_var.set(n))).pack(side="left", padx=2)
         ttk.Button(pf, text="+ row", width=7,
                    command=lambda: (add_row(),
                                     full_set.__setitem__(0, []))).pack(side="left",
                                                                       padx=(10, 2))
-        ttk.Button(pf, text="Save\u2026", width=8,
+        ttk.Button(pf, text="Save...", width=8,
                    command=_save).pack(side="left", padx=(14, 2))
-        ttk.Button(pf, text="Load\u2026", width=8,
+        ttk.Button(pf, text="Load...", width=8,
                    command=_load).pack(side="left", padx=2)
+        ttk.Label(pf, text="Name").pack(side="left", padx=(14, 2))
+        ttk.Entry(pf, textvariable=name_var, width=24).pack(side="left")
 
         def _apply(close=True):
             got = collect()
             if not got:
                 pv.set("No usable row -- the ratio-based bowl will be used.")
                 self.bowl_modes = []
+                self.bowl_name = ""
             else:
                 self.bowl_modes = got
+                self.bowl_name = name_var.get().strip()
                 forced = [f"{m[0]:g}Hz={m[6]}" for m in got if m[6] in BANDS]
                 pv.set(f"{len(got)} mode(s)"
                        + (f"; forced: {', '.join(forced)}" if forced else ""))
@@ -2250,7 +2473,7 @@ class BrainwaveStudio:
 
         bf = ttk.Frame(win)
         bf.grid(row=5, column=0, pady=(8, 10))
-        ttk.Button(bf, text="Analyse a WAV\u2026",
+        ttk.Button(bf, text="Analyse a WAV...",
                    command=_from_any).pack(side="left", padx=4)
         ttk.Button(bf, text="struck", width=7,
                    command=_from_wav).pack(side="left", padx=1)
@@ -2269,8 +2492,10 @@ class BrainwaveStudio:
         except Exception:
             pass
         if self.bowl_modes:
-            self.bowl_lbl.config(text=f"{len(self.bowl_modes)} modes "
-                                      f"({self.bowl_modes[0][0]:g} Hz\u2026)")
+            nm_ = getattr(self, "bowl_name", "")
+            self.bowl_lbl.config(text=(f"{nm_} - " if nm_ else "")
+                                 + f"{len(self.bowl_modes)} modes "
+                                   f"({self.bowl_modes[0][0]:g} Hz...)")
         else:
             self.bowl_lbl.config(text="ratios")
 
@@ -2279,9 +2504,12 @@ class BrainwaveStudio:
         win = tk.Toplevel(self.root)
         win.title("Solfeggio frequencies")
         win.transient(self.root)
+        # Let the text follow the window when it is resized.
+        win.grid_rowconfigure(0, weight=1)
+        win.grid_columnconfigure(0, weight=1)
         txt = scrolledtext.ScrolledText(win, wrap="word", width=78, height=28,
                                         padx=12, pady=12)
-        txt.grid(row=0, column=0)
+        txt.grid(row=0, column=0, sticky="nsew")
         txt.insert("1.0", SOLFEGGIO_NOTE)
         txt.config(state="disabled")
         ttk.Button(win, text="Close", command=win.destroy).grid(row=1, column=0,
@@ -2293,8 +2521,11 @@ class BrainwaveStudio:
         win = tk.Toplevel(self.root)
         win.title("Brainwave Studio -- what the evidence supports")
         win.transient(self.root)
+        # Let the text follow the window when it is resized.
+        win.grid_rowconfigure(0, weight=1)
+        win.grid_columnconfigure(0, weight=1)
         txt = tk.Text(win, wrap="word", width=84, height=26, padx=12, pady=12)
-        txt.grid(row=0, column=0)
+        txt.grid(row=0, column=0, sticky="nsew")
         txt.insert("1.0", HONESTY_NOTE)
         txt.config(state="disabled")
         ttk.Button(win, text="Close", command=win.destroy).grid(row=1, column=0,
@@ -2342,7 +2573,7 @@ class BrainwaveStudio:
                                         ("Monaural", "monaural"), ("Bowl", "bowl")]):
             ttk.Radiobutton(mf, text=lbl, value=val, variable=self.mode,
                             command=self._on_mode).grid(row=0, column=i, padx=2)
-        self.bowl_btn = ttk.Button(mf, text="Edit bowl\u2026", width=11,
+        self.bowl_btn = ttk.Button(mf, text="Edit bowl...", width=11,
                                    command=self.edit_bowl)
         self.bowl_btn.grid(row=0, column=4, padx=(10, 2))
         self.bowl_lbl = ttk.Label(mf, text="", foreground="#555")
@@ -2411,7 +2642,7 @@ class BrainwaveStudio:
         frm_sol = ttk.Frame(frm)
         frm_sol.grid(row=r, column=1, columnspan=3, sticky="w", **pad)
         self.solfeggio_pick = tk.StringVar(value="")
-        _vals = [f"{f:g} Hz  \u2014  {SOLFEGGIO_CLAIMS[f]}" for f in SOLFEGGIO_9]
+        _vals = [f"{f:g} Hz  -  {SOLFEGGIO_CLAIMS[f]}" for f in SOLFEGGIO_9]
         _cb = ttk.Combobox(frm_sol, textvariable=self.solfeggio_pick, width=44,
                            state="readonly", values=_vals)
         _cb.pack(side="left")
@@ -2429,7 +2660,7 @@ class BrainwaveStudio:
         self.solfeggio_pick.trace_add("write", _pick_solfeggio)
         ttk.Button(frm_sol, text="?", width=3,
                    command=self._show_solfeggio_note).pack(side="left", padx=(6, 0))
-        ttk.Label(frm_sol, text="no medical basis \u2014 see ?",
+        ttk.Label(frm_sol, text="no medical basis - see ?",
                   foreground="#8a6d00", font=("Arial", 8)).pack(side="left",
                                                                padx=(6, 0))
         r += 1
@@ -2450,6 +2681,7 @@ class BrainwaveStudio:
         # Measured-bowl model: a table of independent vibration modes. Empty
         # means the historic ratio-based bowl.
         self.bowl_modes = []
+        self.bowl_name = ""
         self.duty_scale = ttk.Scale(frm, from_=0.1, to=0.9, variable=self.duty, length=150)
         self.duty_scale.grid(row=r, column=1, columnspan=2, sticky="w", **pad)
         r += 1
@@ -2589,7 +2821,7 @@ class BrainwaveStudio:
         r += 1
 
         # Background music (loaded file, mixed under the tones, looped)
-        ttk.Button(frm, text="Load music\u2026", command=self.load_music_file).grid(
+        ttk.Button(frm, text="Load music...", command=self.load_music_file).grid(
             row=r, column=0, sticky="w", **pad)
         self.music = None
         self.music_path = None
@@ -2601,7 +2833,7 @@ class BrainwaveStudio:
         self.music_name = tk.StringVar(value="(none)")
         ttk.Label(frm, textvariable=self.music_name, foreground="#666",
                   width=22).grid(row=r, column=1, columnspan=2, sticky="w", **pad)
-        ttk.Button(frm, text="\u2715", width=2, command=self.clear_music).grid(
+        ttk.Button(frm, text="X", width=2, command=self.clear_music).grid(
             row=r, column=3, sticky="w", **pad)
         r += 1
         # Music level in dB, to be comparable with Beat level: a mix is judged by
@@ -2656,16 +2888,25 @@ class BrainwaveStudio:
 
         btns = ttk.Frame(frm)
         btns.grid(row=r, column=0, columnspan=4, pady=(10, 2))
-        self.play_btn = ttk.Button(btns, text="\u25b6  Play", command=self.play)
+        self.play_btn = ttk.Button(btns, text="Play", command=self.play)
         self.play_btn.grid(row=0, column=0, padx=4)
-        ttk.Button(btns, text="\u25a0  Stop", command=self.stop).grid(row=0, column=1, padx=4)
-        self.save_btn = ttk.Button(btns, text="\U0001f4be  Export", command=self.save)
+        ttk.Button(btns, text="Stop", command=self.stop).grid(row=0, column=1, padx=4)
+        self.save_btn = ttk.Button(btns, text="Export", command=self.save)
         self.save_btn.grid(row=0, column=2, padx=4)
+        # Listening aid only: Play and Play session can leave the global music
+        # out. Generate audio always includes it -- it is part of the session.
+        self.hear_global = tk.BooleanVar(value=True)
+        ttk.Checkbutton(btns, text="Hear global music",
+                        variable=self.hear_global).grid(row=0, column=3, padx=(10, 0))
 
     def _build_session(self, frm):
         # 32 chars truncated the label: with beat and music levels a line runs
         # to ~50 characters, so the dB values were computed but never seen.
-        self.seg_list = tk.Listbox(frm, width=52, height=12, activestyle="none")
+        # exportselection=False: by default Tk drops a listbox selection as soon
+        # as text is selected in ANY other field -- clicking a dB box then left
+        # no segment selected, and the value typed there went nowhere.
+        self.seg_list = tk.Listbox(frm, width=52, height=12, activestyle="none",
+                                   exportselection=False)
         self.seg_list.grid(row=0, column=0, columnspan=3, sticky="nsew")
         sb = ttk.Scrollbar(frm, orient="vertical", command=self.seg_list.yview)
         sb.grid(row=0, column=3, sticky="ns")
@@ -2689,48 +2930,75 @@ class BrainwaveStudio:
         b.grid(row=3, column=0, columnspan=4, pady=6)
         ttk.Button(b, text="+ Add", width=6, command=self.add_segment).grid(row=0, column=0, padx=1)
         ttk.Button(b, text="Update", width=7, command=self.update_segment).grid(row=0, column=1, padx=1)
-        ttk.Button(b, text="\u2212 Del", width=6, command=self.remove_segment).grid(row=0, column=2, padx=1)
-        ttk.Button(b, text="\u25b2", width=3,
+        ttk.Button(b, text="Del", width=6, command=self.remove_segment).grid(row=0, column=2, padx=1)
+        ttk.Button(b, text="Up", width=5,
                    command=lambda: self.move_segment(-1)).grid(row=0, column=3, padx=1)
-        ttk.Button(b, text="\u25bc", width=3,
+        ttk.Button(b, text="Down", width=5,
                    command=lambda: self.move_segment(1)).grid(row=0, column=4, padx=1)
         ttk.Button(b, text="Clear", width=6, command=self.clear_segments).grid(row=0, column=5, padx=1)
 
         bm = ttk.Frame(frm)
         bm.grid(row=4, column=0, columnspan=4, pady=(2, 0))
-        ttk.Button(bm, text="\u266a Set GLOBAL music", command=self.set_global_music).grid(
+        ttk.Button(bm, text="Set GLOBAL music", command=self.set_global_music).grid(
             row=0, column=0, padx=2)
-        ttk.Button(bm, text="\u266a Remove global", command=self.clear_global_music).grid(
+        ttk.Button(bm, text="Remove global", command=self.clear_global_music).grid(
             row=0, column=1, padx=2)
+        # Session level: used by segments that have none of their own (older
+        # sessions) and as the starting value. "Apply to all" copies it into
+        # every segment. The global level can be changed at any time: it used to be asked
+        # once, when the file was chosen, and the only way to change it was to
+        # choose the file again.
+        self.global_db = tk.DoubleVar(value=-6.0)
+        # ONE box for the global level, committed with Apply (or Enter). With a
+        # segment selected it sets the level under THAT segment only; with none
+        # selected, the session level (used by every segment that has no level
+        # of its own). Typing or the arrows only change the box: nothing is
+        # written until Apply, and clicking another segment simply reloads the
+        # box with that segment's value.
+        gsp = ttk.Spinbox(bm, from_=-60.0, to=0.0, increment=1.0, width=5,
+                          textvariable=self.global_db)
+        gsp.grid(row=0, column=2, padx=(8, 0))
+        gsp.bind("<Return>", lambda e: self.apply_global_level())
+        self._gl_target = None
+        ttk.Label(bm, text="dB").grid(row=0, column=3, padx=(2, 0))
+        self.global_target = tk.StringVar(value="(session)")
+        ttk.Label(bm, textvariable=self.global_target, foreground="#555").grid(
+            row=0, column=4, padx=(4, 0))
+        ttk.Button(bm, text="Apply", width=6, command=self.apply_global_level).grid(
+            row=0, column=5, padx=(8, 0))
+        # Back to one level everywhere: the box's value on every segment and as
+        # the session level.
+        ttk.Button(bm, text="Apply to all", command=self.apply_global_to_all).grid(
+            row=0, column=6, padx=(4, 0))
         self.global_lbl = tk.StringVar(value="(none)")
         ttk.Label(bm, textvariable=self.global_lbl, foreground="#555").grid(
-            row=0, column=2, padx=(8, 0), sticky="w")
+            row=1, column=0, columnspan=7, padx=(8, 0), sticky="w")
 
         b2 = ttk.Frame(frm)
         b2.grid(row=5, column=0, columnspan=4, pady=(2, 0))
-        self.sess_play = ttk.Button(b2, text="\u25b6 Play session", command=self.play_session)
+        self.sess_play = ttk.Button(b2, text="Play session", command=self.play_session)
         self.sess_play.grid(row=0, column=0, padx=2)
-        self.gen_btn = ttk.Button(b2, text="\U0001f3b5 Generate audio", command=self.save_session)
+        self.gen_btn = ttk.Button(b2, text="Generate audio", command=self.save_session)
         self.gen_btn.grid(row=0, column=1, padx=2)
 
         b3 = ttk.Frame(frm)
         b3.grid(row=6, column=0, columnspan=4, pady=(2, 0))
-        ttk.Button(b3, text="\U0001f4cb Paste (import)", command=self.import_session).grid(
+        ttk.Button(b3, text="Paste (import)", command=self.import_session).grid(
             row=0, column=0, padx=2)
-        ttk.Button(b3, text="\U0001f4c4 Copy (export)", command=self.export_session).grid(
+        ttk.Button(b3, text="Copy (export)", command=self.export_session).grid(
             row=0, column=1, padx=2)
         # Copy/Paste is for moving a session through the clipboard; Save/Load is
         # for keeping one. Doing it by hand meant copying into a text editor and
         # saving from there, which is work the tool should do.
-        ttk.Button(b3, text="\U0001f4be Save\u2026", command=self.save_session_file).grid(
+        ttk.Button(b3, text="Save...", command=self.save_session_file).grid(
             row=0, column=2, padx=2)
-        ttk.Button(b3, text="\U0001f4c2 Load\u2026", command=self.load_session_file).grid(
+        ttk.Button(b3, text="Load...", command=self.load_session_file).grid(
             row=0, column=3, padx=2)
 
         ttk.Label(frm, text="Set the tone and its music on the left, press Play\n"
                             "to check, then + Add -- the segment stores all of it.\n"
                             "Click a segment to load it back and edit it.\n"
-                            "\u266a GLOBAL music plays under the whole session.",
+                            "GLOBAL music plays under the whole session.",
                   foreground="#888", justify="left").grid(
             row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
@@ -2761,7 +3029,7 @@ class BrainwaveStudio:
         for lbl, base in ((self.carrier_lbl, "Fundamental (Hz)" if bowl else "Carrier (Hz)"),
                           (self.beat_lbl, "Warble (Hz)" if bowl else "Beat (Hz)")):
             lbl.configure(foreground="#aaa" if measured else "black",
-                          text=base + (" \u2014 from modes" if measured else ""))
+                          text=base + (" - from modes" if measured else ""))
         if hasattr(self, "ramp_chk"):
             self.ramp_chk.state(["disabled"] if measured else ["!disabled"])
 
@@ -2901,6 +3169,8 @@ class BrainwaveStudio:
         # so a plain segment stays a short readable line.
         if self.mode.get() == "bowl" and self.bowl_modes:
             seg["bowl_modes"] = [tuple(mm) for mm in self.bowl_modes]
+            if getattr(self, "bowl_name", ""):
+                seg["bowl_name"] = self.bowl_name
         if self.level_drone.get():
             seg["level_drone"] = True
         if self.level_noise.get():
@@ -2936,6 +3206,8 @@ class BrainwaveStudio:
             forced = sorted({x[6] for x in nm if x[6] in BANDS})
             ramped = sum(1 for x in nm if x[7] > 0)
             det = f"{len(nm)} modes {f0:.0f}Hz+"
+            if seg.get("bowl_name"):
+                det = f"{seg['bowl_name']}: " + det
             if forced:
                 det += " " + "/".join(forced)
             if ramped:
@@ -2960,6 +3232,13 @@ class BrainwaveStudio:
             extra += f" | {seg.get('noise_color', 'pink')} {float(seg['noise']):.2f}"
         if float(seg.get("duck", 0)) > 0.001:
             extra += f" | duck {float(seg['duck']):.2f}"
+        # The global level is shown on EVERY segment as soon as a global music
+        # is loaded (the segment's own level, else the session's), and on none
+        # when there is no global music -- the line says what will be heard.
+        if getattr(self, "global_music_path", None):
+            gl = seg.get("global_level")
+            gl = self.global_music_level if gl is None else float(gl)
+            extra += f" | global {20 * math.log10(max(gl, 1e-6)):+.0f}dB"
         if seg.get("music"):
             ml = float(seg.get("music_level", 0.25))
             # Name as well as level: with several segments carrying different
@@ -2967,7 +3246,7 @@ class BrainwaveStudio:
             name = os.path.basename(str(seg["music"]))
             if len(name) > 22:
                 name = name[:19] + "..."
-            mus = (f" | \u266a {name} "
+            mus = (f" | music {name} "
                    f"{20.0 * math.log10(max(ml, 1e-6)):+.0f}dB")
         else:
             mus = ""
@@ -2978,6 +3257,7 @@ class BrainwaveStudio:
         Asked for once, at the end, which is when a session is finished."""
         path = filedialog.askopenfilename(
             title="Global music for the whole session",
+            initialdir=preset_dir(MUSIC_DIR),
             filetypes=[("Audio", "*.wav *.mp3 *.flac *.ogg *.aiff *.aif *.m4a "
                                  "*.aac *.opus *.wma"), ("All files", "*.*")])
         if not path:
@@ -2996,18 +3276,127 @@ class BrainwaveStudio:
             initialvalue=-6.0, minvalue=-80.0, maxvalue=0.0, parent=self.root)
         if db is None:
             return
+        if self._apply_global_music(path, 10.0 ** (db / 20.0)):
+            # A newly chosen global music starts at the same level under every
+            # segment; Apply on a segment then changes that one only.
+            for s_ in self.segments:
+                s_["global_level"] = self.global_music_level
+            self._refresh_list(select=self._selected_index())
+
+    def _apply_global_music(self, path, level, announce=True):
+        """Install a global bed from a path and a linear level. Shared by the
+        dialog and by session load/import."""
+        try:
+            arr = load_music(path, self.SR)
+        except Exception as e:
+            self.status.set(f"Global music missing: {os.path.basename(str(path))} ({e})")
+            return False
+        db = 20.0 * math.log10(max(level, 1e-6))
         self.global_music = arr
         self.global_music_path = path
+        self.global_music_level = level
+        self.global_lbl.set(os.path.basename(path))
+        self._show_global_target()
+        if announce:
+            self.status.set(f"Global music: {os.path.basename(path)} at {db:+.0f} dB.")
+        return True
+
+    def _selected_index(self):
+        """The segment being edited: the listbox selection, or the last one
+        clicked if the selection was lost."""
+        sel = self.seg_list.curselection()
+        if sel:
+            return sel[0]
+        i = getattr(self, "_sel_index", None)
+        return i if (i is not None and 0 <= i < len(self.segments)) else None
+
+    def _session_offset(self, i, xfade=2.0):
+        """Sample at which segment i starts in the assembled session (same
+        crossfade geometry as the renderer)."""
+        if i is None:
+            return 0
+        nx = self.tb._n(xfade)
+        return sum(self.tb._n(s_["duration"]) - nx for s_ in self.segments[:i])
+
+    def _level_for(self, i):
+        """Global music level under segment i (its own, else the session's)."""
+        if i is not None and 0 <= i < len(self.segments):
+            lv = self.segments[i].get("global_level")
+            if lv is not None:
+                return float(lv)
+        return self.global_music_level
+
+    def _show_global_target(self):
+        """Put the selected segment's level in the global box and say which
+        segment the box is acting on."""
+        i = self._selected_index()
+        self._gl_target = i
+        self.global_db.set(round(20.0 * math.log10(max(self._level_for(i), 1e-6)), 1))
+        self.global_target.set(f"(segment {i + 1})" if i is not None else "(session)")
+
+    def apply_global_to_all(self):
+        """Give every segment -- and the session -- the box's level."""
+        try:
+            db = max(-60.0, min(0.0, float(self.global_db.get())))
+        except (tk.TclError, ValueError):
+            return
         self.global_music_level = 10.0 ** (db / 20.0)
-        self.global_lbl.set(f"{os.path.basename(path)}  {db:+.0f} dB")
-        self.status.set(f"Global music: {os.path.basename(path)} at {db:+.0f} dB.")
+        for s_ in self.segments:
+            s_["global_level"] = self.global_music_level
+        self._refresh_list(select=self._selected_index())
+        self.status.set(f"Global music at {db:+.0f} dB under all "
+                        f"{len(self.segments)} segments (and as session level).")
+
+    def apply_global_level(self):
+        """Apply button: write the box's value to the selected segment, or to
+        the session level when no segment is selected."""
+        self._global_db_changed(self._selected_index())
+
+    def _global_db_changed(self, target=None):
+        """Global dB box: level under segment `target` only, or the session
+        level when no segment is targeted."""
+        try:
+            db = max(-60.0, min(0.0, float(self.global_db.get())))
+        except (tk.TclError, ValueError):
+            return
+        lin = 10.0 ** (db / 20.0)
+        if target is not None and 0 <= target < len(self.segments):
+            cur = self.segments[target].get("global_level")
+            if cur is not None and abs(20.0 * math.log10(max(cur, 1e-6)) - db) < 0.05:
+                return
+            self.segments[target]["global_level"] = lin
+            self._refresh_list(select=target)
+            self.status.set(f"Segment {target + 1}: global music at {db:+.0f} dB "
+                            f"(other segments unchanged).")
+            return
+        self.global_music_level = lin
+        self._refresh_list(select=self._selected_index())
+        self.status.set(f"Session global level {db:+.0f} dB (segments without a "
+                        f"level of their own).")
+
+    def _global_music_dict(self):
+        if getattr(self, "global_music_path", None):
+            return {"music": self.global_music_path,
+                    "music_level": self.global_music_level}
+        return None
+
+    def _missing_music(self, segs):
+        return sorted({os.path.basename(s["music"]) for s in segs
+                       if s.get("music") and not os.path.isfile(s["music"])})
 
     def clear_global_music(self):
         self.global_music = None
         self.global_music_path = None
         self.global_music_level = 0.25
+        # Without a global music a per-segment global level means nothing:
+        # removed from every segment, so it disappears from the lines and
+        # from the saved .seg.
+        for s_ in self.segments:
+            s_.pop("global_level", None)
         self.global_lbl.set("(none)")
-        self.status.set("Global music removed.")
+        self._refresh_list(select=self._selected_index())
+        self._show_global_target()
+        self.status.set("Global music removed (and its level from every segment).")
 
     # NOTE: no longer wired to a button. Music now travels with the segment,
     # captured by + Add from the left panel; these two remain in case a
@@ -3027,7 +3416,7 @@ class BrainwaveStudio:
                 "the left instead.")
             self.status.set("Select a segment in the list first.")
             return
-        path = filedialog.askopenfilename(filetypes=[
+        path = filedialog.askopenfilename(initialdir=preset_dir(MUSIC_DIR), filetypes=[
             ("Audio", "*.wav *.mp3 *.flac *.ogg *.aiff *.aif *.m4a *.aac *.opus *.wma"),
             ("All files", "*.*")])
         if not path:
@@ -3057,7 +3446,7 @@ class BrainwaveStudio:
         seg["music"] = path
         seg["music_level"] = 10.0 ** (db / 20.0)
         self._refresh_list(select=i)
-        self.status.set(f"\u266a {os.path.basename(path)} on segment {i + 1} "
+        self.status.set(f"Music {os.path.basename(path)} on segment {i + 1} "
                         f"at {db:+.0f} dB ({db - beat_db:+.0f} dB vs its beat).")
 
     def clear_segment_music(self):
@@ -3072,6 +3461,8 @@ class BrainwaveStudio:
 
     def add_segment(self):
         seg = self._current_segment()
+        if getattr(self, "global_music_path", None):
+            seg["global_level"] = self.global_music_level
         self.segments.append(seg)
         self.seg_list.insert("end", self._seg_label(seg))
         self._update_total()
@@ -3081,7 +3472,7 @@ class BrainwaveStudio:
             # visible and stops the next segment inheriting it silently.
             self._clear_music(announce=False)
             self.status.set(f"Segment {len(self.segments)} added with "
-                            f"{os.path.basename(had)} — panel cleared for the next.")
+                            f"{os.path.basename(had)} - panel cleared for the next.")
         else:
             self.status.set(f"Segment {len(self.segments)} added (no music).")
 
@@ -3134,6 +3525,8 @@ class BrainwaveStudio:
         sel = self.seg_list.curselection()
         if not sel:
             return
+        self._sel_index = sel[0]
+        self._gl_target = sel[0]
         seg = self.segments[sel[0]]
         self.mode.set(seg["mode"])
         self.carrier.set(seg["carrier"])
@@ -3155,6 +3548,7 @@ class BrainwaveStudio:
         self.rot_rpm.set(float(seg.get("rot_rpm", 0.0)))
         self.rot_depth.set(float(seg.get("rot_depth", 1.0)))
         self.bowl_modes = [tuple(mm) for mm in seg.get("bowl_modes", [])]
+        self.bowl_name = str(seg.get("bowl_name", ""))
         self._refresh_bowl_label()
         self.level_drone.set(bool(seg.get("level_drone", False)))
         self.level_noise.set(bool(seg.get("level_noise", False)))
@@ -3162,6 +3556,7 @@ class BrainwaveStudio:
         self.noise.set(float(seg.get("noise", 0.0)))
         self.noise_color.set(seg.get("noise_color", "pink"))
         self.duck.set(float(seg.get("duck", 0.0)))
+        self._show_global_target()
         if seg.get("tuning") in TUNINGS:
             self.tuning.set(seg["tuning"])
         if seg.get("music"):
@@ -3172,22 +3567,21 @@ class BrainwaveStudio:
             self._clear_music(announce=False)
         self._on_mode()
         self._on_ramp()
-        self.status.set(f"Segment {sel[0] + 1} loaded — edit then Update, "
+        self.status.set(f"Segment {sel[0] + 1} loaded - edit then Update, "
                         f"or - Del to remove it.")
 
     def update_segment(self):
         """Replace the selected segment with the current control values."""
-        sel = self.seg_list.curselection()
-        if not sel:
+        i = self._selected_index()
+        if i is None:
             self.status.set("Select a segment to update.")
             return
-        i = sel[0]
         # Keep what the controls do not carry. _current_segment() only knows
         # mode/carrier/beat/duration/level, so replacing wholesale silently
         # dropped the music attached with the button: updating any segment
         # erased its file, and the session then played only whichever music
         # had survived.
-        keep = {k: self.segments[i][k] for k in ("music", "music_level")
+        keep = {k: self.segments[i][k] for k in ("music", "music_level", "global_level")
                 if k in self.segments[i]}
         seg = self._current_segment()
         seg.update(keep)
@@ -3204,13 +3598,15 @@ class BrainwaveStudio:
         path = filedialog.asksaveasfilename(
             title="Save session", defaultextension=".seg",
             filetypes=[("Session", "*.seg"), ("Text", "*.txt")],
+            initialdir=preset_dir(SESSION_DIR),
             initialfile="session.seg")
         if not path:
             return
         # Build the text BEFORE opening the file: open(path, "w") truncates at
         # once, so a failure while formatting would leave a 0-byte file behind.
         try:
-            body = segments_to_text(self.segments) + "\n"
+            body = segments_to_text(self.segments,
+                                    self._global_music_dict()) + "\n"
         except Exception as e:
             self.status.set(f"Could not format the session: {e}")
             return
@@ -3226,14 +3622,23 @@ class BrainwaveStudio:
         """Read a .seg file, replacing the current session."""
         path = filedialog.askopenfilename(
             title="Load session",
-            filetypes=[("Session", "*.seg *.txt"), ("All files", "*.*")])
+            filetypes=[("Session", "*.seg *.txt"), ("All files", "*.*")],
+            initialdir=preset_dir(SESSION_DIR))
         if not path:
             return
         try:
-            raw = parse_segments(open(path, encoding="utf-8").read())
+            file_txt = open(path, encoding="utf-8").read()
+            raw = parse_segments(file_txt)
         except Exception as e:
             self.status.set(f"Could not read: {e}")
             return
+        # Music paths are resolved against the .seg's own folder too, so a
+        # session shipped with its sounds next to it opens anywhere.
+        seg_dir = os.path.dirname(os.path.abspath(path))
+        for s_ in raw:
+            if isinstance(s_, dict) and s_.get("music"):
+                s_["music"] = resolve_music(s_["music"], seg_dir)
+        gm = parse_global_music(file_txt)
         if not raw:
             self.status.set("No usable segment in that file.")
             return
@@ -3259,9 +3664,27 @@ class BrainwaveStudio:
             except Exception:
                 bad += 1
         self._update_total()
+        note = self._restore_global(gm, append, seg_dir)
+        miss = self._missing_music(self.segments)
         self.status.set(f"{len(self.segments)} segment(s) in the session after "
                         f"loading {os.path.basename(path)}"
-                        + (f" ({bad} skipped)" if bad else ""))
+                        + (f" ({bad} skipped)" if bad else "") + note
+                        + (f" -- music not found: {', '.join(miss)} "
+                           f"(put it in Brainwave_Presets/Music)" if miss else ""))
+
+    def _restore_global(self, gm, append, base_dir=None):
+        """Bring back the global bed stored in a session. When ADDING to a
+        session that already has one, the current bed wins: the pieces are
+        being assembled into it, not the other way round."""
+        if not gm:
+            return ""
+        if append and getattr(self, "global_music_path", None):
+            return " (its global music ignored: this session already has one)"
+        p = resolve_music(gm["music"], base_dir)
+        if self._apply_global_music(p, gm["music_level"], announce=False):
+            self._refresh_list(select=self._selected_index())   # show the levels
+            return f" + global music {os.path.basename(p)}"
+        return f" -- global music not found: {os.path.basename(p)}"
 
     def import_session(self):
         self._text_dialog(
@@ -3271,6 +3694,7 @@ class BrainwaveStudio:
         try:
             raw = parse_segments(text)
             segs = [validate_segment(s) for s in raw]
+            gm = parse_global_music(text)
             if not segs:
                 raise ValueError("The list is empty.")
         except Exception as e:
@@ -3296,9 +3720,12 @@ class BrainwaveStudio:
             self.segments.append(s)
             self.seg_list.insert("end", self._seg_label(s))
         self._update_total()
+        note = self._restore_global(gm, append)
+        miss = self._missing_music(segs)
         self.status.set(f"{len(segs)} segment(s) "
                         f"{'added' if append else 'imported'} "
-                        f"({len(self.segments)} total).")
+                        f"({len(self.segments)} total){note}"
+                        + (f" -- music not found: {', '.join(miss)}" if miss else ""))
         return True
 
     def export_session(self):
@@ -3306,17 +3733,30 @@ class BrainwaveStudio:
             messagebox.showinfo("Empty session", "No segment to export.")
             return
         self._text_dialog("Copy the session (Ctrl+C)",
-                          segments_to_text(self.segments), None)
+                          segments_to_text(self.segments,
+                                           self._global_music_dict()), None)
 
     def _text_dialog(self, title, initial, on_ok):
         win = tk.Toplevel(self.root)
         win.title(title)
         win.transient(self.root)
-        txt = scrolledtext.ScrolledText(win, width=58, height=16, wrap="none")
-        txt.pack(padx=8, pady=8)
-        txt.insert("1.0", initial)
+        win.minsize(420, 240)
+        # Pack order matters: the buttons and the horizontal bar are packed
+        # BEFORE the text, from the bottom, so they stay visible when the
+        # window shrinks. The text then takes everything left, and follows the
+        # window when it grows -- it used to keep its initial size, leaving the
+        # new space empty around it.
         bar = ttk.Frame(win)
-        bar.pack(pady=(0, 8))
+        bar.pack(side="bottom", pady=(4, 8))
+        hsb = ttk.Scrollbar(win, orient="horizontal")
+        hsb.pack(side="bottom", fill="x", padx=8)
+        # wrap="none" keeps one segment per line, so long bowl_modes lines need
+        # a horizontal scrollbar -- ScrolledText only provides the vertical one.
+        txt = scrolledtext.ScrolledText(win, width=100, height=20, wrap="none",
+                                        xscrollcommand=hsb.set)
+        hsb.configure(command=txt.xview)
+        txt.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 0))
+        txt.insert("1.0", initial)
         if on_ok is not None:
             def ok():
                 if on_ok(txt.get("1.0", "end")):
@@ -3400,7 +3840,8 @@ class BrainwaveStudio:
                     # The session bed is the GLOBAL music, not the left panel:
                     # the left panel now belongs to whichever segment is being
                     # edited, and each segment carries its own music inside it.
-                    music=self.global_music,
+                    # "Hear global music" can leave it out of this preview.
+                    music=self.global_music if self.hear_global.get() else None,
                     music_level=self.global_music_level,
                     duck=self._dget(self.duck, 0.0),
                     rot_rpm=self._dget(self.rot_rpm, 0.0),
@@ -3414,7 +3855,7 @@ class BrainwaveStudio:
         self.pbar.start(12)
         self.pframe.grid()
         self._set_busy(True)
-        self.status.set("Building session preview…")
+        self.status.set("Building session preview...")
 
         def work():
             try:
@@ -3430,7 +3871,7 @@ class BrainwaveStudio:
         d, t = self._prog
         if t:
             self.pbar.configure(value=100.0 * d / t)
-            self.status.set(f"Generating… {d / self.SR:.0f} / {t / self.SR:.0f} s")
+            self.status.set(f"Generating... {d / self.SR:.0f} / {t / self.SR:.0f} s")
         try:
             kind, val = self._resq.get_nowait()
         except queue.Empty:
@@ -3528,7 +3969,7 @@ class BrainwaveStudio:
             self.status.set("Music removed.")
 
     def load_music_file(self):
-        path = filedialog.askopenfilename(filetypes=[
+        path = filedialog.askopenfilename(initialdir=preset_dir(MUSIC_DIR), filetypes=[
             ("Audio", "*.wav *.mp3 *.flac *.ogg *.aiff *.aif *.m4a *.aac *.opus *.wma"),
             ("All files", "*.*")])
         if path:
@@ -3544,6 +3985,16 @@ class BrainwaveStudio:
             _d = self._dget(self.duration, 300.0, "Duration")
             dur = min(_d, 12.0) if self.loop.get() else _d
             audio = self._render(dur)
+            # The global music under this segment, at the level it will have
+            # in the session (its own level if ticked, else the session's).
+            if self.hear_global.get() and self.global_music is not None:
+                i = self._selected_index()
+                gm = _MusicStream(self.global_music, self._level_for(i), self.SR)
+                # Start the bed where it will be when this segment plays in the
+                # session, not at its beginning: in the session the global music
+                # runs on without restarting at each segment.
+                gm.pos = self._session_offset(i) % gm.n
+                audio = audio + gm.read(len(audio))
             # Do NOT normalise to peak here. Peak normalisation rescales the
             # whole mix, so lowering the beat by 20 dB and then dividing by the
             # new peak restores the original balance: the preview sounded
@@ -3558,7 +4009,7 @@ class BrainwaveStudio:
             pygame.mixer.stop()
             self._snd = pygame.sndarray.make_sound(data)
             self._snd.play(loops=-1 if self.loop.get() else 0)
-            self.status.set(f"Playing… {self.mode.get()} | "
+            self.status.set(f"Playing... {self.mode.get()} | "
                             f"{self._dget(self.carrier, 200.0):.0f} Hz")
         except Exception as e:
             self.status.set(f"Playback error: {e}")

@@ -36,18 +36,18 @@ Everything is built from **segments**. A session is a list of them, rendered
 end to end with a crossfade at each join.
 
 **The rule: everything you set on the left panel is captured by `+ Add`.**
-Whatever `▶ Play` previews is exactly what the segment will store — mode,
+Whatever `Play` previews is exactly what the segment will store — mode,
 carrier, beat, duration, duty, stereo offset, beat level, rotation, drone,
 noise, ducking, tuning, and the segment's own music with its level.
 
 ### Building a session
 
 1. Set the tone and its music on the left
-2. **`▶ Play`** — you hear precisely what the segment will contain
+2. **`Play`** — you hear precisely what the segment will contain
 3. **`+ Add`** — the segment stores all of it, and the music panel clears so
    the next segment does not inherit the file by accident
 4. Repeat
-5. **`♪ Set GLOBAL music`** — the bed that plays under the whole session, on
+5. **`Set GLOBAL music`** — the bed that plays under the whole session, on
    top of whatever music individual segments carry
 
 **Click a segment** to load all of it back for editing, then **`Update`**, or
@@ -57,12 +57,53 @@ noise, ducking, tuning, and the segment's own music with its level.
 
 | Button | What it does |
 |---|---|
-| `📋 Paste (import)` / `📄 Copy (export)` | move a session through the clipboard |
-| `💾 Save…` / `📂 Load…` | keep one as a readable `.seg` file |
+| `Paste (import)` / `Copy (export)` | move a session through the clipboard |
+| `Save...` / `Load...` | keep one as a readable `.seg` file |
 
 Pasting or loading into a session that already has segments asks whether to
 **add** them after the existing ones or **replace** the list — building a long
 session out of shorter saved pieces is the obvious use.
+
+**Music travels with the session.** Each segment keeps its own music and level,
+and the global music is written on a last line of the `.seg`:
+
+```python
+global_music = {"music": 'nidra_bed.wav', "music_level": 0.5}
+```
+
+A music file stored in `Brainwave_Presets/Music/` is written **relative** to
+that folder, so the same `.seg` opens on every machine where the repository is
+cloned. On load a path is looked for as written, then in the Music folder, then
+next to the `.seg`, then by file name alone in the Music folder — which also
+rescues older sessions saved with an absolute path from another machine. A
+missing file is named in the status bar. When sessions are **added** together,
+the global music already in place is kept.
+
+**Global music level, per segment.** One dB box and an **Apply** button, next
+to *Set GLOBAL music*. Select a segment: the box shows the global music level
+under that segment (`(segment 2)` beside it). Set a value — typing or arrows —
+then **Apply** (or Enter): only that segment changes. Nothing is written before
+Apply; clicking another segment just reloads the box with that segment's value.
+The segment's line shows `global -12dB`, the level glides across the crossfade
+at each boundary, and it is saved in the `.seg` as `"global_level"`. With no
+segment selected, Apply sets the session level, used by every segment that has
+no level of its own. **Apply to all** puts the box's value on every
+segment and as the session level — the way back to a single level.
+
+Choosing a global music puts its level on every segment already in the list,
+and every segment added afterwards starts at the session level: each line shows
+`global -5dB` as soon as a global music is loaded. *Remove global* removes the
+level from every segment, so it disappears from the lines and from the `.seg`.
+
+The global music is one continuous layer: in *Play session* and *Generate
+audio* it runs on across segment boundaries, never restarting at a new segment
+(it only loops when the file itself ends). *Play* on a single segment starts it
+where it will be when that segment plays in the session.
+
+**Hear global music.** Next to *Play*, this box adds the global music to the
+segment preview, at the level it will have under that segment, and to *Play
+session*. Unticked, both previews leave it out. *Generate audio* always
+includes it: it is part of the session.
 
 Everything a segment carries is written out, not just the first few fields: a
 measured bowl, a rotation, a per-segment drone or a forced band all come back as
@@ -178,19 +219,39 @@ Select mode **Bowl**, then **`Edit bowl…`**. One row per vibration mode:
 | `duty` | gate width — **iso only**, greyed otherwise |
 | `stereo` | gate offset between the ears — **iso only** |
 | `rot/min`, `depth` | this mode's own slow constant-power pan |
+| `strike_s` | this mode's own strike period in seconds — 0 = struck with the whole bowl |
+| `offset_s` | delay before this mode's first strike |
 | `note → freq` | pick a named frequency (any tuning × chakra, or a Solfeggio) to fill `freq_hz` |
 
 Every row is independent: one partial can beat binaurally in theta while another
 pulses isochronically and a third simply rings.
 
 `Save…` and `Load…` write a readable `.bowl` file, so a measured instrument
-outlives the segment it was used in. Three starting presets (small / medium /
+outlives the segment it was used in. The **Name** field travels with the bowl:
+into the `.bowl` file (`# name: …` on the first line), into the segment and into
+the `.seg` (`"bowl_name"`), and it shows in the session list. Presets and
+analysed recordings fill it in automatically. Three starting presets (small / medium /
 large), `+ row` to add one, `✕` to remove one, `Check` to see what was
 understood before applying, `Clear` to return to the ratio-based bowl.
 
 Short tables still work: a 4-column list — or a bare column of frequencies read
 off a phone analyser — parses fine, the later fields taking the values that
 reproduce the plain measured behaviour.
+
+### Several bowls in one segment
+
+A segment holds one table of modes, of any length — so several bowls are just
+their rows one after the other. By default they are all **struck together**,
+every longest-decay seconds: a struck chord.
+
+Give a bowl's rows a `strike_s` and they get their own pace; `offset_s` delays
+the first strike. For example a root bowl every 30 s from 0 s and a heart bowl
+every 20 s from 7 s. Explicit strikes also let the previous strike keep ringing
+when the next one lands, as a real bowl does, and each new strike gets a 4 ms
+attack instead of a hard restart.
+
+Rows with `strike_s` and `offset_s` at 0 behave exactly as before — old `.bowl`
+and `.seg` files render sample-for-sample identical.
 
 ### Measuring a real instrument
 
@@ -249,7 +310,7 @@ is wanted; as an imitation it is not.
 A ramp set in the table (`beat_hz` → `ramp_hz`) completes once per strike, on the
 same period as the envelope — not spread over the whole segment.
 
-That distinction cost an evening. `▶ Play` with `Loop` renders only 12 s and
+That distinction cost an evening. `Play` with `Loop` renders only 12 s and
 repeats them, so the full ramp was obvious there; the same ramp in a 300 s
 segment took five minutes and was inaudible. The preview was promising something
 the segment never delivered, which made Play and Add sound like different
@@ -389,11 +450,24 @@ elsewhere.
 
 ---
 
+## Plain-text labels
+
+Buttons use plain words (`Up`, `Down`, `Del`, `Save...`) rather than symbols
+or emoji. A Tk built without Xft -- the default in many conda environments --
+only has the old X11 core fonts and shows symbols such as ▲ or ♪ as garbage,
+so a label that looks fine on one machine can be unreadable on another.
+
 ## Files
 
 | File | Role |
 |---|---|
 | `brainwave_studio.py` | everything: engine, interface, standalone entry point |
+| `Brainwave_Presets/Bowls/` | default folder of the bowl `Save…` / `Load…` dialogs |
+| `Brainwave_Presets/Sessions/` | default folder of the session `Save…` / `Load…` dialogs |
+| `Brainwave_Presets/Music/` | default folder of every music dialog (segment music and global music) |
+
+These folders sit next to `Python_Scripting/` and are created on first use; the
+dialogs only start there, any other folder still works.
 
 It runs both ways: `python brainwave_studio.py` for its own window, or as a tab
 inside XTTS Voice Studio, which passes it a frame instead. Window-only calls are

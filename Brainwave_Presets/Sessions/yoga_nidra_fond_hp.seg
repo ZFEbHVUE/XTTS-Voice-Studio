@@ -1,0 +1,11 @@
+segments = [
+    {"mode": "monaural", "carrier": 256, "beat": 10, "duration": 150, "tone_level": 0.501, "drone": 0.126},
+    {"mode": "monaural", "carrier": 256, "beat": (10, 8), "duration": 60, "tone_level": 0.501, "drone": 0.126},
+    {"mode": "monaural", "carrier": 256, "beat": (8, 6), "duration": 300, "tone_level": 0.501, "drone": 0.126},
+    {"mode": "monaural", "carrier": 256, "beat": 6, "duration": 200, "tone_level": 0.501, "drone": 0.126},
+    {"mode": "monaural", "carrier": 256, "beat": (6, 5), "duration": 120, "tone_level": 0.501, "drone": 0.126},
+    {"mode": "monaural", "carrier": 256, "beat": 5, "duration": 120, "tone_level": 0.501, "drone": 0.126},
+    {"mode": "monaural", "carrier": 256, "beat": (5, 6), "duration": 50, "tone_level": 0.501, "drone": 0.126},
+    {"mode": "monaural", "carrier": 256, "beat": (6, 10), "duration": 150, "tone_level": 0.501, "drone": 0.126},
+    {"mode": "monaural", "carrier": 256, "beat": 10, "duration": 90, "tone_level": 0.501, "drone": 0.126},
+]
