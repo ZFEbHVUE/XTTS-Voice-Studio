@@ -75,7 +75,9 @@ A music file stored in `Brainwave_Presets/Music/` is written **relative** to
 that folder, so the same `.seg` opens on every machine where the repository is
 cloned. On load a path is looked for as written, then in the Music folder, then
 next to the `.seg`, then by file name alone in the Music folder — which also
-rescues older sessions saved with an absolute path from another machine. A
+rescues older sessions saved with an absolute path from another machine. Files elsewhere in the repository —
+`Ambient_Musics/`, `Punctual_sounds/` — are written relative to the repository
+root (`"Ambient_Musics/Pure_Theta_4_7hz.mp3"`) and found the same way. A
 missing file is named in the status bar. When sessions are **added** together,
 the global music already in place is kept.
 
@@ -465,8 +467,9 @@ so a label that looks fine on one machine can be unreadable on another.
 | `Brainwave_Presets/Bowls/` | default folder of the bowl `Save…` / `Load…` dialogs |
 | `Brainwave_Presets/Sessions/` | default folder of the session `Save…` / `Load…` dialogs |
 | `Brainwave_Presets/Music/` | default folder of every music dialog (segment music and global music) |
+| `Ambient_Musics/` | default folder of *Generate audio* and *Export*: rendered beds land where the voice pipeline picks up background music |
 
-These folders sit next to `Python_Scripting/` and are created on first use; the
+All of them are taken from the copy of the repository the script runs from (never the working directory), sit next to `Python_Scripting/` and are created on first use; the
 dialogs only start there, any other folder still works.
 
 It runs both ways: `python brainwave_studio.py` for its own window, or as a tab

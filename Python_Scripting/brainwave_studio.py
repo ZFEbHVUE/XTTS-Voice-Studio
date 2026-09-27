@@ -37,6 +37,11 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOWL_DIR = os.path.join(_REPO_ROOT, "Brainwave_Presets", "Bowls")
 SESSION_DIR = os.path.join(_REPO_ROOT, "Brainwave_Presets", "Sessions")
 MUSIC_DIR = os.path.join(_REPO_ROOT, "Brainwave_Presets", "Music")
+# Rendered audio goes where the voice pipeline looks for background beds, in
+# the SAME copy of the repository as the running script. Without an explicit
+# folder the dialog opened in the process's working directory -- so a script
+# started from ~/XTTS-Voice-Studio-Testing could save into ~/XTTS-Voice-Studio.
+AUDIO_OUT_DIR = os.path.join(_REPO_ROOT, "Ambient_Musics")
 
 
 def preset_dir(path):
@@ -57,27 +62,39 @@ def music_to_portable(path):
     """
     if not path:
         return path
+    if not os.path.isabs(os.path.expanduser(str(path))):
+        return str(path)                          # already relative: keep it
     p = os.path.abspath(os.path.expanduser(str(path)))
-    try:
-        rel = os.path.relpath(p, MUSIC_DIR)
-    except ValueError:                           # other drive on Windows
-        return str(path)
-    return rel if not rel.startswith("..") else str(path)
+    # Inside Brainwave_Presets/Music: relative to it ("Global/bed.flac").
+    # Elsewhere in the repository (Ambient_Musics/, Punctual_sounds/ used by
+    # the voice pipeline): relative to the repository root
+    # ("Ambient_Musics/bed.mp3"). Anything outside the repository: absolute.
+    for base in (MUSIC_DIR, _REPO_ROOT):
+        try:
+            rel = os.path.relpath(p, base)
+        except ValueError:                       # other drive on Windows
+            continue
+        if not rel.startswith(".."):
+            return rel
+    return str(path)
 
 
 def resolve_music(path, base_dir=None):
     """Find the file a .seg refers to, most specific place first:
-    the path as written, then relative to Brainwave_Presets/Music, then next to
-    the .seg itself, then by file name alone in the Music folder -- which
-    rescues a session saved with an absolute path on another machine."""
+    the path as written, then relative to Brainwave_Presets/Music, then to the
+    repository root, then next to the .seg itself, then by file name alone in
+    the Music folder and in Ambient_Musics/ -- which rescues a session saved
+    with an absolute path on another machine."""
     if not path:
         return path
     p = os.path.expanduser(str(path))
     cands = [p] if os.path.isabs(p) else []
     cands.append(os.path.join(MUSIC_DIR, p))
+    cands.append(os.path.join(_REPO_ROOT, p))       # e.g. Ambient_Musics/...
     if base_dir:
         cands.append(os.path.join(base_dir, p))
     cands.append(os.path.join(MUSIC_DIR, os.path.basename(p)))
+    cands.append(os.path.join(_REPO_ROOT, "Ambient_Musics", os.path.basename(p)))
     for c in cands:
         if os.path.isfile(c):
             return os.path.abspath(c)
@@ -2323,6 +2340,7 @@ class BrainwaveStudio:
             measurement gets wrong."""
             path = filedialog.askopenfilename(
                 title="Recording of an instrument",
+                initialdir=preset_dir(MUSIC_DIR),
                 filetypes=[("Audio", "*.wav *.flac *.aiff *.aif *.ogg *.mp3"),
                            ("All files", "*.*")], parent=win)
             if not path:
@@ -2351,6 +2369,7 @@ class BrainwaveStudio:
             simply is not there on a held note, so it needs its own."""
             path = filedialog.askopenfilename(
                 title="Recording of a sustained sound (one held note)",
+                initialdir=preset_dir(MUSIC_DIR),
                 filetypes=[("Audio", "*.wav *.flac *.aiff *.aif *.ogg *.mp3"),
                            ("All files", "*.*")], parent=win)
             if not path:
@@ -2376,6 +2395,7 @@ class BrainwaveStudio:
         def _from_wav():
             path = filedialog.askopenfilename(
                 title="Recording of a struck bowl",
+                initialdir=preset_dir(MUSIC_DIR),
                 filetypes=[("Audio", "*.wav *.flac *.aiff *.aif *.ogg *.mp3"),
                            ("All files", "*.*")], parent=win)
             if not path:
@@ -3911,7 +3931,7 @@ class BrainwaveStudio:
             return
         path = filedialog.asksaveasfilename(
             defaultextension=".wav", filetypes=self.AUDIO_TYPES,
-            initialfile="session.wav")
+            initialdir=preset_dir(AUDIO_OUT_DIR), initialfile="session.wav")
         if not path:
             return
         self._start_stream_job([dict(s) for s in self.segments], path)
@@ -4022,6 +4042,7 @@ class BrainwaveStudio:
     def save(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".wav", filetypes=self.AUDIO_TYPES,
+            initialdir=preset_dir(AUDIO_OUT_DIR),
             initialfile=f"{self.mode.get()}_"
                         f"{int(self._dget(self.carrier, 200.0))}Hz.wav")
         if not path:
