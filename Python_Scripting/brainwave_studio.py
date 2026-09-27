@@ -3255,10 +3255,11 @@ class BrainwaveStudio:
         # The global level is shown on EVERY segment as soon as a global music
         # is loaded (the segment's own level, else the session's), and on none
         # when there is no global music -- the line says what will be heard.
+        glob = ""
         if getattr(self, "global_music_path", None):
             gl = seg.get("global_level")
             gl = self.global_music_level if gl is None else float(gl)
-            extra += f" | global {20 * math.log10(max(gl, 1e-6)):+.0f}dB"
+            glob = f" | global {20 * math.log10(max(gl, 1e-6)):+.0f}dB"
         if seg.get("music"):
             ml = float(seg.get("music_level", 0.25))
             # Name as well as level: with several segments carrying different
@@ -3270,7 +3271,9 @@ class BrainwaveStudio:
                    f"{20.0 * math.log10(max(ml, 1e-6)):+.0f}dB")
         else:
             mus = ""
-        return (f"{head} | {seg['duration']:.0f}s{chk}{lvl}{rot}{extra}{mus}")
+        # The segment's own music first, the global bed last: the line reads
+        # from what belongs to this segment to what spans the whole session.
+        return (f"{head} | {seg['duration']:.0f}s{chk}{lvl}{rot}{extra}{mus}{glob}")
 
     def set_global_music(self):
         """The bed under the WHOLE session, on top of any per-segment music.
@@ -3547,6 +3550,7 @@ class BrainwaveStudio:
             return
         self._sel_index = sel[0]
         self._gl_target = sel[0]
+        self._music_removed = False
         seg = self.segments[sel[0]]
         self.mode.set(seg["mode"])
         self.carrier.set(seg["carrier"])
@@ -3601,13 +3605,24 @@ class BrainwaveStudio:
         # dropped the music attached with the button: updating any segment
         # erased its file, and the session then played only whichever music
         # had survived.
-        keep = {k: self.segments[i][k] for k in ("music", "music_level", "global_level")
-                if k in self.segments[i]}
+        old = self.segments[i]
         seg = self._current_segment()
+        keep = {}
+        # The panel's music and its level win: the segment was loaded into the
+        # panel, so a level lowered after listening must be stored. Keeping the
+        # old music_level unconditionally (as before) silently discarded it.
+        # The old music survives only if the panel has none and it was not
+        # removed on purpose with the X button.
+        if ("music" not in seg and "music" in old
+                and not getattr(self, "_music_removed", False)):
+            keep["music"] = old["music"]
+            keep["music_level"] = old.get("music_level", 0.25)
+        if "global_level" in old:          # set with Apply, not by the panel
+            keep["global_level"] = old["global_level"]
         seg.update(keep)
         self.segments[i] = seg
         self._refresh_list(select=i)
-        kept = " (music kept)" if keep else ""
+        kept = " (music kept)" if "music" in keep else ""
         self.status.set(f"Segment {i + 1} updated.{kept}")
 
     def save_session_file(self):
@@ -3996,7 +4011,10 @@ class BrainwaveStudio:
             self._set_music_from_path(path)
 
     def clear_music(self):
+        # Remember that the user removed it: Update must then drop the
+        # segment's music instead of restoring it.
         self._clear_music()
+        self._music_removed = True
 
     def play(self):
         if not self._need_audio():

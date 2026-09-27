@@ -102,6 +102,12 @@ audio* it runs on across segment boundaries, never restarting at a new segment
 (it only loops when the file itself ends). *Play* on a single segment starts it
 where it will be when that segment plays in the session.
 
+*Update* stores the panel as it is, music level included: load a segment,
+lower its music after listening, *Update*. Removing the music with the panel's
+**X** then *Update* removes it from the segment. The global level set with
+*Apply* is kept. On each line the segment's own music comes first, the global
+level last.
+
 **Hear global music.** Next to *Play*, this box adds the global music to the
 segment preview, at the level it will have under that segment, and to *Play
 session*. Unticked, both previews leave it out. *Generate audio* always
