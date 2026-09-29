@@ -30,7 +30,7 @@ def split_paths(text):
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XTTS Voice Studio — Tkinter GUI
+XTTS Voice Studio - Tkinter GUI
 Graphical interface for all XTTS-Voice-Studio scripts.
 """
 
@@ -402,7 +402,7 @@ def add_console(parent, start_row):
 
     bar = tk.Frame(box)
     bar.grid(row=1, column=0, sticky='w', pady=(2, 0))
-    tk.Button(bar, text="\U0001f4be Save log\u2026", width=12,
+    tk.Button(bar, text="Save log...", width=12,
               command=lambda: save_console(console)).pack(side='left', padx=(0, 3))
     tk.Button(bar, text="Copy all", width=9,
               command=lambda: copy_console(console)).pack(side='left', padx=3)
@@ -413,9 +413,22 @@ def add_console(parent, start_row):
     return console
 
 
+_TK_SAFE = {0x2014: '-', 0x2013: '-', 0x2212: '-', 0x2192: '->', 0x2190: '<-', 0x2191: '^', 0x2193: 'v',
+            0x2026: '...', 0x2022: '*', 0x2248: '~', 0x2265: '>=', 0x2264: '<=', 0x2260: '!=', 0x0394: 'd',
+            0x2713: 'OK', 0x2714: 'OK', 0x2717: 'X', 0x2715: 'X', 0x2500: '-', 0x2502: '|', 0x2550: '=',
+            0x2018: "'", 0x2019: "'", 0x201c: '"', 0x201d: '"', 0x0153: 'oe', 0x0152: 'OE'}
+
+
+def _tk_safe(text):
+    """Text a Tk without Xft can draw: common symbols spelled in ASCII,
+    anything else beyond Latin-1 (emoji...) shown as '?'."""
+    text = str(text).translate(_TK_SAFE)
+    return ''.join(c if ord(c) < 256 else '?' for c in text)
+
+
 def log(console, text):
     if _root:
-        _root.after(0, lambda c=console, t=text: (c.config(state='normal'), c.insert('end', t + '\n'), c.see('end')))
+        _root.after(0, lambda c=console, t=_tk_safe(text): (c.config(state='normal'), c.insert('end', t + '\n'), c.see('end')))
     # On laisse state='normal' pour permettre la sélection/copie
     # On bloque juste les touches qui modifient le texte via binding
 
@@ -423,12 +436,12 @@ def _make_readonly(widget):
     """
     Read-only but selectable/copyable console widget.
     Supported shortcuts:
-      Ctrl+C       → copy selection
-      Ctrl+Insert  → copy selection
-      Ctrl+A       → select all
-      Ctrl+V       → no effect (read-only)
-      Shift+Insert → no effect (read-only)
-      Shift+Delete → no effect (read-only)
+      Ctrl+C       -> copy selection
+      Ctrl+Insert  -> copy selection
+      Ctrl+A       -> select all
+      Ctrl+V       -> no effect (read-only)
+      Shift+Insert -> no effect (read-only)
+      Shift+Delete -> no effect (read-only)
     """
     def block_edit(e):
         ctrl  = e.state & 0x4
@@ -859,7 +872,7 @@ def tab_generator(nb):
         if not path:
             return
         try:
-            raw = open(path, encoding='utf-8').read()
+            raw = open(path, encoding='utf-8').read().replace('\r', '')
         except Exception as e:
             log(console, f"[ERR] Could not read: {e}")
             return
@@ -916,9 +929,9 @@ def tab_generator(nb):
                      f"({len(voice_rows_gen)} voice(s), "
                      f"{len(music_rows_gen)} sound(s))")
 
-    tk.Button(proj_bar, text="Save project\u2026", width=13,
+    tk.Button(proj_bar, text="Save project...", width=13,
               command=save_project).pack(side='left', padx=2)
-    tk.Button(proj_bar, text="Load project\u2026", width=13,
+    tk.Button(proj_bar, text="Load project...", width=13,
               command=load_project).pack(side='left', padx=2)
     tk.Label(proj_bar, text="a .med holds the script, the voices, the sounds "
                             "and the output path", fg='grey').pack(side='left',
@@ -944,7 +957,7 @@ def tab_generator(nb):
             v_script.set(path)
             with open(path, encoding='utf-8') as fh:
                 editor.delete('1.0', 'end')
-                editor.insert('1.0', fh.read())
+                editor.insert('1.0', fh.read().replace('\r', ''))
 
     def sauvegarder_prompt():
         path = v_script.get()
@@ -1210,7 +1223,7 @@ def tab_generator(nb):
     tk.Button(preset_bar, text="Delete", command=_delete_preset,
               width=7).pack(side='left', padx=2)
     def _browse_preset():
-        """Open any preset file, from Voice_Presets/ or anywhere else — presets
+        """Open any preset file, from Voice_Presets/ or anywhere else - presets
         are plain files, so one received by mail or kept in another folder
         inserts just the same."""
         if not VP:
@@ -1228,14 +1241,14 @@ def tab_generator(nb):
             return
         _insert(f"{e['xtts']}\n{e['audio']}")
         bits = [e.get('source', ''), e.get('date', ''), e.get('scores_text', '')]
-        _status(f"{e.get('name', os.path.basename(p))} — "
+        _status(f"{e.get('name', os.path.basename(p))} - "
                 + '  |  '.join(b for b in bits if b))
 
     tk.Button(preset_bar, text="Browse...", command=_browse_preset,
               width=9).pack(side='left', padx=2)
     tk.Button(preset_bar, text="Refresh", command=lambda: _refresh_presets(),
               width=8).pack(side='left', padx=2)
-    tk.Label(preset_bar, text="(saved in Voice_Presets/ — the pipeline writes "
+    tk.Label(preset_bar, text="(saved in Voice_Presets/ - the pipeline writes "
                             "there; Refresh after a run)",
              fg='grey', font=("Arial", 8)).pack(side='left', padx=(8, 0))
     cb_preset.bind('<<ComboboxSelected>>', _show_preset_info)
@@ -1380,7 +1393,7 @@ def tab_generator(nb):
                 editor.see(pos)
                 status_fr.set(f"Found at line {pos.split('.')[0]}")
             else:
-                status_fr.set("Not found — wrapping...")
+                status_fr.set("Not found - wrapping...")
                 pos2 = editor.search(needle, '1.0', stopindex='end', nocase=nocase)
                 if pos2:
                     end2 = f"{pos2}+{len(needle)}c"
@@ -1388,7 +1401,7 @@ def tab_generator(nb):
                     editor.tag_config('found', background='#ffff00', foreground='#000')
                     editor.mark_set('insert', end2)
                     editor.see(pos2)
-                    status_fr.set(f"Wrapped — found at line {pos2.split('.')[0]}")
+                    status_fr.set(f"Wrapped - found at line {pos2.split('.')[0]}")
                 else:
                     status_fr.set("Not found.")
 
@@ -1441,7 +1454,7 @@ def tab_generator(nb):
         win.transient(editor_frame)
 
         n_lines = int(editor.index('end-1c').split('.')[0])
-        tk.Label(win, text=f"Line (1–{n_lines}):").grid(row=0, column=0, padx=8, pady=8)
+        tk.Label(win, text=f"Line (1-{n_lines}):").grid(row=0, column=0, padx=8, pady=8)
         v_line = tk.StringVar()
         e_line = tk.Entry(win, textvariable=v_line, width=8)
         e_line.grid(row=0, column=1, padx=4)
@@ -1488,7 +1501,7 @@ def tab_generator(nb):
         if path and os.path.exists(path):
             try:
                 with open(path, encoding='utf-8') as fh:
-                    content = fh.read()
+                    content = fh.read().replace('\r', '')
                 if editor.get('1.0', 'end-1c') != content:
                     editor.delete('1.0', 'end')
                     editor.insert('1.0', content)
@@ -1516,7 +1529,7 @@ def tab_generator(nb):
     # it needs the same bar explicitly.
     _gen_bar = tk.Frame(console_frame)
     _gen_bar.grid(row=1, column=0, sticky='w', padx=4, pady=(0, 4))
-    tk.Button(_gen_bar, text="\U0001f4be Save log\u2026", width=12,
+    tk.Button(_gen_bar, text="Save log...", width=12,
               command=lambda: save_console(console, "generator")).pack(
                   side='left', padx=(0, 3))
     tk.Button(_gen_bar, text="Copy all", width=9,
@@ -1593,7 +1606,7 @@ def tab_auto(nb):
                      state='readonly').pack(side='left', padx=2)
         def remove():
             row_f.destroy(); auto_rows.remove(entry)
-        tk.Button(row_f, text="✕", command=remove).pack(side='left', padx=1)
+        tk.Button(row_f, text="X", command=remove).pack(side='left', padx=1)
 
         # What the reference actually contains, measured as soon as a path is
         # entered. "Not enough voiced material to curate" is a late and opaque
@@ -1609,7 +1622,7 @@ def tab_auto(nb):
             if not p or not os.path.isfile(p):
                 info.set("")
                 return
-            info.set("reading\u2026")
+            info.set("reading...")
             def work():
                 try:
                     import soundfile as _sf
@@ -1650,7 +1663,7 @@ def tab_auto(nb):
                     except Exception:
                         keep = 45.0
                     if usable < keep:
-                        warn.append(f"Keep s is {keep:g} — use {sugg:g} or less")
+                        warn.append(f"Keep s is {keep:g} - use {sugg:g} or less")
                     if 20 * _np.log10(peak) < -20:
                         warn.append("very quiet")
                     if warn:
@@ -1706,7 +1719,7 @@ def tab_auto(nb):
         """
         vals = [s[0] for _v, _l, _f, _p, s in auto_rows if s[0]]
         if not vals:
-            log(console, "[*] Nothing measured yet — pick a reference first.")
+            log(console, "[*] Nothing measured yet - pick a reference first.")
             return
         v_a_keep.set(f"{min(vals):g}")
         log(console, f"[*] Keep s set to {min(vals):g} "
@@ -1776,9 +1789,9 @@ def tab_auto(nb):
                          "are processed but not saved)",
              fg='grey', font=("Arial", 8)).pack(side='left', padx=(8, 0))
 
-    tk.Label(f, text="Runs curate → analyse → optimise → tone-fit for each voice and"
+    tk.Label(f, text="Runs curate -> analyse -> optimise -> tone-fit for each voice and"
                      " prints the final {} / [] blocks to paste. LISTEN to each"
-                     " *_pipeline_clone.wav before generating — scores don't hear"
+                     " *_pipeline_clone.wav before generating - scores don't hear"
                      " naturalness.",
              fg='gray', font=("Arial", 8), justify='left', wraplength=560,
              anchor='w').grid(row=6, column=0, columnspan=3, sticky='w', padx=8)
@@ -1870,7 +1883,7 @@ def tab_curate(nb):
         if not paths:
             cur_info.set("")
             return
-        cur_info.set("reading\u2026")
+        cur_info.set("reading...")
 
         def work():
             try:
@@ -1895,7 +1908,7 @@ def tab_curate(nb):
                                  f"voiced {voiced * 100:.0f}%")
                 sugg = max(5.0, round(total * 0.8))
                 txt = "  |  ".join(lines) + f"\nusable ~{total:.0f}s across "
-                txt += f"{len(paths)} file(s) — suggest Keep s {sugg:g}"
+                txt += f"{len(paths)} file(s) - suggest Keep s {sugg:g}"
                 try:
                     if total < float(v_cur_keep.get()):
                         txt += f"   [!] Keep s is {v_cur_keep.get()}, too high"
@@ -1925,7 +1938,7 @@ def tab_curate(nb):
     ttk.Combobox(frm_c, textvariable=v_cur_device, values=['cpu', 'cuda'],
                  width=6, state='readonly').pack(side='left')
 
-    tk.Label(f, text="Keeps only the most speaker-coherent windows (ECAPA) — breaths,"
+    tk.Label(f, text="Keeps only the most speaker-coherent windows (ECAPA) - breaths,"
                      " noise, off-voice segments are dropped. Run everything downstream"
                      " (Analyser/Optimiser/Comparator) on the curated file.",
              fg='gray', font=("Arial", 8), justify='left', wraplength=560,
@@ -1953,17 +1966,17 @@ def tab_curate(nb):
 
     frm_cho = tk.Frame(f)
     frm_cho.grid(row=6, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
-    tk.Label(frm_cho, text="Use curated file →", fg="gray",
+    tk.Label(frm_cho, text="Use curated file ->", fg="gray",
              font=("Arial", 8)).pack(side='left', padx=(0, 4))
     def _cur_to(target, name):
         out = v_cur_output.get().strip()
         if not out or not os.path.exists(out):
             log(console, "[!] Run the curation first."); return
         ok = _handoff_set(target, out)
-        log(console, f"[→] Sent curated file to {name}" if ok else f"[!] {name} tab not ready.")
-    tk.Button(frm_cho, text="→ Analyser",
+        log(console, f"[->] Sent curated file to {name}" if ok else f"[!] {name} tab not ready.")
+    tk.Button(frm_cho, text="-> Analyser",
               command=lambda: _cur_to('ana_voice1', 'Analyser')).pack(side='left', padx=2)
-    tk.Button(frm_cho, text="→ Optimiser",
+    tk.Button(frm_cho, text="-> Optimiser",
               command=lambda: _cur_to('opt_voices', 'Optimiser')).pack(side='left', padx=2)
 
 
@@ -2155,7 +2168,7 @@ def tab_analyser(nb):
                 # Show final summary if multiple voices
                 if len(summary_lines) > 1:
                     log(console, "\n" + "="*62)
-                    log(console, "  FINAL SUMMARY — ready to paste")
+                    log(console, "  FINAL SUMMARY - ready to paste")
                     log(console, "="*62)
                     for block in summary_lines:
                         log(console, "\n" + block)
@@ -2191,19 +2204,19 @@ def tab_analyser(nb):
     # Hand-off: push the analysed {} / [] into the Validator or Comparator fields
     frm_ho = tk.Frame(f)
     frm_ho.grid(row=4, column=0, columnspan=2, sticky='w', padx=6, pady=(0, 4))
-    tk.Label(frm_ho, text="Send result →", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
+    tk.Label(frm_ho, text="Send result ->", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
     def _to_validator():
         ok = _handoff_set('val_xtts', HANDOFF['xtts']) | _handoff_set('val_audio', HANDOFF['audio'])
-        log(console, "[→] Sent {}/[] to Validator" if ok else "[!] Run the analysis first.")
+        log(console, "[->] Sent {}/[] to Validator" if ok else "[!] Run the analysis first.")
     def _to_comparator():
         ok = _handoff_set('cmp_xtts', HANDOFF['xtts']) | _handoff_set('cmp_audio', HANDOFF['audio'])
-        log(console, "[→] Sent {}/[] to Comparator" if ok else "[!] Run the analysis first.")
-    tk.Button(frm_ho, text="→ Validator", command=_to_validator).pack(side='left', padx=2)
+        log(console, "[->] Sent {}/[] to Comparator" if ok else "[!] Run the analysis first.")
+    tk.Button(frm_ho, text="-> Validator", command=_to_validator).pack(side='left', padx=2)
     def _to_optimize():
         ok = _handoff_set('opt_xtts', HANDOFF['xtts'])
-        log(console, "[→] Sent {} to Optimiser" if ok else "[!] Run the analysis first.")
-    tk.Button(frm_ho, text="→ Optimise", command=_to_optimize).pack(side='left', padx=2)
-    tk.Button(frm_ho, text="→ Comparator", command=_to_comparator).pack(side='left', padx=2)
+        log(console, "[->] Sent {} to Optimiser" if ok else "[!] Run the analysis first.")
+    tk.Button(frm_ho, text="-> Optimise", command=_to_optimize).pack(side='left', padx=2)
+    tk.Button(frm_ho, text="-> Comparator", command=_to_comparator).pack(side='left', padx=2)
 
 
 # ── Tab: Transcription ──────────────────────────────────────────────────────
@@ -2630,7 +2643,7 @@ def tab_convert(nb):
     frm_vid_tempo.grid(row=4, column=1, sticky='w', padx=4)
     ttk.Combobox(frm_vid_tempo, textvariable=v_vid_tempo, width=6,
         values=['0.70','0.80','0.85','0.90','1.0','1.10','1.25','1.5']).pack(side='left')
-    tk.Label(frm_vid_tempo, text="(pitch preserved — slower < 1.0 < faster)", fg='grey').pack(side='left', padx=(6,0))
+    tk.Label(frm_vid_tempo, text="(pitch preserved - slower < 1.0 < faster)", fg='grey').pack(side='left', padx=(6,0))
 
     console = add_console(foot, 0)
 
@@ -2731,7 +2744,7 @@ def tab_validator(nb):
             # Generator defaults
             xtts_str  = "{1, 0, 0, 0, 100, 250, 0.65, 50, 0.85, 5.0, 1.0, 30, 4, 0}"
             audio_str = f"[1, {lang}, 0.9, 3, -2, 3, -4, 90, 8000, 0.5, 0.4, 0.3, 0, 0, 0, 0]"
-        else:  # raw — native XTTS defaults, no audio processing
+        else:  # raw - native XTTS defaults, no audio processing
             xtts_str  = "{1, 0, 0, 0, 0, 0, 0.75, 50, 0.85, 10.0, 1.0, 30, 4, 0}"
             audio_str = f"[1, {lang}, 1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]"
         v_val_xtts.set(xtts_str)
@@ -2938,12 +2951,12 @@ def tab_validator(nb):
     TARGETS['val_audio'] = v_val_audio
     frm_vho = tk.Frame(f)
     frm_vho.grid(row=row + 2, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
-    tk.Label(frm_vho, text="Send winning {} →", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
+    tk.Label(frm_vho, text="Send winning {} ->", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
     def _val_to_cmp():
         block = HANDOFF.get('win_xtts') or v_val_xtts.get().strip()
         ok = _handoff_set('cmp_xtts', block)
-        log(console, "[→] Sent winning {} to Comparator" if ok else "[!] Run a sweep first.")
-    tk.Button(frm_vho, text="→ Comparator", command=_val_to_cmp).pack(side='left', padx=2)
+        log(console, "[->] Sent winning {} to Comparator" if ok else "[!] Run a sweep first.")
+    tk.Button(frm_vho, text="-> Comparator", command=_val_to_cmp).pack(side='left', padx=2)
 
 
 # ── Tab: Optimiser ────────────────────────────────────────────────────────────
@@ -3033,12 +3046,12 @@ def tab_optimize(nb):
 
     frm_oho = tk.Frame(f)
     frm_oho.grid(row=9, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
-    tk.Label(frm_oho, text="Send winning {} →", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
+    tk.Label(frm_oho, text="Send winning {} ->", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
     def _opt_to_cmp():
         block = HANDOFF.get('win_xtts') or v_opt_xtts.get().strip()
         ok = _handoff_set('cmp_xtts', block)
-        log(console, "[→] Sent winning {} to Comparator" if ok else "[!] Run the optimiser first.")
-    tk.Button(frm_oho, text="→ Comparator", command=_opt_to_cmp).pack(side='left', padx=2)
+        log(console, "[->] Sent winning {} to Comparator" if ok else "[!] Run the optimiser first.")
+    tk.Button(frm_oho, text="-> Comparator", command=_opt_to_cmp).pack(side='left', padx=2)
 
 
 # ── Tab: Comparator ──────────────────────────────────────────────────────────
@@ -3081,7 +3094,7 @@ def tab_rvc(nb):
     tk.Label(frm_r1, text="Device").pack(side='left', padx=(10, 2))
     ttk.Combobox(frm_r1, textvariable=v_rvc_dev, values=['cpu', 'cuda'],
                  width=6, state='readonly').pack(side='left')
-    tk.Label(frm_r1, text="→ then TRAIN in Applio (docs/RVC_GUIDE.md): 40k, rmvpe, "
+    tk.Label(frm_r1, text="-> then TRAIN in Applio (docs/RVC_GUIDE.md): 40k, rmvpe, "
                           "250-300 epochs, save every 50", fg='grey',
              font=("Arial", 8)).pack(side='left', padx=(12, 0))
 
@@ -3118,7 +3131,7 @@ def tab_rvc(nb):
                         ("Protect", v_rvc_prot, 5)]:
         tk.Label(frm_r2, text=lbl).pack(side='left', padx=(6, 2))
         tk.Entry(frm_r2, textvariable=var, width=w).pack(side='left')
-    tk.Label(frm_r2, text="(index rate ↑ = more target timbre, more artefacts)",
+    tk.Label(frm_r2, text="(index rate ^ = more target timbre, more artefacts)",
              fg='grey', font=("Arial", 8)).pack(side='left', padx=(8, 0))
 
     # ── 3. Measure ────────────────────────────────────────────────────────────
@@ -3290,7 +3303,7 @@ def tab_comparator(nb):
     tk.Label(frm_iter, text="Iterations", width=10, anchor='w').pack(side='left')
     v_cmp_iter = tk.StringVar(value='1')
     tk.Spinbox(frm_iter, from_=1, to=20, textvariable=v_cmp_iter, width=4).pack(side='left', padx=4)
-    tk.Label(frm_iter, text="  Stop if score Δ <", anchor='w').pack(side='left', padx=(12,2))
+    tk.Label(frm_iter, text="  Stop if score delta  <", anchor='w').pack(side='left', padx=(12,2))
     v_cmp_conv = tk.StringVar(value='0.5')
     tk.Entry(frm_iter, textvariable=v_cmp_conv, width=5).pack(side='left')
     tk.Label(frm_iter, text="or [] unchanged", fg='gray', font=('Arial',8)).pack(side='left', padx=6)
