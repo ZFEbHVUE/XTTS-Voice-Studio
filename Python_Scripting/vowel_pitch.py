@@ -60,10 +60,19 @@ except ImportError:
 
 MARK = re.compile(r"\{([+-]?\d+(?:\.\d+)?)(?:>([+-]?\d+(?:\.\d+)?))?\}")
 OLD_TAG = re.compile(r"\[p:([+-]?\d+(?:\.\d+)?|\?)\]")
-VOWEL_LETTERS = "aeiouyàâäéèêëîïôöùûüÿœæáíóúãõåøı"
+VOWEL_LETTERS = ("aeiouyàâäéèêëîïôöùûüÿœæáíóúãõåøı"   # Latin: fr en de es it pt nl tr...
+                 "ąęóěůýőű"                           # pl cs hu
+                 "аеёиоуыэюяіїє")                     # Cyrillic: ru uk
 LANG = "fr"          # set by --lang: decides the silent-final-e rule
+# XTTS v2 languages -> MFA models known to exist. For the others (it, nl, hu, ar, hi)
+# list what MFA offers with "mfa model download acoustic" and pass --mfa-model.
 MODELS = {"fr": "french_mfa", "en": "english_mfa", "de": "german_mfa", "es": "spanish_mfa",
-          "pt": "portuguese_mfa", "ru": "russian_mfa", "pl": "polish_mfa", "sv": "swedish_mfa"}
+          "pt": "portuguese_mfa", "ru": "russian_mfa", "pl": "polish_mfa", "sv": "swedish_mfa",
+          "tr": "turkish_mfa", "cs": "czech_mfa", "ko": "korean_mfa", "ja": "japanese_mfa",
+          "zh": "mandarin_mfa", "uk": "ukrainian_mfa"}
+# Scripts without vowel letters: vowel marks cannot be placed, contour and
+# global shift still work.
+NO_VOWEL_MARKS = {"ja", "zh", "ko", "ar", "hi"}
 IPA_VOWELS = set("aeiouyøœəɛɔɑɐɪʊʏɨʉɯɤɵɘɞʌæɶ")
 EDGE = 0.015          # s of ramp at the vowel edges, so a shift never clicks
 
@@ -131,12 +140,12 @@ def marks_by_word(line):
                         marks.append((-1, float(m.group(1)), float(m.group(1))))
                     continue
                 a = float(m.group(1)); b = float(m.group(2)) if m.group(2) else a
-                letters = re.sub(r"[^\wàâäéèêëîïôöùûüÿœæç]", "", clean.lower())
+                letters = re.sub(r"[^\w]", "", clean.lower())
                 k = sum(1 for s_, e_ in vowel_groups(letters + "x") if e_ <= len(letters)) - 1
                 marks.append((max(k, 0), a, b))
             else:
                 clean += part
-        tok = re.sub(r"[^\wàâäéèêëîïôöùûüÿœæç]", "", clean.lower())
+        tok = re.sub(r"[^\w]", "", clean.lower())
         if tok:
             res.append((tok, marks))
     return res
@@ -399,6 +408,9 @@ def main():
     a = ap.parse_args()
     global LANG
     LANG = a.lang.lower()[:2]
+    if LANG in NO_VOWEL_MARKS and (a.script or a.extract):
+        ap.error(f"vowel marks are not available for '{a.lang}' (no vowel letters); "
+                 "use --contour and --global-shift")
     model = a.mfa_model or MODELS.get(LANG)
     if a.mfa and not model:
         ap.error(f"no default MFA model for '{a.lang}': give --mfa-model")

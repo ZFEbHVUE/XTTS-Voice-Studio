@@ -2592,8 +2592,10 @@ def tab_pitch(nb):
     tk.Label(fc, text="  range x").pack(side='left'); tk.Entry(fc, textvariable=v_comp, width=5).pack(side='left')
 
     tk.Label(f, text="Language", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
+    # XTTS v2 languages; vowel marks need vowel letters (not ja, zh, ko, ar, hi)
     ttk.Combobox(f, textvariable=v_lang, width=8, state='readonly',
-        values=['fr','en','de','es','pt','ru','pl','sv']).grid(row=6, column=1, sticky='w', padx=4)
+        values=['fr','en','es','de','it','pt','pl','tr','ru','nl','cs','ar','zh','hu','ko','ja','hi']
+    ).grid(row=6, column=1, sticky='w', padx=4)
 
     tk.Label(f, text="MFA command", anchor='w', width=20).grid(row=7, column=0, sticky='w', padx=6, pady=3)
     tk.Entry(f, textvariable=v_mfa, width=30).grid(row=7, column=1, sticky='w', padx=4)
