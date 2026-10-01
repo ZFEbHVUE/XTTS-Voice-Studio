@@ -2230,7 +2230,9 @@ def tab_transcribe(nb):
     v_model  = tk.StringVar(value='medium')
     v_pause  = tk.StringVar(value='0.7')
     v_lang   = tk.StringVar(value='fr')
-    v_pitch  = tk.BooleanVar(value=False)
+    v_pitch  = tk.StringVar(value='none')
+    v_glide  = tk.BooleanVar(value=True)
+    v_mfa    = tk.StringVar(value='conda run -n mfa mfa')
 
     add_row(f, "Video/Audio", v_input,  0,
             [("Video","*.mp4 *.mkv *.avi *.mov *.flv *.webm *.wmv *.m4v *.ts *.mpg"),
@@ -2261,8 +2263,16 @@ def tab_transcribe(nb):
     tk.Label(f, text="Min pause (s)", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
     tk.Entry(f, textvariable=v_pause, width=8).grid(row=5, column=1, sticky='w', padx=4)
 
-    tk.Checkbutton(f, text="Pitch annotation [p:±N]", variable=v_pitch).grid(
-        row=6, column=1, sticky='w', padx=4, pady=3)
+    # Pitch annotation: per word with Whisper timestamps ([p:+2]), or per vowel
+    # with a forced alignment ({+2}, {0>-3}) -- the melody of a song or of a
+    # voice, written into the prompt, applied later in the [Pit] tab.
+    tk.Label(f, text="Pitch annotation", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
+    fp = tk.Frame(f); fp.grid(row=6, column=1, sticky='w', padx=4)
+    ttk.Combobox(fp, textvariable=v_pitch, width=24, state='readonly',
+        values=['none', 'per word [p:N]', 'per vowel {N} (MFA)']).pack(side='left')
+    tk.Checkbutton(fp, text="glides {a>b}", variable=v_glide).pack(side='left', padx=(8, 0))
+    tk.Label(f, text="MFA command", anchor='w', width=20).grid(row=7, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_mfa, width=30).grid(row=7, column=1, sticky='w', padx=4)
 
     console = add_console(foot, 0)
 
@@ -2271,17 +2281,31 @@ def tab_transcribe(nb):
             log(console, "[ERR] Source and output required."); return
         ext = os.path.splitext(v_input.get())[1].lower()
         video_exts = {'.mp4','.mkv','.avi','.mov','.flv','.webm','.wmv','.m4v','.ts','.mpg'}
+        mode = v_pitch.get()
+        per_word, per_vowel = mode.startswith('per word'), mode.startswith('per vowel')
         if ext in video_exts:
             cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'video2txt.py'),
                    v_input.get(), v_output.get(),
                    '--model', v_model.get(), '--lang', v_lang.get(),
                    '--pause', v_pause.get(), '--device', v_device.get()]
-            if v_pitch.get(): cmd.append('--pitch')
+            if per_word: cmd.append('--pitch')
+            if per_vowel:
+                log(console, "[!] Per-vowel pitch needs an audio file: convert the video first ([Vid] tab).")
+                return
         else:
             cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'transcribeSong2txt_with_pause.py'),
                    v_input.get(), v_output.get(),
                    v_model.get(), v_pause.get(), v_lang.get(), '--device', v_device.get()]
-            if v_pitch.get(): cmd.append('--pitch')
+            if per_word: cmd.append('--pitch')
+        if per_vowel:
+            # Transcribe first, then read the pitch of every vowel of the same
+            # audio and write the marks back into the transcript.
+            import shlex as _sh
+            ext_cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'vowel_pitch.py'), v_input.get(),
+                       '--script', v_output.get(), '--extract', v_output.get(),
+                       '--mfa', v_mfa.get(), '--lang', v_lang.get()]
+            if v_glide.get(): ext_cmd.append('--glide')
+            cmd = ['bash', '-c', ' '.join(_sh.quote(c) for c in cmd) + ' && ' + ' '.join(_sh.quote(c) for c in ext_cmd)]
         run_cmd(cmd, console, btn, stop_btn)
 
     make_btn(foot, ">  Transcribe", lancer, 1)
@@ -2530,54 +2554,74 @@ def tab_extract(nb):
 # ── Tab: Pitch ──────────────────────────────────────────────────────────────
 
 def tab_pitch(nb):
+    """Pitch of the generated audio, vowel by vowel, timbre kept (PSOLA).
+    Marks come from the prompt: {+2} / {0>-3} after a vowel, or [p:+2] after a
+    word (all its vowels). Shift mode adds them to the voice's own intonation
+    (meditation prompts); Target mode places each vowel at that height above or
+    below the voice's median -- the melody extracted from a song in [Txt]."""
     f, foot = scrollable_tab(nb, "[Pit] Pitch")
     f.grid_columnconfigure(1, weight=1)
 
     v_clone  = tk.StringVar()
     v_txt    = tk.StringVar()
     v_output = tk.StringVar()
+    v_mode   = tk.StringVar(value='shift (meditation)')
     v_shift  = tk.StringVar(value='0')
+    v_contour= tk.BooleanVar(value=False)
+    v_decl   = tk.StringVar(value='2')
+    v_comp   = tk.StringVar(value='0.8')
     v_lang   = tk.StringVar(value='fr')
-    v_model  = tk.StringVar(value='small')
+    v_mfa    = tk.StringVar(value='conda run -n mfa mfa')
+    v_tg     = tk.StringVar()
 
-    add_row(f, "Clone (.wav)",        v_clone,  0, [("WAV","*.wav")], initialdir=DIR_VOICES)
-    add_row(f, "Script (.txt)",       v_txt,    1, [("Text","*.txt")])
-    add_row(f, "Output (.wav)",       v_output, 2, [("WAV","*.wav")], save=True, initialdir=DIR_OUTPUT)
+    add_row(f, "Generated audio (.wav)", v_clone,  0, [("WAV","*.wav")], initialdir=DIR_OUTPUT)
+    add_row(f, "Annotated prompt (.txt)", v_txt,  1, [("Text","*.txt")])
+    add_row(f, "Output (.wav)",          v_output, 2, [("WAV","*.wav")], save=True, initialdir=DIR_OUTPUT)
 
-    tk.Label(f, text="Global shift (st)", anchor='w', width=20).grid(row=3, column=0, sticky='w', padx=6, pady=3)
-    tk.Entry(f, textvariable=v_shift, width=8).grid(row=3, column=1, sticky='w', padx=4)
+    tk.Label(f, text="Marks", anchor='w', width=20).grid(row=3, column=0, sticky='w', padx=6, pady=3)
+    ttk.Combobox(f, textvariable=v_mode, width=28, state='readonly',
+        values=['shift (meditation)', 'target (melody of a song)']).grid(row=3, column=1, sticky='w', padx=4)
 
-    tk.Label(f, text="Language", anchor='w', width=20).grid(row=4, column=0, sticky='w', padx=6, pady=3)
+    tk.Label(f, text="Global shift (st)", anchor='w', width=20).grid(row=4, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_shift, width=8).grid(row=4, column=1, sticky='w', padx=4)
+
+    tk.Label(f, text="Calm contour", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
+    fc = tk.Frame(f); fc.grid(row=5, column=1, sticky='w', padx=4)
+    tk.Checkbutton(fc, text="on", variable=v_contour).pack(side='left')
+    tk.Label(fc, text="  fall (st)").pack(side='left'); tk.Entry(fc, textvariable=v_decl, width=5).pack(side='left')
+    tk.Label(fc, text="  range x").pack(side='left'); tk.Entry(fc, textvariable=v_comp, width=5).pack(side='left')
+
+    tk.Label(f, text="Language", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_lang, width=8, state='readonly',
-        values=['fr','en','es','de','it']
-    ).grid(row=4, column=1, sticky='w', padx=4)
+        values=['fr','en','de','es','pt','ru','pl','sv']).grid(row=6, column=1, sticky='w', padx=4)
 
-    tk.Label(f, text="Whisper model", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
-    ttk.Combobox(f, textvariable=v_model, width=10, state='readonly',
-        values=['tiny','base','small','medium']
-    ).grid(row=5, column=1, sticky='w', padx=4)
-
-    try:
-        import torch as _torch_pit
-        _pit_dev = "cuda" if _torch_pit.cuda.is_available() else "cpu"
-    except Exception:
-        _pit_dev = "cpu"
-    v_device = tk.StringVar(value=_pit_dev)
-    tk.Label(f, text="Device", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
-    ttk.Combobox(f, textvariable=v_device, width=8, state='readonly',
-        values=['cpu','cuda']).grid(row=6, column=1, sticky='w', padx=4)
+    tk.Label(f, text="MFA command", anchor='w', width=20).grid(row=7, column=0, sticky='w', padx=6, pady=3)
+    tk.Entry(f, textvariable=v_mfa, width=30).grid(row=7, column=1, sticky='w', padx=4)
+    add_row(f, "TextGrid (optional)", v_tg, 8, [("TextGrid","*.TextGrid")])
+    tk.Label(f, text="A TextGrid already aligned skips MFA: faster when trying other values.",
+             fg='#666').grid(row=9, column=1, sticky='w', padx=4)
 
     console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
         if not v_clone.get() or not v_output.get():
-            log(console, "[ERR] Clone and output required."); return
-        cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'apply_pitch_to_clone.py'),
-               v_clone.get(), v_txt.get(), v_output.get(),
-               '--global-shift', v_shift.get(),
-               '--lang', v_lang.get(),
-               '--model', v_model.get(),
-               '--device', v_device.get()]
+            log(console, "[ERR] Generated audio and output required."); return
+        cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'vowel_pitch.py'),
+               v_clone.get(), v_output.get(), '--lang', v_lang.get()]
+        if v_txt.get():
+            cmd += ['--script', v_txt.get()]
+            cmd += ['--textgrid', v_tg.get()] if v_tg.get() else ['--mfa', v_mfa.get()]
+            if v_mode.get().startswith('target'):
+                cmd.append('--target')
+        if v_contour.get():
+            cmd += ['--contour', '--declination', v_decl.get(), '--compress', v_comp.get()]
+        try:
+            if float(v_shift.get() or 0) != 0:
+                cmd += ['--global-shift', v_shift.get()]
+        except ValueError:
+            log(console, "[ERR] Global shift must be a number."); return
+        if not (v_txt.get() or v_contour.get() or '--global-shift' in cmd):
+            log(console, "[ERR] Nothing to do: give an annotated prompt, the calm contour or a global shift."); return
         run_cmd(cmd, console, btn, stop_btn)
 
     make_btn(foot, ">  Apply pitch", lancer, 1)

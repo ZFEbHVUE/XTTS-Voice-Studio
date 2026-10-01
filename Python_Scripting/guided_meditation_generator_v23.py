@@ -237,7 +237,13 @@ PARAMS_GLOBAUX_DEFAUT = DEFAULT_XTTS_PARAMS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def clean_text(text):
-    """Strip trailing punctuation so XTTS does not vocalise it."""
+    """Strip trailing punctuation so XTTS does not vocalise it.
+
+    Pitch marks are removed too -- vowel marks {+2} / {0>-3} and word tags
+    [p:+2] / [p:?] -- so an annotated prompt can be generated as it is; the
+    marks are applied afterwards to the audio by vowel_pitch.py ([Pit] tab)."""
+    text = re.sub(r'\{[+-]?\d+(?:\.\d+)?(?:>[+-]?\d+(?:\.\d+)?)?\}', '', text)
+    text = re.sub(r'\[p:(?:[+-]?\d+(?:\.\d+)?|\?)\]', '', text)
     text = re.sub(r'[.!?]+\s*$', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
