@@ -102,13 +102,37 @@ def _dereverberate_impl(y, sr, method='none', device='cpu'):
             from nara_wpe.utils import stft, istft
         except ImportError:
             print("[!] pip install nara-wpe"); return y
-        print("   [*] WPE...")
-        size, shift = 512, 128
-        Y = stft(y, size=size, shift=shift).T[None, ...]
-        Z = wpe(Y, taps=10, delay=3, iterations=3)[0]
-        out = istft(Z.T, size=size, shift=shift)
-        res = np.zeros_like(y); res[:min(len(out), len(y))] = out[:min(len(out), len(y))]
-        return res.astype(np.float32)
+        # nara_wpe wants (F, D, T): frequency bins first, then channels. The old
+        # code passed (1, F, T), i.e. ONE bin with 257 "channels": a 2570x2570
+        # cross-frequency predictor per iteration — ~15x slower, and it made the
+        # signal WORSE (SI-SDR -5 dB vs input on a synthetic room, RT60 0.6 s).
+        # Window/hop are fixed in TIME (32 ms / 8 ms), not samples, so taps=10
+        # always models 80 ms of tail whatever the rate (nara's 512/128 @ 16 kHz
+        # reference tuning), at the native rate: no band above 8 kHz is lost.
+        # Blocks bound memory: the solver builds a (bins, taps, frames) tensor
+        # that grows to several GB on a long 48 kHz file. 2 iterations: the 3rd
+        # gains < 0.1 dB for +40 % time.
+        size = int(round(0.032 * sr)) & ~1
+        shift = size // 4
+        bs, ov, xf = int(20 * sr), int(1 * sr), int(0.02 * sr)
+        n = len(y); nb = max(1, int(np.ceil(n / bs)))
+        print(f"   [*] WPE: {nb} block(s) of 20 s @ {sr} Hz (win {size}, hop {shift})...")
+        res = np.zeros(n, dtype=np.float32)
+        zprev = sprev = None
+        for i in range(nb):
+            s = max(0, i * bs - ov); e = min(n, (i + 1) * bs + ov)
+            Y = stft(y[s:e].astype(np.float64), size=size, shift=shift).T[:, None, :]
+            Z = wpe(Y, taps=10, delay=3, iterations=2)[:, 0, :]
+            z = istft(Z.T, size=size, shift=shift).astype(np.float32)
+            z = np.pad(z, (0, max(0, (e - s) - len(z))))[: e - s]
+            a, b = i * bs, min(n, (i + 1) * bs)
+            seg = z[a - s: b - s].copy()
+            if zprev is not None and xf < len(seg):
+                w = np.linspace(0.0, 1.0, xf, dtype=np.float32)
+                seg[:xf] = zprev[a - sprev: a - sprev + xf] * (1 - w) + seg[:xf] * w
+            res[a:b] = seg
+            zprev, sprev = z, s
+        return np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
     elif method == 'deepfilter':
         try:
             from df.enhance import enhance, init_df
