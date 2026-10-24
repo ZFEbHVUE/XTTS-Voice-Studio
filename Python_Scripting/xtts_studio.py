@@ -1,32 +1,3 @@
-def split_paths(text):
-    """Split a multi-file field into paths, tolerating spaces in names.
-
-    Splitting on whitespace alone was wrong: half the sound libraries ship files
-    called "Chant du coq (ID 0283).wav", and each word became a missing file.
-    Splitting never is wrong too: voice rows have always held several references
-    separated by spaces, and that is the main quality lever in XTTS.
-
-    So: semicolons and newlines win, since neither can appear in a path. Failing
-    that, whitespace is tried and kept only when the pieces look like real
-    paths -- every one of them exists, or every one of them ends in an audio or
-    text extension. Anything else is one path with spaces in it.
-    """
-    if not text or not text.strip():
-        return []
-    raw = text.replace("\n", ";")
-    if ";" in raw:
-        return [p.strip() for p in raw.split(";") if p.strip()]
-    parts = text.split()
-    if len(parts) > 1:
-        if all(os.path.exists(p) for p in parts):
-            return parts
-        exts = ('.wav', '.mp3', '.flac', '.ogg', '.aiff', '.aif', '.m4a', '.txt')
-        if all(p.lower().endswith(exts) for p in parts):
-            return parts
-    single = text.strip()
-    return [single] if single else []
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -37,6 +8,10 @@ Graphical interface for all XTTS-Voice-Studio scripts.
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, simpledialog, messagebox
 import re
+import json
+from xtts_settings import parse_block
+# Budget and length arithmetic shared with xtts_optimize.py ([Auto] auto buttons).
+import search_plan as SP
 import subprocess
 import threading
 import sys
@@ -282,22 +257,36 @@ def play_file(path):
 def split_paths(text):
     """Split a multi-file field into paths, tolerating spaces in names.
 
-    Splitting on whitespace was wrong: half the sound libraries ship files
+    Splitting on whitespace alone was wrong: half the sound libraries ship files
     called "Chant du coq (ID 0283).wav", and each word became a missing file.
-    Semicolons and newlines are used first because neither can appear in a
-    path; whitespace is only a fallback, and then only when every piece it
-    produces actually exists on disk.
+    Splitting never is wrong too: voice rows have always held several references
+    separated by spaces, and that is the main quality lever in XTTS.
+
+    So: semicolons and newlines win, since neither can appear in a path. Failing
+    that, whitespace is tried and kept only when the pieces look like real
+    paths -- every one of them exists, or every one of them ends in an audio or
+    text extension. Anything else is one path with spaces in it.
     """
     if not text or not text.strip():
         return []
-    raw = text.replace("\n", ";")
-    if ";" in raw:
-        return [p.strip() for p in raw.split(";") if p.strip()]
-    parts = text.split()
-    if len(parts) > 1 and all(os.path.exists(p) for p in parts):
-        return parts                      # old-style, still valid
-    single = text.strip()
-    return [single] if single else []
+    out = []
+    # Each ';'-separated piece still goes through the whitespace rule, so a
+    # field holding old space-separated paths with a new ' ; '-joined one
+    # appended after it is still read correctly.
+    for piece in text.replace("\n", ";").split(";"):
+        piece = piece.strip()
+        if not piece:
+            continue
+        parts = piece.split()
+        if len(parts) > 1:
+            exts = ('.wav', '.mp3', '.flac', '.ogg', '.aiff', '.aif', '.m4a', '.txt')
+            if (all(os.path.exists(p) for p in parts)
+                    or all(p.lower().endswith(exts) for p in parts)):
+                out += parts
+                continue
+        out.append(piece)
+    return out
+
 
 def add_row(parent, label, var, row, filetypes=None, save=False, multi=False, initialdir=None):
     parent.grid_columnconfigure(1, weight=1)
@@ -605,13 +594,20 @@ def make_btn(parent, text, cmd_fn, row):
 # language combobox — but only while they still hold a built-in default, so a
 # sentence you typed is never overwritten.
 try:
-    from probe_texts import (default_text as _default_text,
+    from probe_texts import (default_text as _language_default_text,
                              supported as _langs_ok,
                              default_lang as _default_lang)
 except Exception:                                    # keep the GUI usable
-    def _default_text(lang): return "Hello, this is a short test sentence for tuning the voice."
+    def _language_default_text(lang): return ""
     def _langs_ok(): return ['en']
     def _default_lang(): return 'EN'
+
+def _default_text(lang):
+    try:
+        return _language_default_text(lang)
+    except ValueError:
+        return ""  # unsupported default: user must enter language-specific prose
+
 
 # Start on the user's own language rather than imposing one: an explicit
 # XTTS_STUDIO_LANG wins, else the system locale when we have sentences for it,
@@ -724,8 +720,8 @@ def tab_generator(nb):
                 initialdir=DIR_VOICES)
             if files:
                 existing = v.get().strip()
-                new_files = " ".join(files)
-                v.set((existing + " " + new_files).strip() if existing else new_files)
+                new_files = " ; ".join(files)
+                v.set((existing + " ; " + new_files).strip() if existing else new_files)
 
         tk.Button(row_f, text="Browse", width=8, command=browse_refs).pack(side='left', padx=2)
 
@@ -1190,17 +1186,39 @@ def tab_generator(nb):
         if not name:
             return
         try:
-            saved = VP.save(name.strip(), mx.group(0), ma.group(0), source='gui')
+            n = int(mx.group(0).strip()[1:].split(',')[0])
+            refs = split_paths(voice_rows_gen[n-1][1].get()) if 0 < n <= len(voice_rows_gen) else []
+            saved = VP.save(name.strip(), mx.group(0), ma.group(0), source='gui', references=refs)
             _refresh_presets(); v_preset.set(saved)
             _status(f"Preset '{saved}' saved")
         except Exception as e:
             _status(f"Save failed: {e}")
+
+    def _restore_preset_refs(d):
+        refs = d.get('references')
+        if not refs:
+            return
+        if not all(os.path.isfile(path) for path in refs):
+            messagebox.showwarning('Voice references',
+                'Some saved reference files are missing. Choose their new locations before generating.')
+            return
+        n = int(d['xtts'].strip()[1:].split(',')[0])
+        while len(voice_rows_gen) < n:
+            add_gen_voice_row(len(voice_rows_gen) + 1)
+        target = voice_rows_gen[n - 1][1]
+        value = ' ; '.join(refs)
+        if target.get().strip() and split_paths(target.get()) != refs:
+            if not messagebox.askyesno('Voice references',
+                    f'Replace the current references of voice {n} with those saved in the preset?'):
+                return
+        target.set(value)
 
     def _insert_preset():
         d = VP.get(v_preset.get()) if VP else None
         if not d:
             _status("No preset selected")
             return
+        _restore_preset_refs(d)
         _insert(f"{d['xtts']}\n{d['audio']}")
 
     def _delete_preset():
@@ -1239,6 +1257,7 @@ def tab_generator(nb):
         if not e:
             _status(f"No {{}} / [] pair in {os.path.basename(p)}")
             return
+        _restore_preset_refs(e)
         _insert(f"{e['xtts']}\n{e['audio']}")
         bits = [e.get('source', ''), e.get('date', ''), e.get('scores_text', '')]
         _status(f"{e.get('name', os.path.basename(p))} - "
@@ -1584,6 +1603,7 @@ def tab_auto(nb):
     voices_frame = tk.LabelFrame(f, text="Voices (reference + language)")
     voices_frame.grid(row=0, column=0, columnspan=3, sticky='ew', padx=6, pady=4)
     auto_rows = []
+    row_probes = []      # each row's readout, re-run when curation settings change
 
     def add_auto_row():
         v_path = tk.StringVar()
@@ -1606,6 +1626,8 @@ def tab_auto(nb):
                      state='readonly').pack(side='left', padx=2)
         def remove():
             row_f.destroy(); auto_rows.remove(entry)
+            if _probe in row_probes:
+                row_probes.remove(_probe)
         tk.Button(row_f, text="X", command=remove).pack(side='left', padx=1)
 
         # What the reference actually contains, measured as soon as a path is
@@ -1614,8 +1636,8 @@ def tab_auto(nb):
         # that decide it are cheap to read here.
         info = tk.StringVar(value="")
         row_suggest = [None]          # what curation could keep from this file
-        tk.Label(voices_frame, textvariable=info, fg='#555',
-                 font=("Arial", 8), anchor='w').pack(fill='x', padx=(28, 4))
+        tk.Label(voices_frame, textvariable=info, fg='#555', font=("Arial", 8),
+                 anchor='w', justify='left').pack(fill='x', padx=(28, 4))
 
         def _probe(*_a):
             p = v_path.get().strip()
@@ -1668,12 +1690,26 @@ def tab_auto(nb):
                         warn.append("very quiet")
                     if warn:
                         txt += "   [!] " + "; ".join(warn)
+                    # The pipeline REUSES an existing curated file unless told
+                    # to re-curate: a new Keep s would then change nothing.
+                    cur = os.path.splitext(p)[0] + '_curated.wav'
+                    if os.path.isfile(cur) and v_a_curate.get():
+                        try:
+                            txt += (f"\n{os.path.basename(cur)} exists "
+                                    f"({_sf.info(cur).duration:.1f}s): ")
+                            txt += ("Re-curate will curate the reference again to Keep s"
+                                    if v_a_recur.get() else
+                                    "reused as it is, Keep s does not apply unless "
+                                    "Re-curate is ticked")
+                        except Exception:
+                            pass
                     info.set(txt)
                 except Exception as e:
                     info.set(f"could not read: {e}")
             threading.Thread(target=work, daemon=True).start()
 
         v_path.trace_add('write', _probe)
+        row_probes.append(_probe)
 
         entry = (v_path, v_lang, row_f, v_pname, row_suggest)
         auto_rows.append(entry)
@@ -1685,20 +1721,89 @@ def tab_auto(nb):
     v_a_seeds  = tk.StringVar(value='0 42 100 180 200')
     v_a_budget = tk.StringVar(value='60')
     v_a_keep   = tk.StringVar(value='45')
-    v_a_wacc   = tk.StringVar(value='0.6')
-    v_a_wid    = tk.StringVar(value='0.4')
+    v_a_wacc   = tk.StringVar(value='0.3')
+    v_a_wid    = tk.StringVar(value='0.7')
+    # What an empty field means. lancer() passes these fallbacks; for gcl s it
+    # passes nothing and xtts_pipeline.py's own --gpt-cond-lens default applies.
+    # The auto buttons and the budget check read the fields the same way, or
+    # an emptied field would get a budget computed for another search.
+    FALLBACK = {'seeds': '0 42 100 180 200', 'budget': '60', 'keep': '45',
+                'cond': '24', 'chunks': '4 6 8 10', 'maxref': '30', 'gcl': '20 30'}
+
+    def _field(var, key):
+        return var.get().strip() or FALLBACK[key]
     # What the optimiser's second term measures. ECAPA is robust to pitch
     # shifts by design -- it has to recognise someone who speaks higher today
     # -- so a clone 33 Hz off with a much brighter spectrum can score ABOVE one
     # that sits right on the reference. Measured on this project: 0.6465 vs
     # 0.6039, and the ear ranked them the other way round. 'timbre' scores the
     # distance in pitch, brightness and HNR instead.
-    v_a_obj    = tk.StringVar(value='identity')
+    v_a_obj    = tk.StringVar(value='both')
+    # What the optimiser maximises is a choice, not a measurement: no score can
+    # say whether resemblance matters more than intelligibility. The Priority
+    # menu fills the three fields that define it, and shows Custom as soon as
+    # one of them is edited by hand.
+    PRIORITY = {'Resemblance': ('0.3', '0.7', 'both'),
+                'Balanced': ('0.6', '0.4', 'identity')}
+    v_a_prio   = tk.StringVar(value='Resemblance')
+    _syncing = [False]
+
+    def _apply_priority(*_a):
+        if _syncing[0] or v_a_prio.get() not in PRIORITY:
+            return
+        _syncing[0] = True
+        try:
+            w_acc, w_id, objective = PRIORITY[v_a_prio.get()]
+            v_a_wacc.set(w_acc)
+            v_a_wid.set(w_id)
+            v_a_obj.set(objective)
+        finally:
+            _syncing[0] = False
+
+    def _match_priority(*_a):
+        if _syncing[0]:
+            return
+
+        def same(a, b):
+            try:
+                return abs(float(a) - float(b)) < 1e-9
+            except ValueError:
+                return False
+        found = next((name for name, (w_acc, w_id, objective) in PRIORITY.items()
+                      if same(v_a_wacc.get(), w_acc) and same(v_a_wid.get(), w_id)
+                      and v_a_obj.get() == objective), 'Custom')
+        if v_a_prio.get() != found:
+            _syncing[0] = True
+            try:
+                v_a_prio.set(found)
+            finally:
+                _syncing[0] = False
+
+    v_a_prio.trace_add('write', _apply_priority)
+    for _var in (v_a_wacc, v_a_wid, v_a_obj):
+        _var.trace_add('write', _match_priority)
+    # Candidate gpt_cond_len values for the optimiser. Floor of 20 s on
+    # purpose: the GPT conditioning carries the accent, and no score in the
+    # loop hears a regional accent -- free down to 6 s, a Paris-French voice
+    # came out Canadian. One voice, not a general threshold: lower it for
+    # references shorter than that, or to compare by ear.
+    v_a_gcl    = tk.StringVar(value='20 30')
     v_a_curate = tk.BooleanVar(value=True)
+    # The CLI's --recurate. Without it an existing <ref>_curated.wav is reused,
+    # whatever Keep s says now.
+    v_a_recur  = tk.BooleanVar(value=False)
+
+    def _refresh_rows(*_a):
+        for probe in list(row_probes):
+            probe()
+    v_a_curate.trace_add('write', _refresh_rows)
+    v_a_recur.trace_add('write', _refresh_rows)
     v_a_autotx = tk.BooleanVar(value=True)
     v_a_beams  = tk.BooleanVar(value=False)
     v_a_screen = tk.BooleanVar(value=False)
-    v_a_target = tk.StringVar(value='')          # empty = match the reference
+    # A production level by default: matching each reference gives every voice
+    # of a meditation its own level, and drives a loud reference into the limiter.
+    v_a_target = tk.StringVar(value='-20')       # empty = match each reference
     v_a_optaud = tk.StringVar(value='none')
     try:
         import torch as _t_auto
@@ -1711,27 +1816,69 @@ def tab_auto(nb):
     tk.Label(frm_a, text="Seeds").pack(side='left', padx=(6, 2))
     tk.Entry(frm_a, textvariable=v_a_seeds, width=20).pack(side='left')
     def _auto_keep():
-        """Set Keep s from the shortest reference on screen.
+        """Lower Keep s to what the shortest reference on screen can give.
 
         --keep-seconds is ONE value for every voice in the pipeline run, so the
         shortest file decides: asking for more than it holds fails the whole
-        run, and the error only surfaces after the model has loaded.
+        run, and the error only surfaces after the model has loaded. It only
+        ever LOWERS the value: raised to what a long file holds (100 s and
+        more), curation would keep almost everything, and XTTS still reads
+        only the first Max reference s of it.
         """
         vals = [s[0] for _v, _l, _f, _p, s in auto_rows if s[0]]
         if not vals:
             log(console, "[*] Nothing measured yet - pick a reference first.")
             return
-        v_a_keep.set(f"{min(vals):g}")
-        log(console, f"[*] Keep s set to {min(vals):g} "
-                     f"(shortest of {len(vals)} reference(s))")
+        try:
+            current = float(_field(v_a_keep, 'keep'))
+        except ValueError:
+            current = float(FALLBACK['keep'])
+        if min(vals) < current:
+            v_a_keep.set(f"{min(vals):g}")
+            log(console, f"[*] Keep s lowered to {min(vals):g}: what the shortest of "
+                         f"{len(vals)} reference(s) can give")
+        else:
+            v_a_keep.set(f"{current:g}")
+            log(console, f"[*] Keep s stays at {current:g}: every reference holds enough "
+                         f"voiced audio for it")
+
+    def _seeds():
+        try:
+            seeds = SP.parse_ints(_field(v_a_seeds, 'seeds'))
+        except ValueError:
+            log(console, "[ERR] Seeds must be whole numbers separated by spaces.")
+            return None
+        if not seeds:
+            log(console, "[ERR] At least one seed is required.")
+        return seeds or None
+
+    def _auto_budget():
+        """Budget that runs the whole sampling plan: a larger one is never used."""
+        seeds = _seeds()
+        if seeds is None:
+            return
+        need = SP.pipeline_sampling_budget(seeds, v_a_beams.get())
+        v_a_budget.set(str(need))
+        log(console, f"[*] Budget set to {need}: the whole sampling plan for "
+                     f"{len(set(seeds))} seed(s)"
+                     f"{', beam/greedy probe included' if v_a_beams.get() else ''}. The "
+                     f"starting temperature comes from the analysis, so the longest case "
+                     f"is counted; a larger budget is never used.")
 
     for lbl, var, w in [("Budget", v_a_budget, 4), ("Keep s", v_a_keep, 4),
                         ("w_acc", v_a_wacc, 4), ("w_id", v_a_wid, 4)]:
+        if lbl == "w_acc":
+            tk.Label(frm_a, text="Priority").pack(side='left', padx=(8, 2))
+            ttk.Combobox(frm_a, textvariable=v_a_prio, width=12, state='readonly',
+                         values=['Resemblance', 'Balanced', 'Custom']).pack(side='left')
         tk.Label(frm_a, text=lbl).pack(side='left', padx=(8, 2))
         tk.Entry(frm_a, textvariable=var, width=w).pack(side='left')
         if lbl == "Keep s":
             tk.Button(frm_a, text="auto", width=4, command=_auto_keep).pack(
                 side='left', padx=(2, 0))
+        elif lbl == "Budget":
+            tk.Button(frm_a, text="auto", width=4, command=_auto_budget,
+                      name='auto_budget').pack(side='left', padx=(2, 0))
     tk.Label(frm_a, text="Objective").pack(side='left', padx=(8, 2))
     ttk.Combobox(frm_a, textvariable=v_a_obj, width=9, state='readonly',
                  values=['identity', 'timbre', 'both']).pack(side='left')
@@ -1741,6 +1888,7 @@ def tab_auto(nb):
 
     frm_b = tk.Frame(f); frm_b.grid(row=3, column=0, columnspan=3, sticky='w', padx=6)
     tk.Checkbutton(frm_b, text="Curate reference", variable=v_a_curate).pack(side='left', padx=6)
+    tk.Checkbutton(frm_b, text="Re-curate", variable=v_a_recur).pack(side='left', padx=(0, 6))
     tk.Checkbutton(frm_b, text="Fit on reference's own words (auto-text)",
                    variable=v_a_autotx).pack(side='left', padx=6)
     tk.Checkbutton(frm_b, text="Probe beam/greedy decoding",
@@ -1762,15 +1910,18 @@ def tab_auto(nb):
     tk.Checkbutton(frm_c, text="Screen audio params (which knobs move identity)",
                    variable=v_a_screen).pack(side='left', padx=6)
     tk.Label(frm_c, text="EQ weighting").pack(side='left', padx=(10, 2))
-    v_a_eqw = tk.StringVar(value='a')
-    ttk.Combobox(frm_c, textvariable=v_a_eqw, values=['a', 'voice', 'blend'],
-                 width=6, state='readonly').pack(side='left')
+    # a+blend: the same clone fitted twice, written side by side for a blind
+    # A/B. No rule says which suits a voice: 'a' already gives everything below
+    # ~180 Hz a floor weight, low voice or not.
+    v_a_eqw = tk.StringVar(value='a+blend')
+    ttk.Combobox(frm_c, textvariable=v_a_eqw, values=['a', 'voice', 'blend', 'a+blend'],
+                 width=8, state='readonly').pack(side='left')
     tk.Label(frm_c, text="Optimise audio").pack(side='left', padx=(10, 2))
     ttk.Combobox(frm_c, textvariable=v_a_optaud, values=['none', 'nelder', 'de'],
                  width=7, state='readonly').pack(side='left')
     tk.Label(frm_c, text="Target dBFS").pack(side='left', padx=(10, 2))
     tk.Entry(frm_c, textvariable=v_a_target, width=6).pack(side='left')
-    tk.Label(frm_c, text="(empty = match reference; -20 = production level)",
+    tk.Label(frm_c, text="(-20 = production level; empty = match each reference)",
              fg='grey', font=("Arial", 8)).pack(side='left', padx=(4, 0))
 
     frm_d = tk.Frame(f)
@@ -1796,7 +1947,182 @@ def tab_auto(nb):
              fg='gray', font=("Arial", 8), justify='left', wraplength=560,
              anchor='w').grid(row=6, column=0, columnspan=3, sticky='w', padx=8)
 
+    v_a_cond = tk.StringVar(value='24')
+    v_a_chunks = tk.StringVar(value='4 6 8 10')
+    v_a_maxref = tk.StringVar(value='30')
+    v_a_mrls = tk.StringVar(value='')
+
+    def _voice_seconds(quiet=False):
+        """(path, seconds, what) of the audio each voice will hand XTTS."""
+        paths = [v.get().strip() for v, _l, _f, _p, _s in auto_rows]
+        paths = [p for p in paths if p and os.path.isfile(p)]
+        if not paths:
+            if not quiet:
+                log(console, "[*] Pick a reference first.")
+            return None
+        keep = 0.0
+        if v_a_curate.get():
+            try:
+                keep = float(_field(v_a_keep, 'keep'))
+            except ValueError:
+                if not quiet:
+                    log(console, "[ERR] Keep s must be a number.")
+                return None
+        try:
+            import soundfile as _sf
+            return SP.pipeline_reference_seconds(
+                paths, v_a_curate.get(), v_a_recur.get(), keep,
+                lambda path: _sf.info(path).duration)
+        except Exception as e:
+            if not quiet:
+                log(console, f"[ERR] Cannot read a reference: {e}")
+            return None
+
+    def _int_field(var, key, name):
+        try:
+            value = int(float(_field(var, key)))
+        except ValueError:
+            value = 0
+        if value < 1:
+            log(console, f"[ERR] {name} must be a whole number of seconds.")
+            return None
+        return value
+
+    def _auto_maxref():
+        """Max reference s = the audio XTTS actually gets, so all of it is read."""
+        secs = _voice_seconds()
+        if not secs:
+            return
+        value = SP.max_reference_for([s for _p, s, _w in secs])
+        v_a_maxref.set(str(value))
+        path, seconds, what = max(secs, key=lambda t: t[1])
+        whose = "the audio" if len(secs) == 1 else "all the audio of every voice; longest"
+        log(console, f"[*] Max reference s set to {value}: XTTS reads {whose} "
+                     f"({os.path.basename(path)}, {seconds:.1f}s, {what})"
+                     f"{', capped at 60 s' if value < SP.whole_file_seconds(seconds) else ''}.")
+        gcl = SP.find_ints(_field(v_a_gcl, 'gcl'))
+        ignored = [g for g in gcl if g > value]
+        if ignored:
+            log(console, f"[!] gcl s {' '.join(map(str, ignored))} is longer than {value} s: "
+                         f"ignored by the search.")
+        # The search starts from the analyser's gpt_cond_len, which follows the
+        # length of each voice's file, and tests gcl s against it.
+        starts = sorted({min(SP.analyser_gcl_prior(s), value) for _p, s, _w in secs})
+        if any(g not in gcl for g in starts):
+            log(console, f"[*] The search starts from gpt_cond_len "
+                         f"{' / '.join(map(str, starts))}, the analysis value for this "
+                         f"length, and tests gcl s against it.")
+
+    def _auto_reflens():
+        """Every reference length worth testing: none longer than the audio."""
+        secs = _voice_seconds()
+        if not secs:
+            return
+        shortest = min(s for _p, s, _w in secs)
+        values = ' '.join(map(str, SP.reference_lengths_for(shortest)))
+        v_a_mrls.set(values)
+        log(console, f"[*] Reference lengths to test set to {values}: none longer than the "
+                     f"shortest audio XTTS gets ({shortest:.1f}s), which a longer value would "
+                     f"only read again. Each one is judged on one sentence and one seed, so "
+                     f"only a large effect can win. Then press auto next to Conditioning "
+                     f"budget.")
+
+    def _auto_gcl():
+        """gcl s: GPT lengths up to what XTTS reads of the shortest file."""
+        secs = _voice_seconds()
+        if not secs:
+            return
+        max_ref = _int_field(v_a_maxref, 'maxref', "Max reference s")
+        if max_ref is None:
+            return
+        values = SP.gcl_candidates([s for _p, s, _w in secs], max_ref)
+        text = ' '.join(map(str, values))
+        v_a_gcl.set(text)
+        start = (f"from {SP.GCL_FLOOR} s, the floor kept for the accent" if values[0] >= SP.GCL_FLOOR
+                 else f"from {values[0]} s, the file being shorter than {SP.GCL_FLOOR} s")
+        log(console, f"[*] gcl s set to {text}: {start}, up to the {values[-1]} s XTTS reads "
+                     f"of the shortest file; none is ignored or reads the same audio twice. "
+                     f"Then press auto next to Chunk lengths and Conditioning budget.")
+
+    def _auto_chunks():
+        """Chunk lengths that fit every usable gpt_cond_len."""
+        max_ref = _int_field(v_a_maxref, 'maxref', "Max reference s")
+        if max_ref is None:
+            return
+        values = ' '.join(map(str, SP.chunk_candidates(SP.find_ints(_field(v_a_gcl, 'gcl')),
+                                                       max_ref)))
+        v_a_chunks.set(values)
+        log(console, f"[*] Chunk lengths set to {values}: each one fits the shortest usable "
+                     f"gcl s, so it can pair with every gpt_cond_len. Then press auto next "
+                     f"to Conditioning budget.")
+
+    def _cond_need(secs):
+        max_ref = _int_field(v_a_maxref, 'maxref', "Max reference s")
+        if max_ref is None:
+            return None
+        try:
+            ref_lengths = SP.parse_ints(v_a_mrls.get())
+        except ValueError:
+            log(console, "[ERR] Reference lengths to test must be whole numbers.")
+            return None
+        return SP.pipeline_conditioning_budget(
+            SP.find_ints(_field(v_a_gcl, 'gcl')), SP.find_ints(_field(v_a_chunks, 'chunks')),
+            ref_lengths, max_ref, [s for _p, s, _w in secs])
+
+    def _auto_cond():
+        """Conditioning budget that runs every stage in full, for every voice."""
+        secs = _voice_seconds()
+        if not secs:
+            return
+        need = _cond_need(secs)
+        if need is None:
+            return
+        v_a_cond.set(str(need))
+        log(console, f"[*] Conditioning budget set to {need}: every conditioning stage runs "
+                     f"in full for every voice, whichever candidates win; a larger budget "
+                     f"is never used.")
+
+    extra = tk.Frame(f)
+    extra.grid(row=7, column=0, columnspan=3, sticky='w', padx=6, pady=4)
+    for i, (label, var, name, command) in enumerate((
+            ('Conditioning budget', v_a_cond, 'auto_cond', _auto_cond),
+            ('Chunk lengths', v_a_chunks, 'auto_chunks', _auto_chunks),
+            ('gcl s', v_a_gcl, 'auto_gcl', _auto_gcl),
+            ('Max reference s', v_a_maxref, 'auto_maxref', _auto_maxref),
+            ('Reference lengths to test (optional)', v_a_mrls, 'auto_reflens',
+             _auto_reflens))):
+        tk.Label(extra, text=label).grid(row=i, column=0, sticky='w')
+        tk.Entry(extra, textvariable=var, width=24).grid(row=i, column=1, sticky='w', padx=4)
+        tk.Button(extra, text="auto", width=4, command=command, name=name).grid(
+            row=i, column=2, sticky='w')
     console = add_console(foot, 0)
+
+    def _check_budgets():
+        """Warn before the long run when a budget would cut its own plan."""
+        try:
+            seeds = SP.parse_ints(_field(v_a_seeds, 'seeds'))
+            need = SP.pipeline_sampling_budget(seeds, v_a_beams.get())
+            have = int(_field(v_a_budget, 'budget'))
+            if have < need:
+                log(console, f"[!] Budget {have} is below the whole sampling plan ({need}): "
+                             f"its last stages will be cut. auto next to Budget sets {need}.")
+        except ValueError:
+            pass
+        secs = _voice_seconds(quiet=True)
+        if not secs:
+            return
+        try:
+            have = int(_field(v_a_cond, 'cond'))
+            need = SP.pipeline_conditioning_budget(
+                SP.find_ints(_field(v_a_gcl, 'gcl')), SP.find_ints(_field(v_a_chunks, 'chunks')),
+                SP.parse_ints(v_a_mrls.get()), int(float(_field(v_a_maxref, 'maxref'))),
+                [s for _p, s, _w in secs])
+            if have < need:
+                log(console, f"[!] Conditioning budget {have} is below the whole "
+                             f"conditioning plan ({need}): its last stages will try fewer "
+                             f"candidates. auto next to it sets {need}.")
+        except ValueError:
+            pass
 
     def lancer(btn, stop_btn=None):
         voices = [(v.get().strip(), l.get(), p.get().strip())
@@ -1806,16 +2132,25 @@ def tab_auto(nb):
         cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'xtts_pipeline.py')]
         for path, lg, _pn in voices:
             cmd += ['--voice', path, lg]
-        cmd += ['--seeds', v_a_seeds.get().strip() or '0 42 100 180 200']
-        cmd += ['--budget', v_a_budget.get().strip() or '60']
-        cmd += ['--keep-seconds', v_a_keep.get().strip() or '45']
+        cmd += ['--seeds', _field(v_a_seeds, 'seeds')]
+        cmd += ['--budget', _field(v_a_budget, 'budget')]
+        cmd += ['--cond-budget', _field(v_a_cond, 'cond')]
+        cmd += ['--gpt-chunks', _field(v_a_chunks, 'chunks')]
+        cmd += ['--max-ref-len', _field(v_a_maxref, 'maxref')]
+        if v_a_mrls.get().strip():
+            cmd += ['--max-ref-lens', v_a_mrls.get().strip()]
+        cmd += ['--keep-seconds', _field(v_a_keep, 'keep')]
         cmd += ['--w-accent', v_a_wacc.get().strip() or '0.6']
         cmd += ['--w-identity', v_a_wid.get().strip() or '0.4']
         if v_a_obj.get() != 'identity':
             cmd += ['--objective', v_a_obj.get()]
+        if v_a_gcl.get().strip():
+            cmd += ['--gpt-cond-lens', v_a_gcl.get().strip()]
         cmd += ['--device', v_a_device.get()]
         if not v_a_curate.get():
             cmd += ['--no-curate']
+        elif v_a_recur.get():
+            cmd += ['--recurate']
         if not v_a_autotx.get():
             cmd += ['--no-auto-text']
         if v_a_beams.get():
@@ -1841,6 +2176,7 @@ def tab_auto(nb):
                 cmd += ['--preset-name', pn or '-']
         if v_a_hist.get():
             cmd += ['--keep-preset-history']
+        _check_budgets()
         run_cmd(cmd, console, btn, stop_btn)
 
     make_btn(foot, ">  Run full pipeline", lancer, 1)
@@ -2016,8 +2352,8 @@ def tab_analyser(nb):
                 initialdir=DIR_VOICES)
             if files:
                 existing = vp.get().strip()
-                new_files = " ".join(files)
-                vp.set((existing + " " + new_files).strip() if existing else new_files)
+                new_files = " ; ".join(files)
+                vp.set((existing + " ; " + new_files).strip() if existing else new_files)
 
         tk.Button(row_f, text="Browse", width=8,
             command=browse_multi_refs).pack(side='left', padx=1)
@@ -2326,13 +2662,17 @@ def tab_extract(nb):
     v_debug      = tk.BooleanVar(value=False)
     v_split      = tk.BooleanVar(value=False)
     v_ovrange    = tk.StringVar(value='200')
-    v_minsilence = tk.StringVar(value='0.30')
+    v_minsilence = tk.StringVar(value='0.15')
     v_mindur     = tk.StringVar(value='0.2')
     v_remove_music = tk.BooleanVar(value=False)
     v_demucs_model = tk.StringVar(value='htdemucs_ft')
     v_mp3_bitrate  = tk.StringVar(value='192')
     v_mp3_mode     = tk.StringVar(value='cbr')
     v_method       = tk.StringVar(value='f0')
+    v_female_ref   = tk.StringVar()
+    v_male_ref     = tk.StringVar()
+    v_match_min    = tk.StringVar(value='0.35')
+    v_match_margin = tk.StringVar(value='0.08')
 
     # row 0 : source
     add_row(f, "Audio/Video source", v_input, 0,
@@ -2361,14 +2701,11 @@ def tab_extract(nb):
     frm_thr = tk.Frame(f)
     frm_thr.grid(row=4, column=1, sticky='w', padx=4)
     tk.Entry(frm_thr, textvariable=v_thr, width=8).pack(side='left')
-    tk.Label(frm_thr, text="  (female >= threshold, male < threshold)", fg='grey').pack(side='left')
+    tk.Label(frm_thr, text="  (F0 heuristic only; ignored when matching solo references)", fg='grey').pack(side='left')
 
     # row 5 : Overlap range
-    tk.Label(f, text="Overlap range (Hz)", anchor='w', width=20).grid(row=5, column=0, sticky='w', padx=6, pady=3)
-    frm_ov = tk.Frame(f)
-    frm_ov.grid(row=5, column=1, sticky='w', padx=4)
-    tk.Entry(frm_ov, textvariable=v_ovrange, width=8).pack(side='left')
-    tk.Label(frm_ov, text="  (raise if male voices land in overlap)", fg='grey').pack(side='left')
+    tk.Label(f, text="Pitch alone cannot identify a speaker. Ambiguous audio is saved to _review.wav.",
+             fg='grey').grid(row=5, column=0, columnspan=2, sticky='w', padx=6, pady=3)
 
     # row 6 : Min silence  +  Shorten silences (a different mode entirely)
     tk.Label(f, text="Min silence (s)", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
@@ -2448,14 +2785,7 @@ def tab_extract(nb):
              fg='grey', font=('Arial', 8)).pack(side='left', padx=(4, 0))
 
     # row 11 : Remove music
-    def on_remove_music_toggle(*args):
-        if v_remove_music.get():
-            v_keep.set('vocals only')
-        else:
-            if v_keep.get() == 'vocals only':
-                v_keep.set('female')
-    v_remove_music.trace_add('write', on_remove_music_toggle)
-
+    # Removing music must preserve the user's selected target voices.
     tk.Checkbutton(f, text="Remove background music (demucs)",
                    variable=v_remove_music).grid(row=11, column=0, columnspan=2, sticky='w', padx=6, pady=2)
 
@@ -2489,10 +2819,32 @@ def tab_extract(nb):
         values=['f0', 'ecapa', 'sepformer', 'pyannote']).pack(side='left')
     tk.Label(frm_method, text="(ecapa = by speaker, not pitch)", fg='grey').pack(side='left', padx=(6, 0))
     tk.Label(frm_method,
-             text="  f0=fast  |  ecapa=by speaker  |  sepformer=true separation  |  pyannote=diarisation",
+             text="  f0=fast  |  ecapa=by speaker  |  sepformer=unmix overlapping voices  |  pyannote=diarisation",
              fg='grey').pack(side='left')
 
-    # row 15 : console
+    add_row(f, "Female solo reference", v_female_ref, 16,
+            [("Audio", "*.wav *.mp3 *.flac *.ogg"), ("All", "*.*")], initialdir=DIR_VOICES)
+    add_row(f, "Male solo reference", v_male_ref, 17,
+            [("Audio", "*.wav *.mp3 *.flac *.ogg"), ("All", "*.*")], initialdir=DIR_VOICES)
+    matching = tk.Frame(f)
+    matching.grid(row=18, column=1, sticky='w', padx=4)
+    tk.Label(f, text="Reference matching", width=20, anchor='w').grid(row=18, column=0, sticky='w', padx=6)
+    tk.Label(matching, text="Min cosine").pack(side='left')
+    tk.Entry(matching, textvariable=v_match_min, width=6).pack(side='left', padx=4)
+    tk.Label(matching, text="Margin").pack(side='left')
+    tk.Entry(matching, textvariable=v_match_margin, width=6).pack(side='left', padx=4)
+    tk.Label(f, text="Optional: examples where each target speaks alone. References select ECAPA automatically.\n"
+                     "If voices speak together, choose SepFormer; its model limits the upper audio band.\n"
+                     "Pyannote needs HF_TOKEN and model access. F0/ECAPA route turns; they do not unmix voices.",
+             fg='grey', justify='left', anchor='w').grid(row=19, column=0, columnspan=3, sticky='w', padx=6, pady=4)
+
+    def choose_reference_matching(*_):
+        if (v_female_ref.get().strip() or v_male_ref.get().strip()) and v_method.get() == 'f0':
+            v_method.set('ecapa')
+    v_female_ref.trace_add('write', choose_reference_matching)
+    v_male_ref.trace_add('write', choose_reference_matching)
+
+    # console
     console = add_console(foot, 0)
 
     def _build_cmd(with_output=True):
@@ -2503,11 +2855,15 @@ def tab_extract(nb):
         cmd += ['--keep',          v_keep.get(),
                 '--silence',       v_silence.get(),
                 '--threshold',     v_thr.get(),
-                '--overlap-range', v_ovrange.get(),
                 '--min-silence',   v_minsilence.get(),
                 '--min-dur',       v_mindur.get(),
                 '--dereverberate', v_deverb.get(),
                 '--method',        v_method.get()]
+        for option, var in (('--female-ref', v_female_ref), ('--male-ref', v_male_ref)):
+            if var.get().strip():
+                cmd += [option, var.get().strip()]
+        cmd += ['--match-minimum', v_match_min.get().strip().replace(',', '.'),
+                '--match-margin', v_match_margin.get().strip().replace(',', '.')]
         if v_debug.get():
             cmd.append('--debug')
         cmd += ['--device', v_vox_device.get()]
@@ -2535,6 +2891,8 @@ def tab_extract(nb):
     def lancer(btn, stop_btn=None):
         if not v_input.get() or not v_output.get():
             log(console, "[ERR] Source and output required."); return
+        if v_keep.get() == 'overlap' and v_method.get() != 'pyannote' and not v_split.get():
+            log(console, "[ERR] Use pyannote for overlap intervals. SepFormer extracts sources; choose female/male or Split."); return
         cmd = _build_cmd(with_output=True)
         if v_split.get():
             cmd.append('--split-output')
@@ -2543,6 +2901,8 @@ def tab_extract(nb):
     def analyser(btn, stop_btn=None):
         if not v_input.get():
             log(console, "[ERR] Source required."); return
+        if v_method.get() not in ('f0', 'ecapa'):
+            log(console, "[INFO] Analyze previews F0/ECAPA. Use Separate to run SepFormer/Pyannote."); return
         cmd = _build_cmd(with_output=False) + ['--analyze']
         run_cmd(cmd, console, btn, stop_btn)
 
@@ -2768,8 +3128,8 @@ def tab_validator(nb):
             initialdir=DIR_VOICES)
         if files:
             existing = v_val_voices.get().strip()
-            new_files = " ".join(files)
-            v_val_voices.set((existing + " " + new_files).strip() if existing else new_files)
+            new_files = " ; ".join(files)
+            v_val_voices.set((existing + " ; " + new_files).strip() if existing else new_files)
     tk.Button(frm_v, text="Browse", width=8, command=browse_val_voices).grid(row=0, column=1, padx=2)
 
     row += 1
@@ -2800,7 +3160,7 @@ def tab_validator(nb):
 
     row += 1
     tk.Label(f, text="XTTS params {}", anchor='w', width=18).grid(row=row, column=0, sticky='w', padx=6, pady=3)
-    tk.Label(f, text="{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs}",
+    tk.Label(f, text="{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs, num_beams, do_sample, max_ref_len}",
              fg='gray', font=('Arial',8)).grid(row=row, column=1, sticky='w', padx=4)
     row += 1
     tk.Entry(f, textvariable=v_val_xtts).grid(row=row, column=1, sticky='ew', padx=4)
@@ -2812,7 +3172,8 @@ def tab_validator(nb):
     row += 1
     tk.Entry(f, textvariable=v_val_audio).grid(row=row, column=1, sticky='ew', padx=4)
 
-    ALL_PARAMS = ['seed','temp','top_k','top_p','rep_pen','len_pen','gpt_cond_len',
+    ALL_PARAMS = ['gpt_cond_chunk_len', 'sound_norm_refs', 'num_beams', 'do_sample',
+                  'max_ref_len', 'trim_start', 'trim_end', 'fade_in', 'fade_out', 'limiter', 'seed','temp','top_k','top_p','rep_pen','len_pen','gpt_cond_len',
                   'speed','vol','eq_low','eq_mid','eq_high','hp','lp','NR','comp','de-ess','reverb','noise_gate','pan']
 
     row += 1
@@ -2829,6 +3190,9 @@ def tab_validator(nb):
     lbl_total = tk.Label(f, text="Total: 1 combination", fg='gray', font=('Arial',8))
 
     VAL_DEFAULTS = {
+        'gpt_cond_chunk_len': 4, 'sound_norm_refs': 0, 'num_beams': 1,
+        'do_sample': 1, 'max_ref_len': 30, 'trim_start': 0, 'trim_end': 0,
+        'fade_in': 100, 'fade_out': 250, 'limiter': 1,
         'seed': 42, 'temp': 0.72, 'top_k': 50, 'top_p': 0.85,
         'rep_pen': 5.0, 'len_pen': 1.0, 'gpt_cond_len': 30,
         'speed': 1.0, 'vol': 0, 'eq_low': 0, 'eq_mid': 0, 'eq_high': 0,
@@ -2843,12 +3207,7 @@ def tab_validator(nb):
         audio = v_val_audio.get().strip()
         if xtts:
             try:
-                nums = [float(x) for x in _re.findall(r'[-+]?\d+(?:\.\d+)?', xtts)]
-                keys = ['seed','trim_start','trim_end','fade_in','fade_out',
-                        'temp','top_k','top_p','rep_pen','len_pen',
-                        'gpt_cond_len','gpt_cond_chunk_len','sound_norm_refs']
-                for i, k in enumerate(keys):
-                    if i+1 < len(nums): params[k] = nums[i+1]
+                params.update(parse_block(xtts))
             except Exception: pass
         if audio:
             try:
@@ -2864,7 +3223,7 @@ def tab_validator(nb):
     def _update_total():
         total = 1
         for vp, vv, _ in param_rows:
-            vals = split_paths(vv.get())
+            vals = vv.get().split()   # numeric values, not paths
             if vals:
                 total *= len(vals)
         lbl_total.config(text=f"Total: {total} combination{'s' if total>1 else ''}")
@@ -2949,6 +3308,16 @@ def tab_validator(nb):
     ).grid(row=0, column=1, padx=2)
 
     row += 1
+    v_val_blind = tk.BooleanVar(value=False)
+    v_val_priority = tk.StringVar(value='accent')
+    options = tk.Frame(f)
+    options.grid(row=row, column=0, columnspan=3, sticky='w', padx=6)
+    tk.Checkbutton(options, text='Blind listening (random order)', variable=v_val_blind).pack(side='left')
+    tk.Label(options, text='Rank by').pack(side='left', padx=(12, 2))
+    ttk.Combobox(options, textvariable=v_val_priority,
+                 values=['accent', 'identity', 'balanced'], width=9,
+                 state='readonly').pack(side='left')
+    row += 1
     console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
@@ -2970,7 +3339,12 @@ def tab_validator(nb):
             output = os.path.join(DIR_OUTPUT, f"validation_{params_str}.wav")
             v_val_output.set(output)
 
+        HANDOFF['val_xtts'] = ''
+        HANDOFF['val_refs'] = []
         cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'voice_validator.py')]
+        cmd += ['--prioritise', v_val_priority.get()]
+        if v_val_blind.get():
+            cmd += ['--blind']
         cmd += refs
         cmd += [v_val_lang.get()]
         # Pass each param row as --param name --values v1 v2 v3
@@ -2987,7 +3361,9 @@ def tab_validator(nb):
             # Capture the winning {} block printed after "Paste into the comparator"
             s = txt.strip()
             if s.startswith('{1,') or s.startswith('{1 '):
-                HANDOFF['win_xtts'] = s
+                HANDOFF['val_xtts'] = s
+            if s.startswith('XTTS_REFS_JSON: '):
+                HANDOFF['val_refs'] = json.loads(s.split(': ', 1)[1])
         run_cmd(cmd, console, btn, stop_btn, line_callback=_val_on_line)
 
     make_btn(foot, ">  Generate", lancer, row + 1)
@@ -2999,8 +3375,12 @@ def tab_validator(nb):
     frm_vho.grid(row=row + 2, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
     tk.Label(frm_vho, text="Send winning {} ->", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
     def _val_to_cmp():
-        block = HANDOFF.get('win_xtts') or v_val_xtts.get().strip()
+        block = HANDOFF.get('val_xtts') or v_val_xtts.get().strip()
         ok = _handoff_set('cmp_xtts', block)
+        refs = HANDOFF.get('val_refs') or split_paths(v_val_voices.get())
+        if refs:
+            _handoff_set('cmp_reference', refs[0])
+            _handoff_set('cmp_clone_refs', ' ; '.join(refs))
         log(console, "[->] Sent winning {} to Comparator" if ok else "[!] Run a sweep first.")
     tk.Button(frm_vho, text="-> Comparator", command=_val_to_cmp).pack(side='left', padx=2)
 
@@ -3021,6 +3401,14 @@ def tab_optimize(nb):
     v_opt_wid    = tk.StringVar(value='0.4')
     v_opt_maxref = tk.StringVar(value='30')
     v_opt_model  = tk.StringVar(value='small')
+    v_opt_cond = tk.StringVar(value='24')
+    v_opt_probes = tk.StringVar(value='2')
+    v_opt_gcl = tk.StringVar(value='20 30')
+    v_opt_chunks = tk.StringVar(value='4 6 8 10')
+    v_opt_mrls = tk.StringVar(value='')
+    v_opt_obj = tk.StringVar(value='identity')
+    v_opt_method = tk.StringVar(value='rsm')
+    v_opt_beams = tk.BooleanVar(value=False)
 
     TARGETS['opt_xtts'] = v_opt_xtts   # Analyser -> Optimiser hand-off
     TARGETS['opt_voices'] = v_opt_voices   # Curation -> Optimiser hand-off
@@ -3060,6 +3448,27 @@ def tab_optimize(nb):
     tk.Label(f, text="Device", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_opt_device, values=['cpu', 'cuda'], width=8, state='readonly').grid(row=6, column=1, sticky='w', padx=4)
 
+    for row, label, var in (
+            (7, 'Conditioning budget', v_opt_cond),
+            (8, 'Sentences per candidate', v_opt_probes),
+            (9, 'GPT lengths (seconds)', v_opt_gcl),
+            (10, 'Chunk lengths (seconds)', v_opt_chunks),
+            (11, 'Reference lengths to test', v_opt_mrls)):
+        tk.Label(f, text=label, anchor='w').grid(row=row, column=0, sticky='w', padx=6)
+        tk.Entry(f, textvariable=var).grid(row=row, column=1, sticky='ew', padx=4)
+    advanced = tk.Frame(f)
+    advanced.grid(row=12, column=0, columnspan=3, sticky='w', padx=6, pady=4)
+    tk.Label(advanced, text='Objective').pack(side='left')
+    ttk.Combobox(advanced, textvariable=v_opt_obj, values=['identity', 'timbre', 'both'],
+                 width=9, state='readonly').pack(side='left', padx=4)
+    tk.Label(advanced, text='Method').pack(side='left')
+    ttk.Combobox(advanced, textvariable=v_opt_method, values=['rsm', 'coord'],
+                 width=7, state='readonly').pack(side='left', padx=4)
+    tk.Checkbutton(advanced, text='Test beam/greedy (RSM)', variable=v_opt_beams).pack(side='left')
+    tk.Label(f, text='Budget = sampling only; conditioning and validation add generations. '
+                    'Leave reference lengths empty to keep max_ref_len. Scores help shortlist; listen to the finalists.',
+             wraplength=600, justify='left', fg='gray').grid(
+                 row=14, column=0, columnspan=3, sticky='w', padx=6)
     console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
@@ -3075,7 +3484,18 @@ def tab_optimize(nb):
         cmd += ['--text', v_opt_text.get()]
         if v_opt_seeds.get().strip():
             cmd += ['--seeds', v_opt_seeds.get().strip()]
-        cmd += ['--budget', v_opt_budget.get().strip() or '25']
+        HANDOFF['opt_xtts'] = ''
+        HANDOFF['opt_refs'] = []
+        cmd += ['--budget', v_opt_budget.get().strip() or '60']
+        cmd += ['--cond-budget', v_opt_cond.get().strip() or '24']
+        cmd += ['--probe-texts', v_opt_probes.get().strip() or '2']
+        cmd += ['--gpt-cond-lens', v_opt_gcl.get().strip() or '20 30']
+        cmd += ['--gpt-chunks', v_opt_chunks.get().strip() or '4 6 8 10']
+        cmd += ['--objective', v_opt_obj.get(), '--method', v_opt_method.get()]
+        if v_opt_mrls.get().strip():
+            cmd += ['--max-ref-lens', v_opt_mrls.get().strip()]
+        if v_opt_beams.get():
+            cmd += ['--probe-beams']
         cmd += ['--w-accent', v_opt_wacc.get().strip() or '0.6']
         cmd += ['--w-identity', v_opt_wid.get().strip() or '0.4']
         cmd += ['--max-ref-len', v_opt_maxref.get().strip() or '30']
@@ -3085,17 +3505,23 @@ def tab_optimize(nb):
         def _opt_on_line(txt):
             s = txt.strip()
             if s.startswith('{1,') or s.startswith('{1 '):
-                HANDOFF['win_xtts'] = s
+                HANDOFF['opt_xtts'] = s
+            if s.startswith('XTTS_REFS_JSON: '):
+                HANDOFF['opt_refs'] = json.loads(s.split(': ', 1)[1])
         run_cmd(cmd, console, btn, stop_btn, line_callback=_opt_on_line)
 
     make_btn(foot, ">  Optimise", lancer, 1)
 
     frm_oho = tk.Frame(f)
-    frm_oho.grid(row=9, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
+    frm_oho.grid(row=13, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
     tk.Label(frm_oho, text="Send winning {} ->", fg="gray", font=("Arial", 8)).pack(side='left', padx=(0, 4))
     def _opt_to_cmp():
-        block = HANDOFF.get('win_xtts') or v_opt_xtts.get().strip()
+        block = HANDOFF.get('opt_xtts') or v_opt_xtts.get().strip()
         ok = _handoff_set('cmp_xtts', block)
+        refs = split_paths(v_opt_voices.get())
+        if refs:
+            _handoff_set('cmp_reference', refs[0])
+            _handoff_set('cmp_clone_refs', ' ; '.join(HANDOFF.get('opt_refs') or refs))
         log(console, "[->] Sent winning {} to Comparator" if ok else "[!] Run the optimiser first.")
     tk.Button(frm_oho, text="-> Comparator", command=_opt_to_cmp).pack(side='left', padx=2)
 
@@ -3268,6 +3694,9 @@ def tab_comparator(nb):
     v_cmp_text     = tk.StringVar(value="")
     v_cmp_output   = tk.StringVar()
     v_cmp_opt_out  = tk.StringVar()
+    v_cmp_clone_refs = tk.StringVar()
+    TARGETS['cmp_reference'] = v_cmp_ref
+    TARGETS['cmp_clone_refs'] = v_cmp_clone_refs
     TARGETS['cmp_xtts']  = v_cmp_xtts
     TARGETS['cmp_audio'] = v_cmp_audio
 
@@ -3285,13 +3714,17 @@ def tab_comparator(nb):
     ).grid(row=0, column=1, padx=2)
 
     row += 1
+    add_row(f, 'Clone refs (optional)', v_cmp_clone_refs, row,
+            [('Audio', '*.wav *.mp3 *.flac'), ('All', '*.*')],
+            multi=True, initialdir=DIR_VOICES)
+    row += 1
     tk.Label(f, text="Language", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)
     ttk.Combobox(f, textvariable=v_cmp_lang, values=LANGS, width=8, state="readonly").grid(row=row, column=1, sticky="w", padx=4)
     _bind_default_text(v_cmp_lang, v_cmp_text)
 
     row += 1
     tk.Label(f, text="XTTS params {}", anchor="w", width=18).grid(row=row, column=0, sticky="w", padx=6, pady=3)
-    tk.Label(f, text="{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs}",
+    tk.Label(f, text="{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs, num_beams, do_sample, max_ref_len}",
              fg="gray", font=("Arial",8)).grid(row=row, column=1, sticky="w", padx=4)
     row += 1
     tk.Entry(f, textvariable=v_cmp_xtts).grid(row=row, column=1, sticky="ew", padx=4)
@@ -3378,7 +3811,12 @@ def tab_comparator(nb):
         v_cmp_output.set(output)
         v_cmp_opt_out.set(opt_output)
 
-        refs = ref.split()
+        # Tolerant split: a reference whose name holds a space was cut into
+        # fragments here. The first file is the comparison target; all of
+        # them (first included) are passed again as cloning references.
+        refs = split_paths(ref)
+        if not refs:
+            log(console, "[ERR] Reference voice file required."); return
         n_iter = int(v_cmp_iter.get() or 1)
         conv_thr = float(v_cmp_conv.get() or 0.5)
 
@@ -3390,9 +3828,9 @@ def tab_comparator(nb):
 
         def build_cmd(audio_block_str, out_clone, out_opt, max_iter, conv):
             cmd = [sys.executable, os.path.join(SCRIPTS_DIR, "voice_comparator.py")]
-            cmd += [ref]
-            cmd += refs
+            cmd += [refs[0]]
             cmd += [v_cmp_lang.get()]
+            cmd += ['--clone-refs'] + (split_paths(v_cmp_clone_refs.get()) or refs)
             cmd += ["--xtts-block", v_cmp_xtts.get().strip()]
             cmd += ["--audio-block", audio_block_str]
             cmd += ["--text-file", _tfile.name]

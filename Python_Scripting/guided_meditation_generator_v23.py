@@ -79,7 +79,7 @@ TWO bracket formats in the text file:
 
        Value 0 meaning ({N, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}) :
 
-       seed               -> no seed (None)
+       seed               -> 0 is a valid seed; none leaves RNGs unseeded
        trim_start         -> 0 ms (no trim)
        trim_end           -> 0 ms (no trim)
        fade_in            -> 0 ms (no fade)
@@ -167,16 +167,15 @@ import time
 from datetime import timedelta
 import tempfile
 import random
+import math
 import numpy as np
 import torch
 
 # v24: low-level XTTS path (honours all cloning knobs + caches latents per voice).
-# Falls back to tts_to_file if xtts_clone.py is not present next to this script.
+# xtts_clone.py and xtts_settings.py are required beside this script.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-try:
-    import xtts_clone as _XC
-except Exception:
-    _XC = None
+import xtts_clone as _XC
+from xtts_settings import generator_params, ALIASES, LONG_NAMES, validate
 _LAT_CACHE = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -220,13 +219,15 @@ DEFAULT_XTTS_PARAMS = {
     'gpt_cond_len': 30,        # seconds of reference WAV used for cloning (default 30)
     'gpt_cond_chunk_len': 4,   # GPT conditioning chunk size in seconds (default 4)
     'sound_norm_refs': 0,      # normalise reference WAV before cloning (0=off, 1=on)
-    'num_beams': 1,            # v24: GPT beam search (1 = sampling; >1 activates length_penalty)
+    'num_beams': 1,
+    'do_sample': 1,
+    'max_ref_len': 30,
 }
 
 # Seconds of reference used for the SPEAKER EMBEDDING via the low-level path.
 # tts_to_file silently caps this at 10 s (XttsConfig default) — a major cause of
 # weak cloning. The low-level path honours it.
-MAX_REF_LEN = 30
+MAX_REF_LEN = 30  # legacy constant; per-voice max_ref_len now takes precedence
 
 # Alias used internally
 PARAMS_GLOBAUX_DEFAUT = DEFAULT_XTTS_PARAMS
@@ -242,7 +243,7 @@ def clean_text(text):
     Pitch marks are removed too -- vowel marks {+2} / {0>-3} and word tags
     [p:+2] / [p:?] -- so an annotated prompt can be generated as it is; the
     marks are applied afterwards to the audio by vowel_pitch.py ([Pit] tab)."""
-    text = re.sub(r'\{[+-]?\d+(?:\.\d+)?(?:>[+-]?\d+(?:\.\d+)?)?\}', '', text)
+    text = re.sub(r'\{(?=[^}]*\d)\s*(?:[A-G](?:#|b)?\d|[+-]?\d+(?:\.\d+)?(?:>[+-]?\d+(?:\.\d+)?)?)?\s*,?\s*(?:[xdb]\d+(?:\.\d+)?)?\s*\}', '', text)
     text = re.sub(r'\[p:(?:[+-]?\d+(?:\.\d+)?|\?)\]', '', text)
     text = re.sub(r'[.!?]+\s*$', '', text)
     text = re.sub(r'\s+', ' ', text)
@@ -273,12 +274,25 @@ def apply_eq(audio_segment, graves_db=0, mediums_db=0, aigus_db=0):
         if graves_db  != 0: filters.append(f"equalizer=f=120:t=h:width=160:g={graves_db}")
         if mediums_db != 0: filters.append(f"equalizer=f=1500:t=h:width=2000:g={mediums_db}")
         if aigus_db   != 0: filters.append(f"equalizer=f=5000:t=h:width=3000:g={aigus_db}")
+        boost = max(graves_db, mediums_db, aigus_db) > 0
+        if boost:
+            # A boost can push the peaks past full scale, and this stage writes
+            # 16-bit audio: measured on a voice peaking at -1 dBFS, +4 dB was
+            # enough to clip 1-2 % of the samples, before the volume and the
+            # final limiter could do anything. Overs are limited here instead;
+            # below full scale the limiter does nothing.
+            filters.append(_limiter_filter())
 
         subprocess.run(
-            ['ffmpeg', '-i', temp_in.name, '-af', ','.join(filters), '-y', temp_out.name],
+            ['ffmpeg', '-i', temp_in.name, '-af', ','.join(filters),
+             '-c:a', _PCM_CODECS.get(audio_segment.sample_width, 'pcm_s16le'),
+             '-y', temp_out.name],
             check=True, capture_output=True
         )
-        return AudioSegment.from_wav(temp_out.name)
+        out = AudioSegment.from_wav(temp_out.name)
+        if boost and out.max_dBFS > LIMIT_DBFS - 0.1:
+            print("      [*]  EQ boost reached full scale: peaks limited (they used to clip)")
+        return out
     except FileNotFoundError:
         print("  [!]  ffmpeg not found in PATH -- effect skipped, "
               "audio kept unprocessed (install ffmpeg or restart the app "
@@ -513,31 +527,97 @@ def apply_pan(audio_segment, pan_value=0.0):
     return audio_segment.pan(pan_value)
 
 
-def apply_limiter(audio_segment):
+LIMITER_FILTER = "alimiter=level_in=1:level_out=1:limit=0.99:attack=5:release=50:level=disabled"
+LIMIT_DBFS = 20.0 * math.log10(0.99)          # -0.087 dBFS
+# Keep the bit depth of the segment: without an explicit codec, FFmpeg writes
+# 16-bit WAV whatever the input was.
+_PCM_CODECS = {1: 'pcm_u8', 2: 'pcm_s16le', 3: 'pcm_s24le', 4: 'pcm_s32le'}
+_LIMITER_LATENCY = None
+
+
+def _limiter_filter():
+    """LIMITER_FILTER, delay-compensated when this FFmpeg supports it.
+
+    alimiter looks 5 ms ahead. Without latency=1 it delays the audio by those
+    5 ms and drops the last 5 ms of every sentence (measured with FFmpeg 6.1).
+    The option does not exist in older FFmpeg builds, so it is probed once.
     """
-    Output limiter via FFmpeg alimiter.
-    Prevents inter-sample clipping after all processing stages.
-    level_in/out at 1.0, hard limit at -0.1 dBFS.
+    global _LIMITER_LATENCY
+    if _LIMITER_LATENCY is None:
+        try:
+            info = subprocess.run(['ffmpeg', '-hide_banner', '-h', 'filter=alimiter'],
+                                  capture_output=True, text=True, timeout=30)
+            _LIMITER_LATENCY = 'latency' in (info.stdout + info.stderr)
+        except (OSError, subprocess.SubprocessError):
+            _LIMITER_LATENCY = False
+    return LIMITER_FILTER + (':latency=1' if _LIMITER_LATENCY else '')
+
+
+def _pydub_gain(audio_segment, gain_db, reason=None):
+    """Plain pydub gain, with a warning when it is going to clip.
+
+    pydub applies the gain to the integer samples and saturates them: any
+    peak pushed above full scale is flattened, which is audible distortion.
     """
+    if not gain_db:
+        return audio_segment
+    peak = audio_segment.max_dBFS
+    if math.isfinite(peak) and peak + gain_db > 0.0:
+        print(f"  [!]  Volume {gain_db:+.1f} dB on peaks at {peak:.1f} dBFS"
+              f"{' (' + reason + ')' if reason else ''}: they reach "
+              f"{peak + gain_db:+.1f} dBFS and are CLIPPED. Lower the volume "
+              f"or turn the limiter on.")
+    return audio_segment + gain_db
+
+
+def apply_gain_and_limit(audio_segment, gain_db=0.0, limiter=True):
+    """Volume, then the output limiter, in ONE floating-point FFmpeg pass.
+
+    The limiter used to run before the volume step: a positive volume was
+    added after the protection, and pydub saturates integer samples, so a
+    sentence peaking at -1 dBFS with +6 dB came out with most of its peaks
+    flattened. Here FFmpeg's volume filter works in floating point and the
+    limiter follows it in the same filter graph, so nothing is quantised or
+    clipped between the two. Limit at 0.99 (-0.09 dBFS), as before.
+
+    limiter=False applies the gain alone (plain pydub), warning if it clips.
+    If FFmpeg is missing or fails, the gain is still applied -- dropping it
+    would change the level -- and the missing limiter is reported.
+    """
+    gain_db = float(gain_db)
+    if not math.isfinite(gain_db):
+        raise ValueError("volume must be a finite number of dB")
+    if not limiter:
+        return _pydub_gain(audio_segment, gain_db, "limiter off")
+
+    # The gain is linear, so the peak entering the limiter is known exactly.
+    over = audio_segment.max_dBFS + gain_db - LIMIT_DBFS
+    if math.isfinite(over) and over > 0.05:
+        print(f"      [*]  Limiter: peaks reduced by {over:.1f} dB"
+              f"{' -- heavy limiting is audible, lower the volume' if over > 6 else ''}")
+    limiter_filter = _limiter_filter()
+    flt = limiter_filter if not gain_db else f"volume={gain_db:.6g}dB,{limiter_filter}"
+    codec = _PCM_CODECS.get(audio_segment.sample_width, 'pcm_s16le')
     temp_in  = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
     temp_out = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    temp_in.close()
+    temp_out.close()
 
     try:
         audio_segment.export(temp_in.name, format='wav')
-        flt = "alimiter=level_in=1:level_out=1:limit=0.99:attack=5:release=50:level=disabled"
         subprocess.run(
-            ['ffmpeg', '-i', temp_in.name, '-af', flt, '-y', temp_out.name],
+            ['ffmpeg', '-i', temp_in.name, '-af', flt, '-c:a', codec,
+             '-y', temp_out.name],
             check=True, capture_output=True
         )
         return AudioSegment.from_wav(temp_out.name)
     except FileNotFoundError:
-        print("  [!]  ffmpeg not found in PATH -- effect skipped, "
-              "audio kept unprocessed (install ffmpeg or restart the app "
-              "after adding it to PATH)")
-        return audio_segment
+        print("  [!]  ffmpeg not found in PATH -- limiter skipped "
+              "(install ffmpeg or restart the app after adding it to PATH)")
+        return _pydub_gain(audio_segment, gain_db, "limiter unavailable")
     except subprocess.CalledProcessError as e:
         print(f"  [!]  Limiter error: {e}")
-        return audio_segment
+        return _pydub_gain(audio_segment, gain_db, "limiter failed")
     finally:
         for f in (temp_in.name, temp_out.name):
             if os.path.exists(f):
@@ -547,10 +627,19 @@ def apply_limiter(audio_segment):
                     pass    # Windows keeps the file locked while it is open
 
 
-def process_audio(audio_segment, config, xtts_params):
+def apply_limiter(audio_segment):
+    """Output limiter alone (no gain). Kept for callers of the old API."""
+    return apply_gain_and_limit(audio_segment, 0.0, limiter=True)
+
+
+def process_audio(audio_segment, config, xtts_params, limiter=True):
     """
-    Full audio processing pipeline (per sentence):
-    Trim -> Filters -> EQ -> NR -> De-esser -> Compression -> NoiseGate -> Reverb -> Fades -> Pan -> Limiter
+    Effects stage (per sentence):
+    Trim -> Filters -> EQ -> NR -> De-esser -> Compression -> NoiseGate -> Reverb -> Fades -> Pan [-> Limiter]
+
+    Rendering goes through render_voice_chain(), which calls this with
+    limiter=False and runs the limiter last, after speed and volume. The
+    default (limiter=True) only keeps the old behaviour for direct callers.
     """
     print(f"      [*]  Audio: EQ({config['eq_low']:+.0f}/{config['eq_mid']:+.0f}/{config['eq_high']:+.0f}dB) "
           f"Filters({config['highpass']}-{config['lowpass']}Hz) "
@@ -642,44 +731,57 @@ def process_audio(audio_segment, config, xtts_params):
         audio_segment = apply_pan(audio_segment, pan_value=pv)
         print(f"      [*]  Pan: {pv:+.2f}")
 
-    # 8c. Limiter
-    if config.get('limiter', 0):
+    # 8c. Limiter (only when called directly; render_voice_chain runs it last)
+    if limiter and config.get('limiter', 0):
         audio_segment = apply_limiter(audio_segment)
         print(f"      [*]  Limiter: on")
 
     return audio_segment
 
 
+def render_voice_chain(audio_segment, config, xtts_params):
+    """The complete per-sentence chain, in its only valid order:
+
+        effects (process_audio) -> speed (rubberband) -> volume -> limiter
+
+    The limiter must be LAST: before, it ran inside process_audio, so both the
+    rubberband stretch (which can overshoot the peaks) and the volume step came
+    after it, unprotected. The comparator, the validator and test_truncation
+    call this same function, so the chain they measure cannot drift from the
+    one the generator renders.
+    """
+    audio_segment = process_audio(audio_segment, config, xtts_params, limiter=False)
+    audio_segment = apply_speed_rubberband(audio_segment, config['speed'])
+    limit = bool(config.get('limiter', 0))
+    audio_segment = apply_gain_and_limit(audio_segment, config.get('volume', 0), limiter=limit)
+    if limit:
+        print(f"      [*]  Volume {float(config.get('volume', 0)):+.1f} dB, limiter: on")
+    return audio_segment
+
+
 def apply_speed_rubberband(audio_segment, speed,
                            temp_input=None, temp_output=None):
-    """Scratch files come from tempfile, not fixed /tmp names: two runs at once
-    overwrote each other's scratch, and a crash left the files behind."""
+    """Pitch-preserving speed change; unique scratch files and explicit errors."""
+    import math
     import tempfile
-    _fi, _pi = tempfile.mkstemp(prefix='rb_in_', suffix='.wav')
-    _fo, _po = tempfile.mkstemp(prefix='rb_out_', suffix='.wav')
-    os.close(_fi); os.close(_fo)
-    temp_input  = temp_input  or _pi
-    temp_output = temp_output or _po
-    """Time-stretch audio using rubberband (preserves pitch)."""
-    audio_segment.export(temp_input, format="wav")
-    time_stretch = 1.0 / speed
-    try:
-        subprocess.run(
-            ["rubberband", "-t", str(time_stretch), "-c", "1", temp_input, temp_output],
-            check=True, capture_output=True
-        )
-        result = AudioSegment.from_wav(temp_output)
-        for f in (temp_input, temp_output):
-            if os.path.exists(f): os.remove(f)
-        return result
-    except FileNotFoundError:
-        print("  [!]  ffmpeg not found in PATH -- effect skipped, "
-              "audio kept unprocessed (install ffmpeg or restart the app "
-              "after adding it to PATH)")
+    if not math.isfinite(float(speed)) or float(speed) <= 0:
+        raise ValueError("speed must be finite and positive")
+    if float(speed) == 1.0:
         return audio_segment
-    except subprocess.CalledProcessError as e:
-        print(f"  [!]  Rubberband error: {e}")
-        return audio_segment
+    with tempfile.TemporaryDirectory(prefix='xtts_speed_') as work:
+        source = temp_input or os.path.join(work, 'in.wav')
+        target = temp_output or os.path.join(work, 'out.wav')
+        if os.path.realpath(source) == os.path.realpath(target):
+            raise ValueError("Speed input/output paths must differ")
+        try:
+            audio_segment.export(source, format='wav')
+            subprocess.run(['rubberband', '-t', str(1.0 / float(speed)), '-c', '1', source, target],
+                           check=True, capture_output=True)
+            return AudioSegment.from_wav(target)
+        finally:
+            for path in (source, target):
+                if os.path.exists(path):
+                    os.remove(path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -723,28 +825,41 @@ def parse_voice_config(config_str, use_last=True):
     except (ValueError, IndexError):
         config = DEFAULT_AUDIO_CONFIG.copy()
 
-    # Detect optional language in position 1
+    # A float parser handles .9 and 9e-1 consistently with the scoring tools.
     offset = 1
-    if len(parts) > 1 and parts[1] and not parts[1].lstrip('+-').replace('.','',1).isdigit():
-        lang = parts[1].lower().strip()
-        if lang in VALID_LANGUAGES:
+    if len(parts) > 1 and parts[1]:
+        try:
+            float(parts[1])
+        except ValueError:
+            lang = parts[1].lower()
+            if lang not in VALID_LANGUAGES:
+                raise ValueError(f"Unsupported language in audio block: {parts[1]!r}")
             config['language'] = lang
-            print(f"  [*] Language: {lang.upper()}")
-        else:
-            print(f"  [!]  Unknown language '{parts[1]}', ignored (default: {config['language']})")
-        offset = 2
+            offset = 2
 
     param_names = ['speed', 'volume', 'eq_low', 'eq_mid', 'eq_high',
                    'highpass', 'lowpass', 'noise_reduction', 'compression', 'deesser',
                    'reverb', 'noise_gate', 'pan', 'limiter']
 
+    if len(parts) > offset + len(param_names):
+        raise ValueError("Too many audio parameters")
     for i, param in enumerate(param_names):
         idx = i + offset
         if idx < len(parts) and parts[idx]:
             try:
                 config[param] = float(parts[idx])
-            except ValueError:
-                pass
+            except ValueError as exc:
+                raise ValueError(f"Invalid audio value for {param}: {parts[idx]!r}") from exc
+    import math
+    for key in param_names:
+        if not math.isfinite(float(config[key])):
+            raise ValueError(f"{key} must be finite")
+    if config['speed'] <= 0 or not -1 <= config.get('pan', 0) <= 1:
+        raise ValueError("Audio speed must be positive and pan in [-1, 1]")
+    if config.get('limiter', 0) not in (0, 1):
+        raise ValueError("limiter must be 0 or 1")
+    if voice_num < 1:
+        raise ValueError("Voice number must be positive")
 
     print(f"  [OK] Voice {voice_num} [{config['language'].upper()}] "
           f"speed={config['speed']} vol={config['volume']:+.0f}dB")
@@ -765,63 +880,9 @@ def is_params_xtts_bracket(segment):
 
 
 def parse_xtts_params(segment, base_params):
-    """
-    Parse XTTS-PARAMS block — v21: 9 OR 11 values (rétro-compatible).
-
-    9 values (v20 format):
-    {N, seed, trim_start, trim_end, fade_in, fade_out, temperature, top_k, top_p}
-
-    11 values (v21/v22 format):
-    {N, seed, trim_start, trim_end, fade_in, fade_out, temperature, top_k, top_p, rep_pen, len_pen}
-
-    Value 0 semantics:
-      seed               -> no seed (None)
-      trim_start         -> 0 ms  (no trim)
-      trim_end           -> 0 ms  (no trim)
-      fade_in            -> 0 ms  (no fade)
-      fade_out           -> 0 ms  (no fade)
-      temperature        -> keep default (0 is invalid for XTTS)
-      top_k              -> keep default
-      top_p              -> keep default
-      rep_pen            -> keep default
-      len_pen            -> keep default
-
-    Returns: (voice_num, params_dict)
-    """
-    contenu = segment.strip('{}').strip()
-    parts   = [p.strip() for p in contenu.split(',')]
-
-    try:
-        voice_num = int(parts[0])
-    except (ValueError, IndexError):
-        return None, None
-
-    # Fields where 0 is a valid literal value (= "do not trim / do not fade")
-    ZERO_VALID = {'trim_start', 'trim_end', 'fade_in', 'fade_out'}
-
-    keys = ['seed', 'trim_start', 'trim_end', 'fade_in', 'fade_out',
-            'temperature', 'top_k', 'top_p',
-            'repetition_penalty', 'length_penalty',    # v21: 2 new keys
-            'gpt_cond_len', 'gpt_cond_chunk_len',      # v23: cloning quality
-            'sound_norm_refs',                          # v23: ref normalisation
-            'num_beams']                                # v24: beam search (optional 15th)
-    p = base_params.copy()
-
-    for i, key in enumerate(keys):
-        idx = i + 1
-        if idx < len(parts) and parts[idx] != '':
-            try:
-                val = float(parts[idx])
-                if key == 'seed':
-                    p['seed'] = int(val) if val != 0 else None
-                elif key in ZERO_VALID:
-                    p[key] = val           # 0 = "no trim/fade" -> valid
-                elif val != 0:
-                    p[key] = val           # 0 = invalid -> keep default
-            except ValueError:
-                pass
-
-    return voice_num, p
+    """Read historical and extended blocks. Seed 0, booleans and top_k=0 are literal."""
+    voice_num = int(segment.strip()[1:-1].split(',')[0])
+    return voice_num, generator_params(segment, base_params)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -847,7 +908,7 @@ def extract_per_voice_params(text):
                  'fade_out', 'temperature', 'top_k', 'top_p',
                  'repetition_penalty', 'length_penalty',      # v21
                  'gpt_cond_len', 'gpt_cond_chunk_len',        # v23
-                 'sound_norm_refs'}                            # v23
+                 'sound_norm_refs', 'num_beams', 'do_sample', 'max_ref_len'}                            # v23
 
     RE_PARAM = _re.compile(
         r'^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([-+]?[0-9.]+(?:s)?(?:,[-+]?[0-9.]+)?)\s*$'
@@ -898,14 +959,12 @@ def extract_per_voice_params(text):
 
 
 def _apply_raw_params(params, raw):
-    """Apply a dict of raw string values onto a params dict."""
-    p = params.copy()
-    for key, val_str in raw.items():
-        try:
-            p[key] = int(val_str) if key == 'seed' else float(val_str)
-        except ValueError:
-            pass
-    return p
+    merged = {ALIASES.get(k, k): v for k, v in params.items()}
+    merged.update({ALIASES.get(k, k): v for k, v in raw.items()})
+    checked = validate(merged)
+    out = params.copy()
+    out.update({LONG_NAMES.get(k, k): v for k, v in checked.items()})
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1041,7 +1100,7 @@ def generate_sentence_audio(clean, voice_num, voice_files, tts_instances,
     """
     Generate and fully process audio for a single clean sentence.
     Returns AudioSegment on success, None on error.
-    Pipeline: TTS -> trim -> EQ -> NR -> de-ess -> compress -> fades -> rubberband -> volume
+    Pipeline: TTS -> render_voice_chain (effects -> rubberband -> volume -> limiter)
     """
     if voice_num not in tts_instances:
         print(f"  [!]  TTS instance for voice {voice_num} not found")
@@ -1055,61 +1114,34 @@ def generate_sentence_audio(clean, voice_num, voice_files, tts_instances,
     if isinstance(speaker_wav, list) and len(speaker_wav) == 1:
         speaker_wav = speaker_wav[0]  # unwrap single-item list
     try:
-        if _XC is not None:
-            # v24 low-level path: honours gpt_cond_len / gpt_cond_chunk_len /
-            # max_ref_len / sound_norm_refs (tts_to_file silently overrides them
-            # with config defaults, capping the speaker embedding at 10 s), and
-            # computes the conditioning latents ONCE per voice+settings (cached)
-            # instead of re-extracting them for every sentence.
-            model = tts_instances[voice_num].synthesizer.tts_model
-            lat_key = (voice_num,
-                       int(xtts_params.get('gpt_cond_len', 30)),
-                       int(xtts_params.get('gpt_cond_chunk_len', 4)),
-                       MAX_REF_LEN,
-                       bool(xtts_params.get('sound_norm_refs', 0)))
-            if lat_key not in _LAT_CACHE:
-                _LAT_CACHE[lat_key] = _XC.compute_latents(
-                    model, speaker_wav,
-                    gpt_cond_len=lat_key[1], gpt_cond_chunk_len=lat_key[2],
-                    max_ref_len=lat_key[3], sound_norm_refs=lat_key[4])
-                print(f"  [*]  Voice {voice_num}: conditioning latents computed "
-                      f"(gpt_cond={lat_key[1]}s chunk={lat_key[2]}s max_ref={lat_key[3]}s)")
-            _XC.generate(
-                model, clean, config.get('language', 'fr'), _LAT_CACHE[lat_key],
-                temp_file,
-                temperature=xtts_params['temperature'],
-                length_penalty=xtts_params['length_penalty'],
-                repetition_penalty=xtts_params['repetition_penalty'],
-                top_k=int(xtts_params['top_k']),
-                top_p=xtts_params['top_p'],
-                num_beams=int(xtts_params.get('num_beams', 1)),
-                speed=1.0,     # speed applied later via rubberband
-                seed=None)     # seed is applied per-{}-block upstream, as before
-        else:
-            # Fallback (xtts_clone unavailable): legacy tts_to_file path.
-            # WARNING: gpt_cond_len/chunk/sound_norm_refs are silently ignored
-            # here and the speaker embedding uses only 10 s of reference.
-            tts_instances[voice_num].tts_to_file(
-                text=clean,
-                file_path=temp_file,
-                language=config.get('language', 'fr'),
-                speaker_wav=speaker_wav,
-                temperature=xtts_params['temperature'],
-                length_penalty=xtts_params['length_penalty'],
-                repetition_penalty=xtts_params['repetition_penalty'],
-                top_k=int(xtts_params['top_k']),
-                top_p=xtts_params['top_p'],
-                gpt_cond_len=int(xtts_params.get('gpt_cond_len', 30)),
-                gpt_cond_chunk_len=int(xtts_params.get('gpt_cond_chunk_len', 4)),
-                sound_norm_refs=bool(xtts_params.get('sound_norm_refs', 0)),
-                speed=1.0      # speed applied later via rubberband
-            )
+        model = tts_instances[voice_num].synthesizer.tts_model
+        refs = speaker_wav if isinstance(speaker_wav, (list, tuple)) else [speaker_wav]
+        fingerprints = tuple((os.path.abspath(p), os.stat(p).st_mtime_ns,
+                              os.stat(p).st_size) for p in refs)
+        lat_key = (id(model), fingerprints,
+                   int(xtts_params.get('gpt_cond_len', 30)),
+                   int(xtts_params.get('gpt_cond_chunk_len', 4)),
+                   int(xtts_params.get('max_ref_len', 30)),
+                   bool(xtts_params.get('sound_norm_refs', 0)))
+        if lat_key not in _LAT_CACHE:
+            _LAT_CACHE[lat_key] = _XC.compute_latents(
+                model, speaker_wav, gpt_cond_len=lat_key[2],
+                gpt_cond_chunk_len=lat_key[3], max_ref_len=lat_key[4],
+                sound_norm_refs=lat_key[5])
+            print(f"  [*] Voice {voice_num}: conditioning cached "
+                  f"(gpt={lat_key[2]}s, chunk={lat_key[3]}s, ref={lat_key[4]}s)")
+        _XC.generate(
+            model, clean, config.get('language', 'fr'), _LAT_CACHE[lat_key],
+            temp_file, temperature=xtts_params['temperature'],
+            length_penalty=xtts_params['length_penalty'],
+            repetition_penalty=xtts_params['repetition_penalty'],
+            top_k=int(xtts_params['top_k']), top_p=xtts_params['top_p'],
+            num_beams=int(xtts_params.get('num_beams', 1)),
+            do_sample=bool(xtts_params.get('do_sample', 1)),
+            enable_text_splitting=True, speed=1.0,
+            seed=xtts_params.get('seed'))
         audio = AudioSegment.from_wav(temp_file)
-
-        audio = process_audio(audio, config, xtts_params)
-        audio = apply_speed_rubberband(audio, config['speed'])
-        audio = audio + config['volume']
-        return audio
+        return render_voice_chain(audio, config, xtts_params)
     except FileNotFoundError as e:
         # An external tool is missing (almost always ffmpeg or rubberband).
         # Returning None here drops the sentence, and dropping every sentence
@@ -1409,6 +1441,13 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
         print(f"[*] Initial seed = {sval} (voice 1)")
 
     ambient_vol, music_configs, clean_content = extract_config(text)
+    # Pitch and duration marks ({-2}, {0>-3}, {x1.8}, {-2 x1.8} after a vowel, [p:+2] after a word) are for the
+    # [Pit] tab, not for XTTS. They must go BEFORE the split below: its generic
+    # "{...}" pattern would otherwise take "{-2}" for an XTTS parameter block and
+    # cut "Dé{-2}tends" into two separate utterances, "Dé" and "tends".
+    clean_content = re.sub(r'\{(?=[^}]*\d)\s*(?:[A-G](?:#|b)?\d|[+-]?\d+(?:\.\d+)?(?:>[+-]?\d+(?:\.\d+)?)?)?\s*,?\s*(?:[xdb]\d+(?:\.\d+)?)?\s*\}', '', clean_content)
+    clean_content = re.sub(r'\[p:(?:[+-]?\d+(?:\.\d+)?|\?)\]', '', clean_content)
+    clean_content = re.sub(r'\[tempo=[\d.]+\]', '', clean_content, flags=re.I)   # tempo of note marks
 
     # Single shared TTS instance — XTTS v2 is a voice cloning model, so
     # the same model handles every voice. The actual voice switch happens
@@ -1417,13 +1456,9 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[*] TTS device: {_device}")
     shared_tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(_device)
-    if _XC is not None:
-        print(f"   [*]  Low-level conditioning path ACTIVE: gpt_cond_len/chunk/"
-              f"sound_norm honoured, speaker embedding uses up to {MAX_REF_LEN}s "
-              f"of reference (tts_to_file caps it at 10s), latents cached per voice.")
-    else:
-        print("   [!]  xtts_clone.py not found -> legacy tts_to_file path "
-              "(gpt_cond_len/max_ref_len NOT honoured; embedding capped at 10s).")
+    _LAT_CACHE.clear()
+    print('   [*] Low-level cloning active; reference duration and decode mode '
+          'come from each voice block. Seed is reapplied per sentence.')
     tts_instances = {i: shared_tts for i in range(1, len(voice_files) + 1)}
     for i in tts_instances:
         print(f"   [OK] TTS ready for voice {i}")

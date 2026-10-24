@@ -1,158 +1,122 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Compare reference caps while keeping GPT conditioning fixed.
+
+max_ref_len truncates audio before BOTH XTTS conditioning paths. This experiment
+combines one fixed GPT latent with each capped speaker embedding. Cosine scores
+are descriptive; sentence dispersion is not a calibrated noise floor.
+Use --keep for WAVs/JSON and --text-file for custom language-specific sentences.
 """
-test_max_ref_len.py — does the speaker embedding benefit from more reference?
-
-XTTS builds TWO conditioning objects from the reference:
-  * gpt_cond_len   -> GPT conditioning latents (prosody, style)
-  * max_ref_len    -> speaker embedding (HiFiGAN speaker encoder) = TIMBRE
-
-The second one is capped at 30 s by XttsConfig and is NOT part of the {} block,
-so it has never been searched: giving 45 s of conditioning still builds the
-timbre vector from 30 s only. This script measures whether lifting that cap
-changes ECAPA identity — the metric it should affect most directly.
-
-Method: one model load, one set of latents per max_ref_len value, the SAME
-sentences and the SAME seed everywhere, so the only variable is the cap.
-A noise floor is measured first (two halves of one render) so a difference can
-be called real or not.
-
-Usage:
-  python test_max_ref_len.py Voices_Cloning/Fanny_Ardant_bis_deep_curated.wav FR \\
-      --seed 180 --temp 0.85 --gpt-cond-len 45 --values 20 30 45 60
-"""
-
-import os
-import sys
 import argparse
+import contextlib
+import json
+import math
+import os
 import tempfile
+from xtts_settings import validate, parse_block, format_block
+from test_truncation import load_texts, render_kwargs, conditioning_kwargs
+
+
+def isolated_latents(model, reference, settings, values, reference_duration, clone):
+    """Compute once per cap; returned tuples share the identical GPT latent."""
+    options = conditioning_kwargs(settings)
+    full_cap = max(math.ceil(reference_duration), settings['gpt_cond_len'], max(values))
+    full = clone.compute_latents(model, reference, **dict(options, max_ref_len=full_cap))
+    result = {}
+    for value in values:
+        pair = full if value == full_cap else clone.compute_latents(
+            model, reference, **dict(options, max_ref_len=value))
+        result[value] = (full[0], pair[1])
+    return result
 
 
 def main():
-    p = argparse.ArgumentParser(description='Measure the effect of max_ref_len on identity')
-    p.add_argument('reference')
-    p.add_argument('lang', nargs='?', default='FR')
-    p.add_argument('--values', type=int, nargs='+', default=[20, 30, 45, 60],
-                   help='max_ref_len values to compare (default: 20 30 45 60)')
-    p.add_argument('--gpt-cond-len', type=int, default=45)
-    p.add_argument('--gpt-cond-chunk-len', type=int, default=4)
-    p.add_argument('--seed', type=int, default=180)
-    p.add_argument('--temp', type=float, default=0.85)
-    p.add_argument('--top-k', type=int, default=50)
-    p.add_argument('--top-p', type=float, default=0.85)
-    p.add_argument('--rep-pen', type=float, default=5.0)
-    p.add_argument('--device', default=None)
-    p.add_argument('--keep', default=None,
-                   help='Directory to keep the rendered wavs for listening')
-    args = p.parse_args()
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('reference')
+    parser.add_argument('lang', nargs='?', default='FR')
+    parser.add_argument('--values', type=int, nargs='+', default=[20, 30, 45, 60])
+    parser.add_argument('--gpt-cond-len', type=int, default=45)
+    parser.add_argument('--gpt-cond-chunk-len', type=int, default=4)
+    parser.add_argument('--seed', type=int, default=180)
+    parser.add_argument('--temp', type=float, default=.85)
+    parser.add_argument('--top-k', type=int, default=50)
+    parser.add_argument('--top-p', type=float, default=.85)
+    parser.add_argument('--rep-pen', type=float, default=5.)
+    parser.add_argument('--xtts-block')
+    parser.add_argument('--text-file')
+    parser.add_argument('--device')
+    parser.add_argument('--keep')
+    args = parser.parse_args()
+    lang = args.lang.lower().replace('_', '-').split('-')[0]
+    try:
+        if args.text_file:
+            texts = load_texts(args.text_file, lang, {})
+        else:
+            from probe_texts import probe_texts
+            texts = probe_texts(lang)
+        base = dict(seed=args.seed, temp=args.temp, top_k=args.top_k, top_p=args.top_p,
+                    rep_pen=args.rep_pen, gpt_cond_len=args.gpt_cond_len,
+                    gpt_cond_chunk_len=args.gpt_cond_chunk_len)
+        if args.xtts_block:
+            base.update(parse_block(args.xtts_block))
+        settings = validate(base)
+        if not args.values or min(args.values) <= 0:
+            raise ValueError('Reference caps must be positive')
+        if not os.path.isfile(args.reference):
+            raise ValueError(f'Reference not found: {args.reference}')
+    except ValueError as exc:
+        parser.error(str(exc))
     import numpy as np
     import soundfile as sf
-    import xtts_clone as XC
+    import xtts_clone as clone
     from speaker_identity import SpeakerEncoder
-
-    if not os.path.exists(args.reference):
-        sys.exit(f"[ERR] reference not found: {args.reference}")
-
-    # Several sentences: one sentence is not a measurement, it is an anecdote.
-    TEXTS = [
-        "Respire lentement et laisse les épaules redescendre, sans forcer.",
-        "Chaque expiration relâche un peu plus la mâchoire et le front.",
-        "Installe-toi confortablement et laisse le silence prendre sa place.",
-    ]
-
-    device = args.device or ('cuda' if _cuda() else 'cpu')
-    print("=" * 66)
-    print("  max_ref_len — does a longer speaker embedding help identity?")
-    print("=" * 66)
-    print(f"  reference     : {os.path.basename(args.reference)}")
-    print(f"  fixed         : seed={args.seed} temp={args.temp} "
-          f"gpt_cond_len={args.gpt_cond_len}s")
-    print(f"  varying       : max_ref_len = {args.values}")
-    print(f"  sentences     : {len(TEXTS)}\n")
-
-    ref_dur = sf.info(args.reference).duration
-    print(f"  [*] reference is {ref_dur:.1f}s long")
-    usable = [v for v in args.values if v <= ref_dur + 1]
-    if len(usable) < len(args.values):
-        skipped = [v for v in args.values if v not in usable]
-        print(f"  [!] skipping {skipped}: longer than the reference itself "
-              f"(the cap would do nothing)")
-    if not usable:
-        sys.exit("[ERR] no usable value — the reference is too short.")
-
-    print(f"  [*] loading XTTS on {device}...")
-    # load_xtts returns (TTS api wrapper, raw model) — compute_latents and
-    # generate need the RAW model, i.e. the second element.
-    _tts, model = XC.load_xtts(device)
-    enc = SpeakerEncoder(device=device)
-    ref_emb = enc.embed(args.reference)
-    print("  [OK] ready\n")
-
-    tmpdir = args.keep or tempfile.mkdtemp(prefix='mrl_')
-    os.makedirs(tmpdir, exist_ok=True)
-
-    def render(mrl, idx, text):
-        lat = XC.compute_latents(model, args.reference,
-                                 gpt_cond_len=args.gpt_cond_len,
-                                 gpt_cond_chunk_len=args.gpt_cond_chunk_len,
-                                 max_ref_len=mrl, sound_norm_refs=False)
-        out = os.path.join(tmpdir, f"mrl{mrl}_{idx}.wav")
-        XC.generate(model, text, args.lang, lat, out,
-                    temperature=args.temp, top_k=args.top_k, top_p=args.top_p,
-                    repetition_penalty=args.rep_pen, seed=args.seed)
-        return out
-
-    # ── Noise floor: the two halves of one render are the same voice, so their
-    #    spread is this setup's measurement variability.
-    first = render(usable[0], 0, TEXTS[0])
-    y, sr = sf.read(first)
-    if getattr(y, 'ndim', 1) > 1:
-        y = y.mean(axis=1)
-    h = len(y) // 2
-    noise = max(0.004, abs(float(enc.cosine(ref_emb, enc.embed(y[:h], sr=sr))) -
-                           float(enc.cosine(ref_emb, enc.embed(y[h:], sr=sr)))) / 2.0)
-    print(f"  noise floor: +/-{noise:.4f}  "
-          f"(differences below this are not differences)\n")
-
-    results = []
-    for mrl in usable:
-        vals = []
-        for i, t in enumerate(TEXTS):
-            w = first if (mrl == usable[0] and i == 0) else render(mrl, i, t)
-            vals.append(float(enc.cosine(ref_emb, enc.embed(w))))
-        mean = float(np.mean(vals))
-        sd = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
-        results.append((mrl, mean, sd, min(vals)))
-        print(f"  max_ref_len {mrl:>3}s : identity {mean:.4f} +/-{sd:.4f}  "
-              f"(worst {min(vals):.4f})")
-
-    base = next((m for v, m, _, _ in results if v == 30), results[0][1])
-    best_v, best_m, best_sd, _ = max(results, key=lambda r: r[1])
-    print(f"\n{'-'*66}")
-    gain = best_m - base
-    combined = max(noise, best_sd / np.sqrt(len(TEXTS)))
-    if best_v == 30 or gain <= combined:
-        print(f"  VERDICT: no gain beyond the noise ({gain:+.4f} vs {combined:.4f}).")
-        print(f"  The 30 s cap is not what limits identity here — leave it alone.")
-    else:
-        print(f"  VERDICT: max_ref_len {best_v}s gains {gain:+.4f} over 30s "
-              f"(noise {combined:.4f}).")
-        print(f"  Worth adding to the {{}} block and searching. Confirm by EAR "
-              f"before adopting:")
-        print(f"    python listening_test.py {tmpdir}/mrl30_0.wav "
-              f"{tmpdir}/mrl{best_v}_0.wav --reference {args.reference} --trials 12")
+    duration = sf.info(args.reference).duration
+    if not math.isfinite(duration) or duration <= 0:
+        parser.error('Reference audio is empty or invalid')
+    values, seen = [], set()
+    for value in dict.fromkeys(args.values):
+        effective = min(value, duration)
+        if effective not in seen:
+            values.append(value)
+            seen.add(effective)
+        else:
+            print(f'Skipping redundant cap {value}s (same {effective:.2f}s reference audio)')
+    print(f'Fixed settings: {format_block(settings)}')
+    print('GPT conditioning fixed from full reference; only speaker embeddings vary.')
+    _, model = clone.load_xtts(args.device)
+    encoder = SpeakerEncoder(device=args.device)
+    reference = encoder.embed(args.reference)
+    latents = isolated_latents(model, args.reference, settings, values, duration, clone)
     if args.keep:
-        print(f"\n  renders kept in {tmpdir}/")
+        os.makedirs(args.keep, exist_ok=True)
+    manager = contextlib.nullcontext(args.keep) if args.keep else tempfile.TemporaryDirectory(prefix='mrl_')
+    with manager as directory:
+        results = []
+        for value in values:
+            scores, files = [], []
+            for i, text in enumerate(texts):
+                path = os.path.join(directory, f'mrl{value}_{i}.wav')
+                clone.generate(model, text, args.lang, latents[value], path, **render_kwargs(settings))
+                scores.append(encoder.cosine(reference, encoder.embed(path)))
+                files.append(path)
+            row = dict(max_ref_len=value, effective_seconds=min(value, duration),
+                       mean=float(np.mean(scores)), std=float(np.std(scores, ddof=1)) if len(scores)>1 else None,
+                       scores=scores, files=files)
+            results.append(row)
+            print(f"cap {value}s (effective {row['effective_seconds']:.2f}s): cosine {row['mean']:.4f}; "
+                  f"per-sentence scores {', '.join(f'{s:.4f}' for s in scores)}")
+        baseline = next((r for r in results if r['max_ref_len']==30), results[0])
+        best = max(results, key=lambda r:r['mean'])
+        print(f"Highest observed mean: cap {best['max_ref_len']}s, delta {best['mean']-baseline['mean']:+.4f} "
+              f"vs tested baseline {baseline['max_ref_len']}s.")
+        print('Sentence dispersion is not a calibrated noise floor. Confirm on new text and by listening.')
+        if len(results)<2:
+            print('Only one effective cap: no comparison is possible with this reference.')
+        if args.keep:
+            with open(os.path.join(directory,'max_ref_len_report.json'),'w',encoding='utf-8') as report:
+                json.dump(dict(settings=settings,gpt_fixed=True,texts=texts,results=results),report,
+                          ensure_ascii=False,indent=2)
+            print(f'WAVs and report: {directory}')
 
 
-def _cuda():
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except Exception:
-        return False
-
-
-if __name__ == '__main__':
+if __name__=='__main__':
     main()

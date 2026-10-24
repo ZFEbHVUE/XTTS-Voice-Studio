@@ -40,6 +40,8 @@ import os
 import sys
 import re
 import argparse
+import json
+from xtts_settings import parse_block, format_block, validate
 import tempfile
 import numpy as np
 
@@ -52,28 +54,38 @@ LANGS = {'FR','EN','ES','DE','IT','PT','PL','TR','RU','NL','CS','AR','ZH-CN','HU
 # ── Block parsing / formatting ────────────────────────────────────────────────
 
 def parse_xtts_block(block):
-    nums = [float(x) for x in re.findall(r'[-+]?\d+(?:\.\d+)?', block)]
-    keys = ['seed', 'trim_start', 'trim_end', 'fade_in', 'fade_out',
-            'temp', 'top_k', 'top_p', 'rep_pen', 'len_pen',
-            'gpt_cond_len', 'gpt_cond_chunk_len', 'sound_norm_refs',
-            'num_beams']   # optional 15th (v24)
-    out = {}
-    for i, k in enumerate(keys):
-        if i + 1 < len(nums):
-            out[k] = nums[i + 1]
-    return out
+    return parse_block(block)
 
 
 def parse_audio_block(block):
-    m = re.search(r'\b(FR|EN|ES|DE|IT|PT|PL|TR|RU|NL|CS|AR|HU|KO|JA|HI)\b', block, re.I)
-    lang = m.group(1).upper() if m else 'FR'
-    nums = [float(x) for x in re.findall(r'[-+]?\d+(?:\.\d+)?', block)][1:]
+    raw = block.strip()
+    if not raw.startswith('[') or not raw.endswith(']'):
+        raise ValueError("Audio block must be enclosed in brackets")
+    parts = [part.strip() for part in raw[1:-1].split(',')]
+    if not parts or not parts[0].isdigit() or int(parts[0]) < 1:
+        raise ValueError("Audio block needs a positive voice number")
+    parts = parts[1:]
+    lang = 'FR'
+    if parts and parts[0].upper() in LANGS:
+        lang = parts.pop(0).upper()
     keys = ['speed', 'vol', 'eq_low', 'eq_mid', 'eq_high', 'hp', 'lp',
             'NR', 'comp', 'de-ess', 'reverb', 'noise_gate', 'pan', 'limiter']
+    if len(parts) > len(keys):
+        raise ValueError("Too many audio parameters")
     out = {'lang': lang}
-    for i, k in enumerate(keys):
-        if i < len(nums):
-            out[k] = nums[i]
+    for key, token in zip(keys, parts):
+        if token:
+            value = float(token)
+            if not np.isfinite(value):
+                raise ValueError(f"{key}: value must be finite")
+            out[key] = value
+    if out.get('speed', 1) <= 0 or not -1 <= out.get('pan', 0) <= 1:
+        raise ValueError("speed must be positive and pan in [-1, 1]")
+    if out.get('limiter', 1) not in (0, 1):
+        raise ValueError("limiter must be 0 or 1")
+    for key in ('hp', 'lp', 'NR', 'comp', 'de-ess', 'reverb'):
+        if out.get(key, 0) < 0:
+            raise ValueError(f"{key} must be nonnegative")
     return out
 
 
@@ -85,19 +97,12 @@ def fmt(v):
 
 
 def format_blocks(N, xtts, audio, lang):
-    xa = [N, int(xtts.get('seed', 0)), int(xtts.get('trim_start', 0)),
-          int(xtts.get('trim_end', 0)), int(xtts.get('fade_in', 100)),
-          int(xtts.get('fade_out', 250)), xtts.get('temp', 0.65),
-          int(xtts.get('top_k', 50)), xtts.get('top_p', 0.85),
-          xtts.get('rep_pen', 5.0), xtts.get('len_pen', 1.0),
-          int(xtts.get('gpt_cond_len', 30)), int(xtts.get('gpt_cond_chunk_len', 4)),
-          int(xtts.get('sound_norm_refs', 0))]
     aa = [audio.get('speed', 1.0), audio.get('vol', 0), audio.get('eq_low', 0),
           audio.get('eq_mid', 0), audio.get('eq_high', 0), audio.get('hp', 0),
           audio.get('lp', 0), audio.get('NR', 0), audio.get('comp', 0),
           audio.get('de-ess', 0), audio.get('reverb', 0), audio.get('noise_gate', 0),
           audio.get('pan', 0), audio.get('limiter', 1)]
-    xtts_str  = '{' + ', '.join(fmt(v) for v in xa) + '}'
+    xtts_str = format_block(xtts, voice=N)
     audio_str = f"[{N}, {lang}, " + ', '.join(fmt(v) for v in aa) + ']'
     return xtts_str, audio_str
 
@@ -108,7 +113,7 @@ def clean_text(raw, lang='en'):
     """Strip pause/parameter markup, keep prose for a short test clip.
     Falls back to a built-in sentence IN THE TARGET LANGUAGE when empty."""
     lines = []
-    for ln in raw.splitlines():
+    for ln in (raw or "").splitlines():
         s = ln.strip()
         if not s:
             continue
@@ -172,58 +177,262 @@ def _quiet_post(raw_path, out_path, audio, xtts, lang, gen_path):
         return apply_post(raw_path, out_path, audio, xtts, lang, gen_path)
 
 
-def apply_post(raw_path, out_path, audio, xtts, lang, gen_path):
-    """Apply the generator's process_audio chain to a raw clone."""
-    from pydub import AudioSegment
-    seg = AudioSegment.from_wav(raw_path)
-    process_audio = None
+_GEN_CACHE = {}
+
+
+def _generator_chain(gen_path):
+    """The generator's render_voice_chain, loaded once.
+    The screening and optimiser call apply_post hundreds of times; re-executing
+    the whole generator module on every call was pure overhead."""
+    if gen_path in _GEN_CACHE:
+        return _GEN_CACHE[gen_path]
+    chain = None
     if gen_path and os.path.exists(gen_path):
         import importlib.util
         spec = importlib.util.spec_from_file_location('gmg', gen_path)
         gmg = importlib.util.module_from_spec(spec)
         try:
             spec.loader.exec_module(gmg)
-            process_audio = getattr(gmg, 'process_audio', None)
-        except Exception:
-            pass
-    if process_audio:
+            chain = getattr(gmg, 'render_voice_chain', None)
+            if chain is None:
+                print("   [!] The generator has no render_voice_chain: it is older "
+                      "than this comparator. Install both files together.")
+        except Exception as e:
+            print(f"   [!] Could not load the generator's audio chain: {e}")
+    _GEN_CACHE[gen_path] = chain
+    return chain
+
+
+def apply_post(raw_path, out_path, audio, xtts, lang, gen_path):
+    """Apply the generator's own render chain to a raw clone."""
+    from pydub import AudioSegment
+    seg = AudioSegment.from_wav(raw_path)
+    render_voice_chain = _generator_chain(gen_path)
+    if render_voice_chain is None:
+        raise RuntimeError('Generator audio chain could not be loaded; refusing to score an unprocessed clone')
+    if render_voice_chain:
         config = {
-            'speed': float(audio.get('speed', 1.0)), 'volume': int(audio.get('vol', 0)),
+            'speed': float(audio.get('speed', 1.0)), 'volume': float(audio.get('vol', 0)),
             'eq_low': float(audio.get('eq_low', 0)), 'eq_mid': float(audio.get('eq_mid', 0)),
             'eq_high': float(audio.get('eq_high', 0)), 'highpass': float(audio.get('hp', 0)),
             'lowpass': float(audio.get('lp', 0)), 'noise_reduction': float(audio.get('NR', 0)),
             'compression': float(audio.get('comp', 0)), 'deesser': float(audio.get('de-ess', 0)),
             'reverb': float(audio.get('reverb', 0)), 'noise_gate': float(audio.get('noise_gate', 0)),
-            'pan': float(audio.get('pan', 0)), 'language': lang.lower(),
+            'pan': float(audio.get('pan', 0)),
+            # The chain reads the limiter from CONFIG. It used to be put in
+            # the xtts dict, where nothing reads it, so the comparator never
+            # limited while the generator did.
+            'limiter': int(audio.get('limiter', 1)),
+            'language': lang.lower(),
         }
         xtts_fx = {
             'trim_start': int(xtts.get('trim_start', 0)), 'trim_end': int(xtts.get('trim_end', 0)),
             'fade_in': int(xtts.get('fade_in', 100)), 'fade_out': int(xtts.get('fade_out', 250)),
-            'limiter': int(audio.get('limiter', 1)),
         }
-        seg = process_audio(seg, config, xtts_fx)
-        # In the generator, volume is applied AFTER process_audio (in
-        # generate_sentence_audio) — process_audio itself never touches it.
-        # Mirror that here, otherwise the closed loop can never level-match.
-        vol = int(audio.get('vol', 0))
-        if vol:
-            seg = seg + vol
+        # The generator's own function: effects -> speed -> volume -> limiter.
+        # Rebuilding that order here is how it drifted before (speed missing,
+        # limiter before the volume).
+        seg = render_voice_chain(seg, config, xtts_fx)
     seg.export(out_path, format='wav')
     return out_path
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def unseen_sentence(lang, fit_text, hold_text=None, explicit=None):
+    """A final check must use neither the fitting text nor the selection text."""
+    excluded = {t.strip().casefold() for t in (fit_text, hold_text) if t}
+    if explicit:
+        candidate = clean_text(explicit, lang)
+        if candidate.casefold() in excluded:
+            raise ValueError("unseen-text must differ from fitting and hold-out sentences")
+        return candidate
+    from probe_texts import holdout_texts, probe_texts
+    candidates = holdout_texts(lang, 2) + probe_texts(lang, 3)
+    for candidate in candidates:
+        if candidate.strip().casefold() not in excluded:
+            return candidate
+    raise ValueError("No independent final-check sentence; supply --unseen-text")
+
+
+def transcript_excerpt(segments, limit=240):
+    """Keep text paired with audio, tolerating zero-duration ASR word tokens.
+
+    Such tokens are grouped with a timed neighbour, never silently dropped.
+    Broken word alignment falls back to a COMPLETE, timed segment; it never
+    pairs a truncated segment transcript with the whole segment's audio.
+    """
+    if limit <= 0:
+        raise ValueError('Transcription text limit must be positive')
+
+    def interval(entry):
+        try:
+            start, end = float(entry.start), float(entry.end)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not (np.isfinite(start) and np.isfinite(end) and 0 <= start <= end):
+            return None
+        return start, end
+
+    diagnostics, diagnostic_count = [], 0
+
+    def diagnose(reason, entry, segment_number):
+        nonlocal diagnostic_count
+        diagnostic_count += 1
+        if len(diagnostics) < 8:
+            token = str(getattr(entry, 'word', getattr(entry, 'text', '')) or '')[:64]
+            start = repr(getattr(entry, 'start', None))[:80]
+            end = repr(getattr(entry, 'end', None))[:80]
+            diagnostics.append(f'[INFO] ASR segment {segment_number}: {reason}; '
+                               f'text={token!r}, start={start}, end={end}')
+
+    def report_diagnostics():
+        for message in diagnostics:
+            print(message)
+        if diagnostic_count > len(diagnostics):
+            print(f'[INFO] ASR: {diagnostic_count - len(diagnostics)} further timestamp issue(s).')
+
+    parts, first, last, count = [], None, None, 0
+    repaired, fallback, skipped = 0, 0, 0
+    for segment_number, segment in enumerate(segments, 1):
+        words = list(getattr(segment, 'words', None) or [])
+        units, pending, previous_start, valid = [], [], None, True
+        for word in words:
+            text = str(getattr(word, 'word', '') or '').strip()
+            if not text:
+                continue
+            bounds = interval(word)
+            if bounds is None or (previous_start is not None and bounds[0] < previous_start):
+                diagnose('invalid or out-of-order word timestamps; trying complete segment',
+                         word, segment_number)
+                valid = False
+                break
+            start, end = bounds
+            previous_start = start
+            if start == end:
+                diagnose('zero-duration word; grouping with timed neighbour', word, segment_number)
+                repaired += 1
+                if units:
+                    units[-1][0] += ' ' + text
+                    units[-1][2] = max(units[-1][2], end)
+                else:
+                    pending.append((text, start))
+                continue
+            if pending:
+                text = ' '.join([item[0] for item in pending] + [text])
+                start = min(start, pending[0][1])
+                pending = []
+            units.append([text, start, end])
+
+        if not words or not valid or not units:
+            bounds = interval(segment)
+            text = str(getattr(segment, 'text', '') or '').strip()
+            if not text:
+                text = ' '.join(str(getattr(word, 'word', '') or '').strip() for word in words).strip()
+            if not text or bounds is None or bounds[0] == bounds[1]:
+                diagnose('complete segment unavailable; ending or skipping excerpt', segment, segment_number)
+                if parts:
+                    break
+                skipped += 1
+                continue
+            units = [[text, *bounds]]
+            if words:
+                fallback += 1
+
+        stop = False
+        for text, start, end in units:
+            if count + len(text) + bool(parts) > limit:
+                # A later segment may have usable word alignment. Before the
+                # excerpt starts, skip an indivisible overlong segment safely.
+                if not parts:
+                    diagnose('complete text unit exceeds excerpt limit; skipping leading segment',
+                             segment, segment_number)
+                    skipped += 1
+                    break
+                stop = True
+                break
+            parts.append(text)
+            first = float(start) if first is None else first
+            last = float(end) if last is None else max(last, float(end))
+            count += len(text) + (1 if len(parts)>1 else 0)
+        if stop:
+            break
+    report_diagnostics()
+    if not parts:
+        raise ValueError('No usable timestamped excerpt within text limit; provide --text instead of --auto-text')
+    if repaired or fallback or skipped:
+        print(f'[INFO] ASR alignment: {repaired} zero-duration token(s) grouped; '
+              f'{fallback} complete segment fallback(s); {skipped} leading segment(s) skipped.')
+    return ' '.join(parts), first, last
+
+
+def fit_rendered_tone(reference, reference_sr, render_sr, initial, render,
+                      iterations=3, eq_limit=4., weighting='a', target_dbfs=None,
+                      convergence=.5):
+    """Keep only corrections that improve the spectrum AFTER the actual chain.
+
+    render(config) returns mono samples resampled to reference_sr. Digital EQ
+    responses must use render_sr, even when analysis runs at reference_sr.
+    """
+    import ltas_match as L
+    if not np.isfinite(eq_limit) or eq_limit <= 0:
+        raise ValueError('eq-limit must be finite and positive')
+    fmax=min(L.FIT_FMAX,render_sr/2-1,reference_sr/2-1)
+    grid, ref_db=L.compute_ltas(reference,reference_sr,fmax=fmax)
+    keys=('eq_low','eq_mid','eq_high')
+    current=dict(initial)
+    current.update({key:float(np.clip(current.get(key,0),-eq_limit,eq_limit)) for key in keys})
+    current.setdefault('vol',0)
+    def measure(config):
+        audio=render(config)
+        _,db=L.compute_ltas(audio,reference_sr,fmax=fmax)
+        return audio,db,L.spectral_shape_error(grid,ref_db,db,weighting)
+    audio,curve,error=measure(current)
+    history=[]
+    for index in range(max(1,iterations)):
+        fit=L.fit_eq_ls(grid,ref_db,curve,fs=render_sr,weighting=weighting,
+                        g_bounds=(-eq_limit,eq_limit),cur_hp=current.get('hp',0),cur_lp=current.get('lp',0))
+        candidate=dict(current)
+        candidate.update({key:round(float(np.clip(current.get(key,0)+fit[key],-eq_limit,eq_limit)),1) for key in keys})
+        if index==0:
+            candidate.update(hp=fit['hp'],lp=fit['lp'])
+        correction=(L.level_to_target_db(audio,target_dbfs) if target_dbfs is not None else L.level_match_db(reference,audio))
+        candidate['vol']=float(np.clip(current['vol']+correction,-18,18))
+        trial,trial_curve,trial_error=measure(candidate)
+        # Re-match level after the EQ change; one more render, no XTTS generation.
+        level_delta=(L.level_to_target_db(trial,target_dbfs) if target_dbfs is not None else L.level_match_db(reference,trial))
+        if level_delta:
+            candidate['vol']=float(np.clip(candidate['vol']+level_delta,-18,18))
+            trial,trial_curve,trial_error=measure(candidate)
+        accepted=trial_error < error-.01
+        same_shape=abs(trial_error-error)<=.01 and all(abs(candidate.get(k,0)-current.get(k,0))<1e-9 for k in (*keys,'hp','lp'))
+        history.append(dict(pass_number=index+1,before=error,after=trial_error,accepted=accepted or same_shape,config=dict(candidate)))
+        print(f'  pass {index+1}: rendered shape error {error:.2f} -> {trial_error:.2f} dB; '
+              f"EQ=({candidate['eq_low']:+.1f}/{candidate['eq_mid']:+.1f}/{candidate['eq_high']:+.1f}), "
+              f"volume={candidate['vol']:+.1f} dB; " + ('kept' if accepted or same_shape else 'rejected'))
+        if not accepted and not same_shape:
+            break
+        step=max(abs(candidate.get(k,0)-current.get(k,0)) for k in (*keys,'vol'))
+        current,audio,curve,error=candidate,trial,trial_curve,trial_error
+        if step<convergence or same_shape:
+            break
+    return current,history
+
+
 def main():
     p = argparse.ArgumentParser(description='Identity-driven XTTS clone optimiser')
     p.add_argument('reference')
     p.add_argument('voice_refs', nargs='*')
+    p.add_argument('--clone-refs', nargs='+', default=None,
+                   help='Exact cloning reference subset; comparison target stays positional')
     p.add_argument('--xtts-block', required=True)
     p.add_argument('--audio-block', required=True)
     p.add_argument('--text', default=None,
                    help='Sentence to fit on (default: a built-in sentence in the '
                         'target language — see probe_texts.py)')
     p.add_argument('--text-file', default=None)
+    p.add_argument('--unseen-text', help='Independent sentence for the final identity check')
+    p.add_argument('--holdout-text', help='Unseen sentence in the target language for audio optimisation')
     p.add_argument('--auto-text', action='store_true',
                    help='Transcribe the reference (faster-whisper, CPU) and fit on '
                         'its own words — like-for-like phonetics for the LTAS match')
@@ -231,10 +440,19 @@ def main():
                    help='faster-whisper model for --auto-text (default: small)')
     p.add_argument('--output', default=None)
     p.add_argument('--output-optimised', default=None)
+    p.add_argument('--output-raw', help='Save the untouched XTTS waveform for listening')
+    p.add_argument('--raw-clone', metavar='WAV',
+                   help='Fit on this untouched XTTS render instead of generating one: the '
+                        '--output-raw of an earlier run with the same {} block, text and '
+                        'clone references. Two fits then work on the very same clone.')
+    p.add_argument('--reference-interval', nargs=2, type=float, metavar=('BEGIN', 'END'),
+                   help='Seconds of the reference the clone is compared with, for --text: '
+                        'the stretch that says the same words (printed by an --auto-text run)')
+    p.add_argument('--eq-limit', type=float, default=4., help='Absolute cumulative EQ gain limit per band, default 4 dB')
     p.add_argument('--device', default=None)
-    p.add_argument('--max-ref-len', type=int, default=30,
+    p.add_argument('--max-ref-len', type=int, default=None,
                    help='Seconds of reference used for the SPEAKER EMBEDDING '
-                        '(XTTS default is only 10; higher = better identity).')
+                        '(default: value from block, or 30; longer is not always better).')
     p.add_argument('--gpt-cond-len', type=int, default=None,
                    help='Override seconds of reference for GPT conditioning '
                         '(default: value from the {} block, or 30)')
@@ -255,7 +473,7 @@ def main():
                    help='After the tone fit, search the remaining post-processing '
                         'settings for one that measurably raises ECAPA identity '
                         '(the tone fit optimises spectrum, never identity). Keeps a '
-                        'candidate only if it beats the measured noise floor.')
+                        'candidate only if it beats the heuristic tolerance.')
     p.add_argument('--screen-audio', action='store_true',
                    help='Sensitivity screening BEFORE optimising (the Optimetrics '
                         'reflex): sweep each audio parameter alone over its full range '
@@ -291,14 +509,33 @@ def main():
     lang = 'FR'
     if refs and refs[-1].upper() in LANGS:
         lang = refs[-1].upper(); refs = refs[:-1]
-    if not refs:
-        refs = [args.reference]
+    refs = args.clone_refs or list(dict.fromkeys([args.reference] + refs))
+    for ref in [args.reference] + refs:
+        if not os.path.isfile(ref):
+            p.error(f'Reference not found: {ref}')
     speaker_wav = refs if len(refs) > 1 else refs[0]
 
-    xtts  = parse_xtts_block(args.xtts_block)
+    xtts = parse_xtts_block(args.xtts_block)
+    if args.max_ref_len is not None:
+        xtts['max_ref_len'] = args.max_ref_len
+    if args.gpt_cond_len is not None:
+        xtts['gpt_cond_len'] = args.gpt_cond_len
+    xtts = validate(xtts)
+    args.max_ref_len = xtts['max_ref_len']
+    if not np.isfinite(args.eq_limit) or args.eq_limit<=0:
+        p.error('eq-limit must be finite and positive')
     audio = parse_audio_block(args.audio_block)
     lang  = audio.get('lang', lang)
+    if args.raw_clone and not os.path.isfile(args.raw_clone):
+        p.error(f'Raw clone not found: {args.raw_clone}')
+    if args.reference_interval is not None:
+        if args.auto_text:
+            p.error('--reference-interval comes with --text: --auto-text finds its own')
+        begin, finish = args.reference_interval
+        if not (np.isfinite(begin) and np.isfinite(finish) and 0 <= begin < finish):
+            p.error('--reference-interval needs 0 <= BEGIN < END')
 
+    reference_interval = None
     if args.auto_text:
         # Fit on the reference's own words: same phonemes on both sides of the
         # LTAS comparison, so the fit corrects the voice, not the text.
@@ -306,29 +543,39 @@ def main():
         from faster_whisper import WhisperModel
         wm = WhisperModel(args.whisper_model, device='cpu', compute_type='int8')
         segs, _info = wm.transcribe(args.reference, language=lang.lower().split('-')[0],
-                                    beam_size=5, vad_filter=True)
-        parts, total = [], 0
-        for s in segs:                       # whole segments up to XTTS's fr limit
-            t = s.text.strip()
-            if not t:
-                continue
-            if total + len(t) + 1 > 240:
-                break
-            parts.append(t); total += len(t) + 1
-        auto = clean_text(' '.join(parts), lang)
-        if len(auto) >= 30:
-            text = auto
-            print(f"[OK] Fitting on: \"{text[:70]}{'...' if len(text) > 70 else ''}\"")
-        else:
-            print("[!] Transcription too short -- keeping the provided text.")
-            text = clean_text(args.text, lang)
+                                    beam_size=5, vad_filter=True, word_timestamps=True)
+        try:
+            text, begin, finish = transcript_excerpt(segs)
+            reference_interval=(begin,finish)
+        except ValueError as exc:
+            p.error(str(exc))
+        print(f'[OK] Paired reference interval: {begin:.2f}-{finish:.2f}s; text: {text[:80]!r}')
     elif args.text_file and os.path.exists(args.text_file):
         with open(args.text_file, encoding='utf-8') as fh:
             text = clean_text(fh.read(), lang)
     else:
         text = clean_text(args.text, lang)
+    if args.reference_interval is not None:
+        reference_interval = tuple(args.reference_interval)
+    # What the fit compares, in full: a second run can reuse it with --raw-clone,
+    # --text and --reference-interval, and work on exactly the same material.
+    print('[*] Fit input: ' + json.dumps(
+        {'text': text, 'interval': list(reference_interval) if reference_interval else None},
+        ensure_ascii=False))
 
-    seed = int(xtts.get('seed', 0))
+    hold_text = None
+    if args.optimise_audio != 'none':
+        if args.holdout_text:
+            hold_text = clean_text(args.holdout_text, lang)
+        else:
+            from probe_texts import holdout_texts
+            try:
+                hold_text = next(t for t in holdout_texts(lang, 2) if t.strip().casefold() != text.strip().casefold())
+            except (ValueError, StopIteration) as exc:
+                p.error("Provide --holdout-text in the target language, different from the fitting sentence")
+        if hold_text.strip().casefold() == text.strip().casefold():
+            p.error("holdout-text must differ from the fitting sentence")
+    seed = xtts.get('seed')
 
     print("=" * 64)
     print("  XTTS Voice Comparator -- closed-loop EQ/vol fit (LTAS, least squares)")
@@ -340,616 +587,625 @@ def main():
     print("=" * 64)
 
     gen_path = os.path.join(SCRIPT_DIR, 'guided_meditation_generator_v23.py')
-    tmpdir   = tempfile.mkdtemp()
+    with tempfile.TemporaryDirectory(prefix='xtts_work_') as tmpdir:
+        import shutil
+        # XTTS is needed to generate the clone, and later for the unseen-text
+        # identity check and the audio optimisation's hold-out clone. A fit on a
+        # reused clone without either needs no model at all.
+        need_model = (not args.raw_clone or not args.no_identity_check
+                      or args.optimise_audio != 'none')
+        if need_model:
+            # Load XTTS once, via the low-level path that actually honours the
+            # cloning knobs (tts_to_file silently overrides gpt_cond_len/chunk/
+            # max_ref_len/sound_norm_refs with config defaults 12/4/10/False).
+            import torch
+            import xtts_clone as XC
+            device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"\n[*] Loading XTTS on {device}...")
+            tts, model = XC.load_xtts(device)
+            print("[OK] XTTS ready")
 
-    # Load XTTS once, via the low-level path that actually honours the cloning
-    # knobs (tts_to_file silently overrides gpt_cond_len/chunk/max_ref_len/
-    # sound_norm_refs with config defaults 12/4/10/False).
-    import torch
-    import xtts_clone as XC
-    device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n[*] Loading XTTS on {device}...")
-    tts, model = XC.load_xtts(device)
-    print("[OK] XTTS ready")
+            # Precompute conditioning latents ONCE (independent of seed) with the
+            # real cloning parameters — where max_ref_len/gpt_cond_len finally bite.
+            gpt_cl  = int(args.gpt_cond_len if args.gpt_cond_len is not None
+                          else xtts.get('gpt_cond_len', 30))
+            gpt_ccl = int(xtts.get('gpt_cond_chunk_len', 4))   # same default as the generator
+            snorm   = bool(xtts.get('sound_norm_refs', 0))
+            print(f"[*] Conditioning: gpt_cond_len={gpt_cl}s  chunk={gpt_ccl}s  "
+                  f"max_ref_len={args.max_ref_len}s  sound_norm_refs={snorm}")
+            latents = XC.compute_latents(model, speaker_wav, gpt_cond_len=gpt_cl,
+                                         gpt_cond_chunk_len=gpt_ccl,
+                                         max_ref_len=args.max_ref_len, sound_norm_refs=snorm)
 
-    # Precompute conditioning latents ONCE (independent of seed) with the real
-    # cloning parameters — this is where max_ref_len/gpt_cond_len finally bite.
-    gpt_cl  = int(args.gpt_cond_len if args.gpt_cond_len is not None
-                  else xtts.get('gpt_cond_len', 30))
-    gpt_ccl = int(xtts.get('gpt_cond_chunk_len', 6))
-    snorm   = bool(xtts.get('sound_norm_refs', 0))
-    print(f"[*] Conditioning: gpt_cond_len={gpt_cl}s  chunk={gpt_ccl}s  "
-          f"max_ref_len={args.max_ref_len}s  sound_norm_refs={snorm}")
-    latents = XC.compute_latents(model, speaker_wav, gpt_cond_len=gpt_cl,
-                                 gpt_cond_chunk_len=gpt_ccl,
-                                 max_ref_len=args.max_ref_len, sound_norm_refs=snorm)
+        import ltas_match as L
 
-    import ltas_match as L
-
-    # ── Generate the clone ONCE (the {} block is frozen, seed included) ───────
-    print(f"\n[*] Generating clone (seed {seed})...")
-    raw = os.path.join(tmpdir, 'clone_raw.wav')
-    XC.generate(model, text, lang, latents, raw,
-                temperature=xtts.get('temp', 0.65),
-                length_penalty=xtts.get('len_pen', 1.0),
-                repetition_penalty=xtts.get('rep_pen', 5.0),
-                top_k=int(xtts.get('top_k', 50)),
-                top_p=xtts.get('top_p', 0.85),
-                num_beams=int(xtts.get('num_beams', 1)),
-                speed=1.0, seed=seed)
-    print("[OK] Clone generated")
-
-    ref_y, ref_sr  = load_mono(args.reference)
-    f_grid, ref_db = L.compute_ltas(ref_y, ref_sr)
-    ref_shape      = ref_db - ref_db.mean()
-
-    # ── Closed-loop EQ/vol fit vs the reference (multi-pass) ──────────────────
-    # Each pass renders the full chain (incl. hp/lp/NR/comp/limiter), measures the
-    # rendered clone's LTAS against the reference, and adds the least-squares EQ
-    # correction. Iterating closes the loop on the post-chain colouring, not just
-    # the raw clone. Converges in 1–3 passes.
-    print(f"\n{'-'*64}\n  Closed-loop EQ/vol fit (LTAS, least squares)\n{'-'*64}")
-    opt = dict(audio)
-    opt['vol'] = 0; opt['eq_low'] = 0; opt['eq_mid'] = 0; opt['eq_high'] = 0
-    cand = os.path.join(tmpdir, 'cand.wav')
-    prev_step = float('inf')
-    for it in range(1, max(1, args.iterations) + 1):
-        apply_post(raw, cand, opt, xtts, lang, gen_path)
-        cy, _ = load_mono(cand, target_sr=ref_sr)
-        _, cd = L.compute_ltas(cy, ref_sr)
-        fit  = L.fit_eq_ls(f_grid, ref_db, cd, fs=ref_sr,
-                           weighting=args.eq_weighting,
-                           cur_hp=opt.get('hp', 0), cur_lp=opt.get('lp', 0))
-        if args.target_dbfs is not None:
-            dvol = L.level_to_target_db(cy, args.target_dbfs, cur_vol=0)
+        raw = os.path.join(tmpdir, 'clone_raw.wav')
+        if args.raw_clone:
+            # The same clone as an earlier fit: only the fit differs between them.
+            shutil.copyfile(args.raw_clone, raw)
+            print(f"\n[*] Clone reused from {os.path.basename(args.raw_clone)}"
+                  f"{'' if need_model else ' (XTTS not loaded)'}")
         else:
-            dvol = L.level_match_db(ref_y, cy, cur_vol=0)
-        step = max(abs(fit['eq_low']), abs(fit['eq_mid']), abs(fit['eq_high']), abs(dvol))
-        print(f"  pass {it}: residual {fit['residual_before']:.2f}->{fit['residual_after']:.2f} dB"
-              f"  | Δeq=({fit['eq_low']:+.1f},{fit['eq_mid']:+.1f},{fit['eq_high']:+.1f}) Δvol={dvol:+d}")
-        # Stop on the OBJECTIVE, not on the size of the proposed correction:
-        # a correction can stay large while the residual still falls, and it
-        # can shrink while the residual stagnates. The residual is what the fit
-        # minimises, so it is what decides.
-        if it > 1 and fit['residual_after'] >= prev_residual - 0.01:
-            print(f"  residual no longer improving "
-                  f"({prev_residual:.2f} -> {fit['residual_after']:.2f} dB) — stopping")
-            break
-        opt['eq_low']  = round(opt['eq_low']  + fit['eq_low'], 1)
-        opt['eq_mid']  = round(opt['eq_mid']  + fit['eq_mid'], 1)
-        opt['eq_high'] = round(opt['eq_high'] + fit['eq_high'], 1)
-        if it == 1:
-            # hp/lp are guards, set once from the first measurement. Re-deriving
-            # them every pass let them walk away cumulatively while the EQ was
-            # already correcting the same imbalance.
-            opt['hp'] = fit['hp']; opt['lp'] = fit['lp']
-        opt['vol'] = int(np.clip(opt['vol'] + dvol, -18, 18))
-        prev_step = step
-        prev_residual = fit['residual_after']
-        if step < args.conv_threshold:
-            print(f"  converged (largest change {step:.2f} dB < {args.conv_threshold} dB)")
-            break
-
-    # ── Measured fit of de-ess and compression ────────────────────────────────
-    # The tail of the [] block used to stay at zero because nothing measured it.
-    # Sibilance (5-8 kHz vs 300-3 kHz) and crest factor ARE measurable against
-    # the reference, so they get the same treatment as the EQ: propose a value,
-    # render, re-measure, and KEEP IT ONLY IF THE GAP SHRINKS. NR/reverb/gate/pan
-    # stay at zero on purpose (no measurable target; the gate chops speech).
-    if args.fit_dynamics:
-        print(f"\n{'-'*64}\n  Measured de-ess / compression fit\n{'-'*64}")
-        ref_sib, ref_crest = L.sibilance_db(ref_y, ref_sr), L.crest_db(ref_y)
-        apply_post(raw, cand, opt, xtts, lang, gen_path)
-        cy, _ = load_mono(cand, target_sr=ref_sr)
-        sib_gap = L.sibilance_db(cy, ref_sr) - ref_sib
-        crest_gap = L.crest_db(cy) - ref_crest
-        left_at_zero = []
-        print(f"  reference: sibilance {ref_sib:+.1f} dB   crest {ref_crest:.1f} dB")
-        print(f"  clone gap: sibilance {sib_gap:+.1f} dB   crest {crest_gap:+.1f} dB")
-
-        for name, gap, thr, scale, cap, what in (
-                ('de-ess', sib_gap, 1.5, 0.18, 0.5, 'sibilance'),
-                ('comp', crest_gap, 2.0, 0.12, 0.6, 'dynamics')):
-            if gap <= thr:
-                if gap < 0:
-                    # Expected for synthetic speech: XTTS output is smoother than
-                    # a real recording. A de-esser/compressor can only REDUCE, so
-                    # a negative gap is not correctable here — 0 is the right value.
-                    print(f"  {name}: clone has LESS {what} than the reference "
-                          f"({gap:+.1f} dB) — a {name} can only reduce it, nothing "
-                          f"to do -> 0")
-                else:
-                    print(f"  {name}: gap {gap:+.1f} dB within tolerance ({thr}) -> 0")
-                left_at_zero.append(name)
-                continue
-            trial = dict(opt)
-            trial[name] = round(min(cap, (gap - thr) * scale), 2)
-            apply_post(raw, cand, trial, xtts, lang, gen_path)
-            ty, _ = load_mono(cand, target_sr=ref_sr)
-            new_gap = ((L.sibilance_db(ty, ref_sr) - ref_sib) if name == 'de-ess'
-                       else (L.crest_db(ty) - ref_crest))
-            if abs(new_gap) < abs(gap) - 0.2:
-                opt[name] = trial[name]
-                print(f"  {name} -> {trial[name]}  (gap {gap:+.1f} -> {new_gap:+.1f} dB)")
-            else:
-                print(f"  {name} {trial[name]} did not help ({gap:+.1f} -> {new_gap:+.1f}) "
-                      f"-> reverted to 0")
-
-    # ── Identity-driven post-processing search ────────────────────────────────
-    # Everything above optimises TONE (LTAS residual). This stage asks a
-    # different question, the one that actually matters: can post-processing
-    # raise the ECAPA IDENTITY of the clone? Nobody had ever measured it — the
-    # remaining [] fields stayed at 0 because no criterion ever asked them to
-    # move. Each candidate is rendered and scored; only a gain above the
-    # measured noise floor is kept.
-    if args.fit_identity:
-        print(f"\n{'-'*64}\n  Identity-driven post-processing search (ECAPA)\n{'-'*64}")
-        try:
-            from speaker_identity import SpeakerEncoder
-            enc = _encoder(args.device)
-            ref_emb = enc.embed(args.reference)
-
-            def ident_of(block):
-                apply_post(raw, cand, block, xtts, lang, gen_path)
-                return float(enc.cosine(ref_emb, enc.embed(cand))), cand
-
-            base_id, _ = ident_of(opt)
-            # Noise floor: identity measured on each half of the same clone.
-            # Two halves of one render are the same voice, so their spread is
-            # the measurement variability for this clip.
-            cy_all, csr = load_mono(cand, target_sr=16000)   # ECAPA rate
-            h = len(cy_all) // 2
-            halves = [float(enc.cosine(ref_emb, enc.embed(cy_all[:h], sr=csr))),
-                      float(enc.cosine(ref_emb, enc.embed(cy_all[h:], sr=csr)))]
-            noise = max(0.005, abs(halves[0] - halves[1]) / 2.0)
-            print(f"  baseline (tone-fitted) identity {base_id:.4f}   "
-                  f"noise floor ±{noise:.4f}")
-
-            trials = [('no post-processing at all',
-                       dict(opt, vol=0, eq_low=0, eq_mid=0, eq_high=0, hp=0, lp=0)),
-                      ('EQ off (keep vol/filters)', dict(opt, eq_low=0, eq_mid=0, eq_high=0)),
-                      ('brighter (eq_high +2)', dict(opt, eq_high=opt['eq_high'] + 2)),
-                      ('darker (eq_high -2)',   dict(opt, eq_high=opt['eq_high'] - 2)),
-                      ('full band (lp 16k)',    dict(opt, lp=16000)),
-                      ('narrow band (lp 8k)',   dict(opt, lp=8000)),
-                      ('NR 0.2',                dict(opt, NR=0.2)),
-                      ('comp 0.3',              dict(opt, comp=0.3)),
-                      ('de-ess 0.3',            {**opt, 'de-ess': 0.3})]
-            results = [('baseline', opt, base_id)]
-            for label, blk in trials:
-                try:
-                    v, _ = ident_of(blk)
-                except Exception as e:
-                    print(f"  {label:26s} failed ({e})"); continue
-                results.append((label, blk, v))
-                d = v - base_id
-                flag = '  <-- above noise' if d > noise else ''
-                print(f"  {label:26s} identity {v:.4f}  ({d:+.4f}){flag}")
-
-            lbl, blk, best_id = max(results, key=lambda r: r[2])
-            if best_id > base_id + noise:
-                print(f"\n  ADOPTED '{lbl}': identity {base_id:.4f} -> {best_id:.4f} "
-                      f"(+{best_id - base_id:.4f}, above the {noise:.4f} noise floor)")
-                opt = dict(blk)
-            else:
-                print(f"\n  No post-processing setting raises identity beyond the noise "
-                      f"floor (best {best_id:.4f} vs baseline {base_id:.4f}).")
-                print(f"  Conclusion for this voice: post-processing shapes TONE, not "
-                      f"IDENTITY — the zero fields are zero because nothing they can do")
-                print(f"  makes the clone measurably more like the person.")
-            apply_post(raw, cand, opt, xtts, lang, gen_path)   # restore chosen block
-        except Exception as e:
-            print(f"  [!] Identity search unavailable ({e})")
-
-        if left_at_zero and not args.screen_audio:
-            print(f"  ({', '.join(left_at_zero)} left at 0 because the measured gap "
-                  f"points the wrong way for these tools.")
-            print(f"   To find out whether ANY audio parameter can move identity for "
-                  f"this voice, re-run with --screen-audio.)")
-
-    _measured_noise = [None]      # filled by the screening, used by the gate
-    _adopted = [False]            # True when the identity search replaced the block
-
-    # ── Sensitivity screening (which knobs matter at all?) ────────────────────
-    # The Optimetrics reflex: screen BEFORE optimising. One factor at a time
-    # across its full musical range, measuring how much ECAPA identity actually
-    # moves. This answers, per parameter and with numbers, the question the tool
-    # could never answer before: does this knob do anything for THIS voice?
-    if args.screen_audio:
-        print(f"\n{'-'*64}\n  Sensitivity screening (one factor at a time, ECAPA identity)\n{'-'*64}")
-        try:
-            from speaker_identity import SpeakerEncoder
-            enc_s = _encoder(args.device)
-            ref_s = enc_s.embed(args.reference)
-
-            def ident_blk(blk):
-                _quiet_post(raw, cand, blk, xtts, lang, gen_path)
-                return float(enc_s.cosine(ref_s, enc_s.embed(cand)))
-
-            base_s = ident_blk(opt)
-            # Noise floor from the two halves of the same render (same voice,
-            # so their spread is the measurement variability for this clip).
-            cy_h, csr_h = load_mono(cand, target_sr=16000)
-            hh = len(cy_h) // 2
-            noise_s = max(0.004, abs(
-                float(enc_s.cosine(ref_s, enc_s.embed(cy_h[:hh], sr=csr_h))) -
-                float(enc_s.cosine(ref_s, enc_s.embed(cy_h[hh:], sr=csr_h)))) / 2.0)
-            print(f"  baseline identity {base_s:.4f}   noise floor +/-{noise_s:.4f}\n")
-            _measured_noise[0] = noise_s      # reused by the transfer gate below
-
-            GRID = [('vol',    [-12, -6, 0, 6, 12]),
-                    ('eq_low', [-6, -3, 0, 3, 6]),
-                    ('eq_mid', [-6, -3, 0, 3, 6]),
-                    ('eq_high',[-6, -3, 0, 3, 6]),
-                    ('hp',     [40, 65, 95, 150]),
-                    ('lp',     [6000, 8000, 11000, 16000]),
-                    ('NR',     [0, 0.15, 0.3, 0.5]),
-                    ('comp',   [0, 0.2, 0.4, 0.6]),
-                    ('de-ess', [0, 0.15, 0.3, 0.5])]
-            rows = []
-            for axis, values in GRID:
-                ids = []
-                for v in values:
-                    blk = dict(opt); blk[axis] = v
-                    ids.append((v, ident_blk(blk)))
-                swing = max(i for _, i in ids) - min(i for _, i in ids)
-                bestv, besti = max(ids, key=lambda t: t[1])
-                rows.append((axis, swing, bestv, besti, besti - base_s))
-            rows.sort(key=lambda r: -r[1])
-
-            print(f"  {'axis':>8}{'swing':>9}{'best value':>12}{'identity':>10}{'vs base':>9}")
-            for axis, swing, bestv, besti, delta in rows:
-                verdict = ('MATTERS' if swing > 3 * noise_s else
-                           'marginal' if swing > noise_s else 'INERT')
-                print(f"  {axis:>8}{swing:>9.4f}{str(bestv):>12}{besti:>10.4f}"
-                      f"{delta:>+9.4f}   {verdict}")
-            live = [r[0] for r in rows if r[1] > 3 * noise_s]
-            dead = [r[0] for r in rows if r[1] <= noise_s]
-            print(f"\n  Knobs that move identity for this voice: "
-                  f"{', '.join(live) if live else 'NONE'}")
-            if dead:
-                print(f"  Knobs measurably inert here: {', '.join(dead)}")
-            print(f"  (screening only -- use --optimise-audio to search the live axes "
-                  f"jointly, interactions included)")
-        except Exception as e:
-            print(f"  [!] Screening unavailable ({e})")
-
-    # ── Derivative-free optimisation of the whole audio block ─────────────────
-    # Evaluations here are CHEAP (one clone, then post-processing + one ECAPA
-    # embed each), so unlike the XTTS search we can afford hundreds of them —
-    # which is exactly the regime where derivative-free global optimisers earn
-    # their keep. Least squares does not apply (ECAPA is a non-differentiable
-    # black box, there is no design matrix); bisection does not either (12
-    # interacting axes, non-monotonic). Differential evolution + Nelder-Mead
-    # polish is the method that matches this structure.
-    #
-    # DANGER, handled below: optimising 12 knobs against a neural metric is
-    # metric hacking. Every result is therefore validated on a SECOND clone
-    # generated from a different sentence, and rejected if it does not transfer.
-    if args.optimise_audio != 'none':
-        print(f"\n{'-'*64}\n  Audio-block optimisation ({args.optimise_audio}) — "
-              f"target: identity\n{'-'*64}")
-        try:
-            import numpy as _np
-            from scipy.optimize import differential_evolution, minimize
-            from speaker_identity import SpeakerEncoder
-            enc = _encoder(args.device)
-            ref_emb = enc.embed(args.reference)
-
-            # Bounds kept musically sane: outside these the result stops being
-            # a listenable voice regardless of what the metric says.
-            AXES = [('vol', -18, 18), ('eq_low', -6, 6), ('eq_mid', -6, 6),
-                    ('eq_high', -6, 6), ('hp', 40, 150), ('lp', 6000, 16000),
-                    ('NR', 0, 0.5), ('comp', 0, 0.6), ('de-ess', 0, 0.5)]
-            bounds = [(lo, hi) for _, lo, hi in AXES]
-            lower = _np.array([lo for _, lo, _ in AXES], dtype=float)
-            upper = _np.array([hi for _, _, hi in AXES], dtype=float)
-
-            # The closed-loop tone fit can legitimately leave an EQ value just
-            # outside the identity optimiser's deliberately conservative bounds
-            # (for example eq_high=+6.4 while the identity search is capped at +6).
-            # SciPy's differential_evolution rejects an out-of-bounds x0, so make
-            # the starting point feasible for BOTH DE and Nelder-Mead.
-            x0_raw = _np.array([float(opt.get(k, 0)) for k, _, _ in AXES], dtype=float)
-            x0 = _np.clip(x0_raw, lower, upper)
-            if not _np.allclose(x0_raw, x0):
-                clipped = []
-                for (k, _, _), before, after in zip(AXES, x0_raw, x0):
-                    if abs(float(before) - float(after)) > 1e-12:
-                        clipped.append(f"{k} {before:g}->{after:g}")
-                print("  optimiser start clipped to bounds: " + ", ".join(clipped))
-
-            evals = [0]
-            def identity_of(x, wav_in, wav_out):
-                blk = dict(opt)
-                for (k, _, _), v in zip(AXES, x):
-                    blk[k] = round(float(v)) if k in ('vol', 'hp', 'lp') else float(v)
-                _quiet_post(wav_in, wav_out, blk, xtts, lang, gen_path)
-                return float(enc.cosine(ref_emb, enc.embed(wav_out))), blk
-
-            def neg_identity(x):
-                evals[0] += 1
-                v, _ = identity_of(x, raw, cand)
-                return -v
-
-            base_id = -neg_identity(x0)
-            print(f"  start (tone-fitted block): identity {base_id:.4f}")
-
-            if args.optimise_audio == 'de':
-                # STRICT evaluation budget -------------------------------------------------
-                # scipy's DE budget is population_size * (maxiter + 1).  With init='sobol'
-                # the population is rounded UP to the next power of two, which is why the
-                # old popsize=10/maxiter>=5 configuration silently produced ~768 DE calls
-                # before the Nelder-Mead polish.  Here --optimise-budget is a REAL cap for
-                # the complete identity search (baseline + DE + local polish).
-                total_budget = max(64, int(args.optimise_budget))
-
-                # A smaller Sobol population is still broad enough for these 9 bounded axes
-                # while leaving useful room for local polish.  scipy rounds 6*9=54 -> 64.
-                de_popsize = 6
-                n_free = sum(1 for lo, hi in bounds if hi > lo)
-                requested_pop = max(1, de_popsize * n_free)
-                sobol_pop = 1 << int(_np.ceil(_np.log2(requested_pop)))
-
-                # Reserve roughly 25% of the budget for Nelder-Mead (up to 120 calls).
-                # The baseline evaluation above already consumed one call.
-                reserve_polish = min(120, max(40, total_budget // 4))
-                de_allowance = max(sobol_pop, total_budget - evals[0] - reserve_polish)
-                de_generations = max(0, de_allowance // sobol_pop - 1)
-
-                print(f"  strict optimisation budget: {total_budget} evaluations max "
-                      f"(Sobol population {sobol_pop}, DE generations {de_generations})")
-
-                # Seed the population with the tone-fitted block. Without it,
-                # differential evolution may return something WORSE on a flat/noisy
-                # landscape.  x0 replaces one population member; it does not add a call.
-                try:
-                    res = differential_evolution(
-                        neg_identity, bounds, maxiter=de_generations,
-                        popsize=de_popsize, tol=1e-4, seed=0, polish=False,
-                        init='sobol', x0=x0)
-                except TypeError:            # older scipy has no x0=
-                    res = differential_evolution(
-                        neg_identity, bounds, maxiter=de_generations,
-                        popsize=de_popsize, tol=1e-4, seed=0, polish=False,
-                        init='sobol')
-                xb = _np.clip(res.x, lower, upper)
-                print(f"  differential evolution: {evals[0]} / {total_budget} evaluations")
-
-                # Spend ONLY the remaining budget on local polish.  maxfev, unlike
-                # maxiter, limits objective evaluations directly.
-                remaining = max(0, total_budget - evals[0])
-                if remaining >= 10:
-                    r2 = minimize(
-                        neg_identity, xb, method='Nelder-Mead', bounds=bounds,
-                        options={'maxiter': 120, 'maxfev': remaining,
-                                 'xatol': 1e-3, 'fatol': 1e-5})
-                    r2x = _np.clip(r2.x, lower, upper)
-                    if r2.fun < res.fun:
-                        xb = r2x
-                    print(f"  + Nelder-Mead polish: {evals[0]} / {total_budget} total evaluations")
-                else:
-                    print(f"  + Nelder-Mead polish skipped: only {remaining} evaluations remain")
-            else:
-                # Local optimiser: --optimise-budget is also a strict objective-call cap.
-                total_budget = max(16, int(args.optimise_budget))
-                remaining = max(1, total_budget - evals[0])
-                r = minimize(
-                    neg_identity, x0, method='Nelder-Mead', bounds=bounds,
-                    options={'maxiter': total_budget, 'maxfev': remaining,
-                             'xatol': 1e-3, 'fatol': 1e-5})
-                xb = _np.clip(r.x, lower, upper)
-                print(f"  Nelder-Mead: {evals[0]} / {total_budget} evaluations")
-
-            best_id, best_blk = identity_of(xb, raw, cand)
-            if best_id < base_id:
-                # A search that ends below its own starting point has found
-                # nothing; say so plainly instead of reporting a "result".
-                print(f"  search ended BELOW the starting point "
-                      f"({best_id:.4f} < {base_id:.4f}) — the landscape is flat "
-                      f"and the optimiser is sampling noise.")
-                print(f"  Keeping the tone-fitted block (run --screen-audio to see "
-                      f"which axes, if any, actually move identity for this voice).")
-                apply_post(raw, cand, opt, xtts, lang, gen_path)
-                raise StopIteration
-            print(f"  optimised identity {best_id:.4f}  ({best_id - base_id:+.4f})")
-
-            # ── Hold-out: does it transfer to a clone of a DIFFERENT sentence? ──
-            HOLD_TEXT = ("Respire lentement et laisse les épaules redescendre, "
-                         "sans forcer.")
-            print(f"\n  Hold-out check on an unseen sentence "
-                  f"(one extra generation)...")
-            raw2 = os.path.join(tmpdir, 'clone_raw_holdout.wav')
-            cand2 = os.path.join(tmpdir, 'cand_holdout.wav')
-            XC.generate(model, HOLD_TEXT, lang, latents, raw2,
+            # ── Generate the clone ONCE (the {} block is frozen, seed included) ───
+            print(f"\n[*] Generating clone (seed {seed})...")
+            XC.generate(model, text, lang, latents, raw,
                         temperature=xtts.get('temp', 0.65),
                         length_penalty=xtts.get('len_pen', 1.0),
                         repetition_penalty=xtts.get('rep_pen', 5.0),
                         top_k=int(xtts.get('top_k', 50)),
                         top_p=xtts.get('top_p', 0.85),
                         num_beams=int(xtts.get('num_beams', 1)),
+                        do_sample=bool(xtts.get('do_sample', 1)),
                         speed=1.0, seed=seed)
-            h_base, _ = identity_of(x0, raw2, cand2)
-            h_best, _ = identity_of(xb, raw2, cand2)
-            print(f"  held-out clone: {h_base:.4f} -> {h_best:.4f} "
-                  f"({h_best - h_base:+.4f})")
+            print("[OK] Clone generated")
 
-            gain_fit = best_id - base_id
-            gain_out = h_best - h_base
-            # Threshold from the MEASURED noise floor, not a constant: a change
-            # worth adopting must clear the measurement noise by a clear margin,
-            # because adopting it discards the tone-fitted block.
-            nz = _measured_noise[0]
-            need = (2.0 * nz) if nz else 0.02
-            if gain_out > need and gain_out > 0.4 * gain_fit:
-                for k, _, _ in AXES:
-                    opt[k] = (round(best_blk[k]) if k in ('vol', 'hp', 'lp')
-                              else round(best_blk[k], 2))
-                _adopted[0] = True
-                print(f"\n  ADOPTED: held-out gain {gain_out:+.4f} clears 2x the "
-                      f"measured noise ({need:.4f}) and transfers.")
-                print(f"  NOTE: this REPLACES the tone-fitted block -- the table "
-                      f"below now describes an identity-optimised block.")
-            else:
-                print(f"\n  REJECTED: held-out gain {gain_out:+.4f} does not clear "
-                      f"2x the measured noise ({need:.4f})"
-                      + (f", or does not transfer (fit {gain_fit:+.4f})."
-                         if gain_out <= 0.4 * gain_fit else "."))
-                print(f"  That is metric hacking -- settings tuned to flatter ECAPA on "
-                      f"one clip, not to make the voice more like the person.")
-                print(f"  Keeping the tone-fitted block.")
+        ref_y, ref_sr  = load_mono(args.reference)
+        if reference_interval is not None:
+            begin,finish=reference_interval
+            ref_y=ref_y[round(begin*ref_sr):min(len(ref_y),round(finish*ref_sr))]
+            if not len(ref_y):
+                raise ValueError('Timestamped reference excerpt is empty')
+        import soundfile as sf
+        render_sr=int(sf.info(raw).samplerate)
+        print(f'[*] EQ response sample rate: {render_sr} Hz; analysis sample rate: {ref_sr} Hz')
+        f_grid, ref_db = L.compute_ltas(ref_y, ref_sr)
+        ref_shape      = ref_db - ref_db.mean()
+
+        # ── Closed-loop EQ/vol fit vs the reference (multi-pass) ──────────────────
+        # Each pass renders the full chain (incl. hp/lp/NR/comp/limiter), measures the
+        # rendered clone's LTAS against the reference, and adds the least-squares EQ
+        # correction. Iterating closes the loop on the post-chain colouring, not just
+        # the raw clone. Converges in 1–3 passes.
+        print(f"\n{'-'*64}\n  Closed-loop EQ/vol fit (LTAS, least squares)\n{'-'*64}")
+        cand = os.path.join(tmpdir, 'cand.wav')
+        def render_tone(block):
+            apply_post(raw,cand,block,xtts,lang,gen_path)
+            return load_mono(cand,target_sr=ref_sr)[0]
+        opt,tone_history=fit_rendered_tone(ref_y,ref_sr,render_sr,audio,render_tone,
+                       iterations=args.iterations,eq_limit=args.eq_limit,weighting=args.eq_weighting,
+                       target_dbfs=args.target_dbfs,convergence=args.conv_threshold)
+
+        # ── Measured fit of de-ess and compression ────────────────────────────────
+        # The tail of the [] block used to stay at zero because nothing measured it.
+        # Sibilance (5-8 kHz vs 300-3 kHz) and crest factor ARE measurable against
+        # the reference, so they get the same treatment as the EQ: propose a value,
+        # render, re-measure, and KEEP IT ONLY IF THE GAP SHRINKS. NR/reverb/gate/pan
+        # stay at zero on purpose (no measurable target; the gate chops speech).
+        if args.fit_dynamics:
+            print(f"\n{'-'*64}\n  Measured de-ess / compression fit\n{'-'*64}")
+            ref_sib, ref_crest = L.sibilance_db(ref_y, ref_sr), L.crest_db(ref_y)
             apply_post(raw, cand, opt, xtts, lang, gen_path)
-        except StopIteration:
-            pass          # search ended below its start; message already printed
-        except Exception as e:
-            print(f"  [!] Audio optimisation unavailable ({e})")
+            cy, _ = load_mono(cand, target_sr=ref_sr)
+            sib_gap = L.sibilance_db(cy, ref_sr) - ref_sib
+            crest_gap = L.crest_db(cy) - ref_crest
+            left_at_zero = []
+            print(f"  reference: sibilance {ref_sib:+.1f} dB   crest {ref_crest:.1f} dB")
+            print(f"  clone gap: sibilance {sib_gap:+.1f} dB   crest {crest_gap:+.1f} dB")
 
-    print(f"  Final []: vol={opt['vol']:+d}  eq_low={opt['eq_low']:+.1f}  "
-          f"eq_mid={opt['eq_mid']:+.1f}  eq_high={opt['eq_high']:+.1f}  "
-          f"hp={opt['hp']:.0f}  lp={opt['lp']:.0f}")
+            for name, gap, thr, scale, cap, what in (
+                    ('de-ess', sib_gap, 1.5, 0.18, 0.5, 'sibilance'),
+                    ('comp', crest_gap, 2.0, 0.12, 0.6, 'dynamics')):
+                if gap <= thr:
+                    if gap < 0:
+                        # Expected for synthetic speech: XTTS output is smoother than
+                        # a real recording. A de-esser/compressor can only REDUCE, so
+                        # a negative gap is not correctable here — 0 is the right value.
+                        print(f"  {name}: clone has LESS {what} than the reference "
+                              f"({gap:+.1f} dB) — a {name} can only reduce it, nothing "
+                              f"to do -> 0")
+                    else:
+                        print(f"  {name}: gap {gap:+.1f} dB within tolerance ({thr}) -> 0")
+                    left_at_zero.append(name)
+                    continue
+                trial = dict(opt)
+                trial[name] = round(min(cap, (gap - thr) * scale), 2)
+                apply_post(raw, cand, trial, xtts, lang, gen_path)
+                ty, _ = load_mono(cand, target_sr=ref_sr)
+                new_gap = ((L.sibilance_db(ty, ref_sr) - ref_sib) if name == 'de-ess'
+                           else (L.crest_db(ty) - ref_crest))
+                if abs(new_gap) < abs(gap) - 0.2:
+                    opt[name] = trial[name]
+                    print(f"  {name} -> {trial[name]}  (gap {gap:+.1f} -> {new_gap:+.1f} dB)")
+                else:
+                    print(f"  {name} {trial[name]} did not help ({gap:+.1f} -> {new_gap:+.1f}) "
+                          f"-> reverted to 0")
 
-    xtts_str, opt_audio_str = format_blocks(1, xtts, opt, lang)
-
-    # GUI hook: this exact prefix updates the Audio [] field in xtts_studio.py
-    print(f"  Next []    : {opt_audio_str}")
-
-    if getattr(args, 'save_preset', False) or getattr(args, 'preset_name', None):
-        try:
-            import voice_presets as VP
-            _sc = {}
-            for _k, _v in (('identity', locals().get('_fit_id')),
-                           ('identity_unseen', locals().get('_unseen_id'))):
-                if _v is not None:
-                    _sc[_k] = _v
-            nm = VP.save(args.preset_name or VP.name_from_reference(args.reference),
-                         xtts_str, opt_audio_str,
-                         reference=args.reference, source='comparator',
-                         scores=_sc or None)
-            print(f"  Preset '{nm}' saved to {os.path.basename(VP.PRESET_DIR)}/")
-        except Exception as e:
-            print(f"  [!] Preset save failed: {e}")
-
-    # ── Render outputs ────────────────────────────────────────────────────────
-    out_clone = args.output or os.path.join(tmpdir, 'clone.wav')
-    out_opt   = args.output_optimised or os.path.join(tmpdir, 'clone_optimised.wav')
-    print(f"\n[*] Rendering base clone (original [])...")
-    apply_post(raw, out_clone, audio, xtts, lang, gen_path)
-    print(f"[*] Rendering optimised clone (fitted [])...")
-    apply_post(raw, out_opt, opt, xtts, lang, gen_path)
-
-    by, _ = load_mono(out_clone, target_sr=ref_sr)
-    _, bd = L.compute_ltas(by, ref_sr)
-    oy, _ = load_mono(out_opt, target_sr=ref_sr)
-    _, od = L.compute_ltas(oy, ref_sr)
-    res_base = float(np.sqrt(np.mean((ref_shape - (bd - bd.mean())) ** 2)))
-    res_opt  = float(np.sqrt(np.mean((ref_shape - (od - od.mean())) ** 2)))
-    print(f"  LTAS residual vs reference: base {res_base:.2f} dB -> optimised {res_opt:.2f} dB")
-
-    # ── Side-by-side diagnostic ──────────────────────────────────────────────
-    # A single residual says how far the clone is, not IN WHAT. This table
-    # shows where the difference actually sits, so a surprising fitted value
-    # can be traced to the measurement that produced it.
-    try:
-        from scipy.signal import welch
-
-        def _hnr(y, sr):
-            """Harmonics-to-noise ratio over voiced frames — the husky/veiled
-            component of a voice. A neural vocoder reconstructs the harmonic
-            structure well and smooths the aperiodic part, so a breathy speaker
-            can lose exactly what makes her recognisable. Returns nan if Praat
-            is unavailable."""
+        # ── Identity-driven post-processing search ────────────────────────────────
+        # Everything above optimises TONE (LTAS residual). This stage asks a
+        # different question, the one that actually matters: can post-processing
+        # raise the ECAPA IDENTITY of the clone? Nobody had ever measured it — the
+        # remaining [] fields stayed at 0 because no criterion ever asked them to
+        # move. Each candidate is rendered and scored; only a gain above the
+        # heuristic tolerance is kept.
+        if args.fit_identity:
+            print(f"\n{'-'*64}\n  Identity-driven post-processing search (ECAPA)\n{'-'*64}")
             try:
-                import parselmouth
-                snd = parselmouth.Sound(np.asarray(y[:sr * 60], dtype='float64'), sr)
-                v = snd.to_harmonicity().values
-                v = v[v > -200]
-                v = v[v > 0.0]
-                return float(np.median(v)) if len(v) else float('nan')
-            except Exception:
-                return float('nan')
+                from speaker_identity import SpeakerEncoder
+                enc = _encoder(args.device)
+                ref_emb = enc.embed(args.reference)
 
-        def _probe(y, sr):
-            f, psd = welch(y, sr, nperseg=1024)
-            tot = float(np.sum(psd)) + 1e-12
-            rms = 20 * np.log10(np.sqrt(np.mean(y ** 2)) + 1e-12)
-            pk = float(np.max(np.abs(y)) + 1e-12)
-            band = lambda lo, hi: float(np.sum(psd[(f >= lo) & (f < hi)]) / tot * 100)
-            return {
-                'RMS (dBFS)': rms,
-                'Centroid (Hz)': float(np.sum(f * psd) / tot),
-                'Crest (dB)': 20 * np.log10(pk) - rms,
-                'Low 0-300 Hz (%)': band(0, 300),
-                'Mid 0.3-3 kHz (%)': band(300, 3000),
-                'High 3-8 kHz (%)': band(3000, 8000),
-                'Sibilance (dB)': L.sibilance_db(y, sr),
-                'HNR (dB)': _hnr(y, sr),
-            }
+                def ident_of(block):
+                    apply_post(raw, cand, block, xtts, lang, gen_path)
+                    return float(enc.cosine(ref_emb, enc.embed(cand))), cand
 
-        ry, _ = load_mono(args.reference, target_sr=ref_sr)
-        pr, pc = _probe(ry, ref_sr), _probe(oy, ref_sr)
-        print(f"\n  {'':<20}{'reference':>11}{'clone':>10}{'delta':>10}")
-        for k in pr:
-            if pr[k] != pr[k] or pc[k] != pc[k]:        # nan: Praat missing
-                continue
-            d = pc[k] - pr[k]
-            flag = ''
-            if k == 'HNR (dB)' and d > 3.0:
-                flag = '   <- clone is SMOOTHER: a husky voice loses its grain here'
-            print(f"  {k:<20}{pr[k]:>11.1f}{pc[k]:>10.1f}{d:>+10.1f}{flag}")
-        _which = ("identity-optimised" if _adopted[0] else "tone-fitted")
-        print(f"  (clone measured after the {_which} [] -- delta is what remains)")
-    except Exception as _e:
-        print(f"  [!] Comparison table unavailable ({_e})")
+                base_id, _ = ident_of(opt)
+                # Noise floor: identity measured on each half of the same clone.
+                # Two halves of one render are the same voice, so their spread is
+                # the measurement variability for this clip.
+                cy_all, csr = load_mono(cand, target_sr=16000)   # ECAPA rate
+                h = len(cy_all) // 2
+                halves = [float(enc.cosine(ref_emb, enc.embed(cy_all[:h], sr=csr))),
+                          float(enc.cosine(ref_emb, enc.embed(cy_all[h:], sr=csr)))]
+                noise = max(0.005, abs(halves[0] - halves[1]) / 2.0)
+                print(f"  baseline (tone-fitted) identity {base_id:.4f}   "
+                      f"heuristic tolerance ±{noise:.4f}")
 
-    # ── Identity on UNSEEN text — the figure that matches real usage ──────────
-    # With --auto-text the fit runs on the reference's OWN words, and identity
-    # measured there is systematically optimistic: the clone repeats sentences
-    # the speaker actually said, with matching prosody. Measured on new text —
-    # i.e. on the meditation you will actually generate — it drops noticeably
-    # (0.80 vs 0.69 on one measured voice). Report both so the number you read
-    # is the one that applies.
-    if not args.no_identity_check:
-        try:
-            from speaker_identity import SpeakerEncoder
-            # ECAPA on CPU here: XTTS already fills a 4 GB card, and this is a
-            # single embedding on a few seconds of audio — about a second of
-            # CPU time, against an OOM that skipped the check entirely.
-            _enc = _encoder('cpu')
-            _ref = _enc.embed(args.reference)
-            _fit_id = float(_enc.cosine(_ref, _enc.embed(out_opt)))
+                trials = [('no post-processing at all',
+                           dict(opt, vol=0, eq_low=0, eq_mid=0, eq_high=0, hp=0, lp=0)),
+                          ('EQ off (keep vol/filters)', dict(opt, eq_low=0, eq_mid=0, eq_high=0)),
+                          ('brighter (eq_high +2)', dict(opt, eq_high=opt['eq_high'] + 2)),
+                          ('darker (eq_high -2)',   dict(opt, eq_high=opt['eq_high'] - 2)),
+                          ('full band (lp 16k)',    dict(opt, lp=16000)),
+                          ('narrow band (lp 8k)',   dict(opt, lp=8000)),
+                          ('NR 0.2',                dict(opt, NR=0.2)),
+                          ('comp 0.3',              dict(opt, comp=0.3)),
+                          ('de-ess 0.3',            {**opt, 'de-ess': 0.3})]
+                results = [('baseline', opt, base_id)]
+                for label, blk in trials:
+                    blk=dict(blk,**{key:float(np.clip(blk.get(key,0),-args.eq_limit,args.eq_limit)) for key in ('eq_low','eq_mid','eq_high')})
+                    try:
+                        v, _ = ident_of(blk)
+                    except Exception as e:
+                        print(f"  {label:26s} failed ({e})"); continue
+                    results.append((label, blk, v))
+                    d = v - base_id
+                    flag = '  <-- above noise' if d > noise else ''
+                    print(f"  {label:26s} identity {v:.4f}  ({d:+.4f}){flag}")
+
+                lbl, blk, best_id = max(results, key=lambda r: r[2])
+                if best_id > base_id + noise:
+                    print(f"\n  ADOPTED '{lbl}': identity {base_id:.4f} -> {best_id:.4f} "
+                          f"(+{best_id - base_id:.4f}, above the {noise:.4f} heuristic tolerance)")
+                    opt = dict(blk)
+                else:
+                    print(f"\n  No post-processing setting raises identity beyond the noise "
+                          f"floor (best {best_id:.4f} vs baseline {base_id:.4f}).")
+                    print(f"  Conclusion for this voice: post-processing shapes TONE, not "
+                          f"IDENTITY — the zero fields are zero because nothing they can do")
+                    print(f"  makes the clone measurably more like the person.")
+                apply_post(raw, cand, opt, xtts, lang, gen_path)   # restore chosen block
+            except Exception as e:
+                print(f"  [!] Identity search unavailable ({e})")
+
+            if left_at_zero and not args.screen_audio:
+                print(f"  ({', '.join(left_at_zero)} left at 0 because the measured gap "
+                      f"points the wrong way for these tools.")
+                print(f"   To find out whether ANY audio parameter can move identity for "
+                      f"this voice, re-run with --screen-audio.)")
+
+        _measured_noise = [None]      # filled by the screening, used by the gate
+        _adopted = [False]            # True when the identity search replaced the block
+
+        # ── Sensitivity screening (which knobs matter at all?) ────────────────────
+        # The Optimetrics reflex: screen BEFORE optimising. One factor at a time
+        # across its full musical range, measuring how much ECAPA identity actually
+        # moves. This answers, per parameter and with numbers, the question the tool
+        # could never answer before: does this knob do anything for THIS voice?
+        if args.screen_audio:
+            print(f"\n{'-'*64}\n  Sensitivity screening (one factor at a time, ECAPA identity)\n{'-'*64}")
             try:
-                import torch as _t
-                _t.cuda.empty_cache()          # the 4 GB card OOMs here otherwise
-            except Exception:
-                pass
-            UNSEEN = ("Installe-toi confortablement et laisse le silence "
-                      "prendre sa place.")
-            _raw2 = os.path.join(tmpdir, 'clone_unseen_raw.wav')
-            _out2 = os.path.join(tmpdir, 'clone_unseen.wav')
-            XC.generate(model, UNSEEN, lang, latents, _raw2,
-                        temperature=xtts.get('temp', 0.65),
-                        length_penalty=xtts.get('len_pen', 1.0),
-                        repetition_penalty=xtts.get('rep_pen', 5.0),
-                        top_k=int(xtts.get('top_k', 50)),
-                        top_p=xtts.get('top_p', 0.85),
-                        num_beams=int(xtts.get('num_beams', 1)),
-                        speed=1.0, seed=seed)
-            apply_post(_raw2, _out2, opt, xtts, lang, gen_path)
-            _unseen_id = float(_enc.cosine(_ref, _enc.embed(_out2)))
-            print(f"  Identity: {_fit_id:.4f} on the fitted sentence, "
-                  f"{_unseen_id:.4f} on UNSEEN text ({_unseen_id - _fit_id:+.4f})")
-            if _fit_id - _unseen_id > 0.05:
-                print(f"  ^ the fitted figure is optimistic; {_unseen_id:.4f} is what "
-                      f"your generated meditation will resemble.")
+                from speaker_identity import SpeakerEncoder
+                enc_s = _encoder(args.device)
+                ref_s = enc_s.embed(args.reference)
+
+                def ident_blk(blk):
+                    _quiet_post(raw, cand, blk, xtts, lang, gen_path)
+                    return float(enc_s.cosine(ref_s, enc_s.embed(cand)))
+
+                base_s = ident_blk(opt)
+                # Noise floor from the two halves of the same render (same voice,
+                # so their spread is the measurement variability for this clip).
+                cy_h, csr_h = load_mono(cand, target_sr=16000)
+                hh = len(cy_h) // 2
+                noise_s = max(0.004, abs(
+                    float(enc_s.cosine(ref_s, enc_s.embed(cy_h[:hh], sr=csr_h))) -
+                    float(enc_s.cosine(ref_s, enc_s.embed(cy_h[hh:], sr=csr_h)))) / 2.0)
+                print(f"  baseline identity {base_s:.4f}   heuristic tolerance +/-{noise_s:.4f}\n")
+                _measured_noise[0] = noise_s      # reused by the transfer gate below
+
+                GRID = [('vol',    [-12, -6, 0, 6, 12]),
+                        ('eq_low', [-6, -3, 0, 3, 6]),
+                        ('eq_mid', [-6, -3, 0, 3, 6]),
+                        ('eq_high',[-6, -3, 0, 3, 6]),
+                        ('hp',     [40, 65, 95, 150]),
+                        ('lp',     [6000, 8000, 11000, 16000]),
+                        ('NR',     [0, 0.15, 0.3, 0.5]),
+                        ('comp',   [0, 0.2, 0.4, 0.6]),
+                        ('de-ess', [0, 0.15, 0.3, 0.5])]
+                rows = []
+                for axis, values in GRID:
+                    ids = []
+                    for v in values:
+                        blk = dict(opt); blk[axis] = v
+                        ids.append((v, ident_blk(blk)))
+                    swing = max(i for _, i in ids) - min(i for _, i in ids)
+                    bestv, besti = max(ids, key=lambda t: t[1])
+                    rows.append((axis, swing, bestv, besti, besti - base_s))
+                rows.sort(key=lambda r: -r[1])
+
+                print(f"  {'axis':>8}{'swing':>9}{'best value':>12}{'identity':>10}{'vs base':>9}")
+                for axis, swing, bestv, besti, delta in rows:
+                    verdict = ('MATTERS' if swing > 3 * noise_s else
+                               'marginal' if swing > noise_s else 'INERT')
+                    print(f"  {axis:>8}{swing:>9.4f}{str(bestv):>12}{besti:>10.4f}"
+                          f"{delta:>+9.4f}   {verdict}")
+                live = [r[0] for r in rows if r[1] > 3 * noise_s]
+                dead = [r[0] for r in rows if r[1] <= noise_s]
+                print(f"\n  Knobs that move identity for this voice: "
+                      f"{', '.join(live) if live else 'NONE'}")
+                if dead:
+                    print(f"  Knobs measurably inert here: {', '.join(dead)}")
+                print(f"  (screening only -- use --optimise-audio to search the live axes "
+                      f"jointly, interactions included)")
+            except Exception as e:
+                print(f"  [!] Screening unavailable ({e})")
+
+        # ── Derivative-free optimisation of the whole audio block ─────────────────
+        # Evaluations here are CHEAP (one clone, then post-processing + one ECAPA
+        # embed each), so unlike the XTTS search we can afford hundreds of them —
+        # which is exactly the regime where derivative-free global optimisers earn
+        # their keep. Least squares does not apply (ECAPA is a non-differentiable
+        # black box, there is no design matrix); bisection does not either (12
+        # interacting axes, non-monotonic). Differential evolution + Nelder-Mead
+        # polish is the method that matches this structure.
+        #
+        # DANGER, handled below: optimising 12 knobs against a neural metric is
+        # metric hacking. Every result is therefore validated on a SECOND clone
+        # generated from a different sentence, and rejected if it does not transfer.
+        if args.optimise_audio != 'none':
+            print(f"\n{'-'*64}\n  Audio-block optimisation ({args.optimise_audio}) — "
+                  f"target: identity\n{'-'*64}")
+            try:
+                import numpy as _np
+                from scipy.optimize import differential_evolution, minimize
+                from speaker_identity import SpeakerEncoder
+                enc = _encoder(args.device)
+                ref_emb = enc.embed(args.reference)
+
+                # Bounds kept musically sane: outside these the result stops being
+                # a listenable voice regardless of what the metric says.
+                AXES = [('vol', -18, 18), ('eq_low', -args.eq_limit, args.eq_limit), ('eq_mid', -args.eq_limit, args.eq_limit),
+                        ('eq_high', -args.eq_limit, args.eq_limit), ('hp', 40, 150), ('lp', 6000, 16000),
+                        ('NR', 0, 0.5), ('comp', 0, 0.6), ('de-ess', 0, 0.5)]
+                bounds = [(lo, hi) for _, lo, hi in AXES]
+                lower = _np.array([lo for _, lo, _ in AXES], dtype=float)
+                upper = _np.array([hi for _, _, hi in AXES], dtype=float)
+
+                # The closed-loop tone fit can legitimately leave an EQ value just
+                # outside the identity optimiser's deliberately conservative bounds
+                # (for example eq_high=+6.4 while the identity search is capped at +6).
+                # SciPy's differential_evolution rejects an out-of-bounds x0, so make
+                # the starting point feasible for BOTH DE and Nelder-Mead.
+                x0_raw = _np.array([float(opt.get(k, 0)) for k, _, _ in AXES], dtype=float)
+                x0 = _np.clip(x0_raw, lower, upper)
+                if not _np.allclose(x0_raw, x0):
+                    clipped = []
+                    for (k, _, _), before, after in zip(AXES, x0_raw, x0):
+                        if abs(float(before) - float(after)) > 1e-12:
+                            clipped.append(f"{k} {before:g}->{after:g}")
+                    print("  optimiser start clipped to bounds: " + ", ".join(clipped))
+
+                evals = [0]
+                def identity_of(x, wav_in, wav_out):
+                    blk = dict(opt)
+                    for (k, _, _), v in zip(AXES, x):
+                        blk[k] = round(float(v)) if k in ('vol', 'hp', 'lp') else float(v)
+                    _quiet_post(wav_in, wav_out, blk, xtts, lang, gen_path)
+                    return float(enc.cosine(ref_emb, enc.embed(wav_out))), blk
+
+                def neg_identity(x):
+                    evals[0] += 1
+                    v, _ = identity_of(x, raw, cand)
+                    return -v
+
+                base_id = -neg_identity(x0)
+                print(f"  start (tone-fitted block): identity {base_id:.4f}")
+
+                if args.optimise_audio == 'de':
+                    # STRICT evaluation budget -------------------------------------------------
+                    # scipy's DE budget is population_size * (maxiter + 1).  With init='sobol'
+                    # the population is rounded UP to the next power of two, which is why the
+                    # old popsize=10/maxiter>=5 configuration silently produced ~768 DE calls
+                    # before the Nelder-Mead polish.  Here --optimise-budget is a REAL cap for
+                    # the complete identity search (baseline + DE + local polish).
+                    total_budget = max(64, int(args.optimise_budget))
+
+                    # A smaller Sobol population is still broad enough for these 9 bounded axes
+                    # while leaving useful room for local polish.  scipy rounds 6*9=54 -> 64.
+                    de_popsize = 6
+                    n_free = sum(1 for lo, hi in bounds if hi > lo)
+                    requested_pop = max(1, de_popsize * n_free)
+                    sobol_pop = 1 << int(_np.ceil(_np.log2(requested_pop)))
+
+                    # Reserve roughly 25% of the budget for Nelder-Mead (up to 120 calls).
+                    # The baseline evaluation above already consumed one call.
+                    reserve_polish = min(120, max(40, total_budget // 4))
+                    de_allowance = max(sobol_pop, total_budget - evals[0] - reserve_polish)
+                    de_generations = max(0, de_allowance // sobol_pop - 1)
+
+                    print(f"  strict optimisation budget: {total_budget} evaluations max "
+                          f"(Sobol population {sobol_pop}, DE generations {de_generations})")
+
+                    # Seed the population with the tone-fitted block. Without it,
+                    # differential evolution may return something WORSE on a flat/noisy
+                    # landscape.  x0 replaces one population member; it does not add a call.
+                    try:
+                        res = differential_evolution(
+                            neg_identity, bounds, maxiter=de_generations,
+                            popsize=de_popsize, tol=1e-4, seed=0, polish=False,
+                            init='sobol', x0=x0)
+                    except TypeError:            # older scipy has no x0=
+                        res = differential_evolution(
+                            neg_identity, bounds, maxiter=de_generations,
+                            popsize=de_popsize, tol=1e-4, seed=0, polish=False,
+                            init='sobol')
+                    xb = _np.clip(res.x, lower, upper)
+                    print(f"  differential evolution: {evals[0]} / {total_budget} evaluations")
+
+                    # Spend ONLY the remaining budget on local polish.  maxfev, unlike
+                    # maxiter, limits objective evaluations directly.
+                    remaining = max(0, total_budget - evals[0])
+                    if remaining >= 10:
+                        r2 = minimize(
+                            neg_identity, xb, method='Nelder-Mead', bounds=bounds,
+                            options={'maxiter': 120, 'maxfev': remaining,
+                                     'xatol': 1e-3, 'fatol': 1e-5})
+                        r2x = _np.clip(r2.x, lower, upper)
+                        if r2.fun < res.fun:
+                            xb = r2x
+                        print(f"  + Nelder-Mead polish: {evals[0]} / {total_budget} total evaluations")
+                    else:
+                        print(f"  + Nelder-Mead polish skipped: only {remaining} evaluations remain")
+                else:
+                    # Local optimiser: --optimise-budget is also a strict objective-call cap.
+                    total_budget = max(16, int(args.optimise_budget))
+                    remaining = max(1, total_budget - evals[0])
+                    r = minimize(
+                        neg_identity, x0, method='Nelder-Mead', bounds=bounds,
+                        options={'maxiter': total_budget, 'maxfev': remaining,
+                                 'xatol': 1e-3, 'fatol': 1e-5})
+                    xb = _np.clip(r.x, lower, upper)
+                    print(f"  Nelder-Mead: {evals[0]} / {total_budget} evaluations")
+
+                best_id, best_blk = identity_of(xb, raw, cand)
+                if best_id < base_id:
+                    # A search that ends below its own starting point has found
+                    # nothing; say so plainly instead of reporting a "result".
+                    print(f"  search ended BELOW the starting point "
+                          f"({best_id:.4f} < {base_id:.4f}) — the landscape is flat "
+                          f"and the optimiser is sampling noise.")
+                    print(f"  Keeping the tone-fitted block (run --screen-audio to see "
+                          f"which axes, if any, actually move identity for this voice).")
+                    apply_post(raw, cand, opt, xtts, lang, gen_path)
+                    raise StopIteration
+                print(f"  optimised identity {best_id:.4f}  ({best_id - base_id:+.4f})")
+
+                # ── Hold-out: does it transfer to a clone of a DIFFERENT sentence? ──
+                HOLD_TEXT = hold_text
+                print(f"\n  Hold-out check on an unseen sentence "
+                      f"(one extra generation)...")
+                raw2 = os.path.join(tmpdir, 'clone_raw_holdout.wav')
+                cand2 = os.path.join(tmpdir, 'cand_holdout.wav')
+                XC.generate(model, HOLD_TEXT, lang, latents, raw2,
+                            temperature=xtts.get('temp', 0.65),
+                            length_penalty=xtts.get('len_pen', 1.0),
+                            repetition_penalty=xtts.get('rep_pen', 5.0),
+                            top_k=int(xtts.get('top_k', 50)),
+                            top_p=xtts.get('top_p', 0.85),
+                            num_beams=int(xtts.get('num_beams', 1)),
+                            do_sample=bool(xtts.get('do_sample', 1)),
+                            speed=1.0, seed=seed)
+                h_base, _ = identity_of(x0, raw2, cand2)
+                h_best, _ = identity_of(xb, raw2, cand2)
+                print(f"  held-out clone: {h_base:.4f} -> {h_best:.4f} "
+                      f"({h_best - h_base:+.4f})")
+
+                gain_fit = best_id - base_id
+                gain_out = h_best - h_base
+                # Threshold from the heuristic tolerance, not a constant: a change
+                # worth adopting must clear the measurement noise by a clear margin,
+                # because adopting it discards the tone-fitted block.
+                nz = _measured_noise[0]
+                need = (2.0 * nz) if nz else 0.02
+                if gain_out > need and gain_out > 0.4 * gain_fit:
+                    for k, _, _ in AXES:
+                        opt[k] = (round(best_blk[k]) if k in ('vol', 'hp', 'lp')
+                                  else round(best_blk[k], 2))
+                    _adopted[0] = True
+                    print(f"\n  ADOPTED: held-out gain {gain_out:+.4f} clears 2x the "
+                          f"measured noise ({need:.4f}) and transfers.")
+                    print(f"  NOTE: this REPLACES the tone-fitted block -- the table "
+                          f"below now describes an identity-optimised block.")
+                else:
+                    print(f"\n  REJECTED: held-out gain {gain_out:+.4f} does not clear "
+                          f"2x the measured noise ({need:.4f})"
+                          + (f", or does not transfer (fit {gain_fit:+.4f})."
+                             if gain_out <= 0.4 * gain_fit else "."))
+                    print(f"  That is metric hacking -- settings tuned to flatter ECAPA on "
+                          f"one clip, not to make the voice more like the person.")
+                    print(f"  Keeping the tone-fitted block.")
+                apply_post(raw, cand, opt, xtts, lang, gen_path)
+            except StopIteration:
+                pass          # search ended below its start; message already printed
+            except Exception as e:
+                print(f"  [!] Audio optimisation unavailable ({e})")
+
+        print(f"  Final []: vol={opt['vol']:+g}  eq_low={opt['eq_low']:+.1f}  "
+              f"eq_mid={opt['eq_mid']:+.1f}  eq_high={opt['eq_high']:+.1f}  "
+              f"hp={opt['hp']:.0f}  lp={opt['lp']:.0f}")
+
+        xtts_str, opt_audio_str = format_blocks(1, xtts, opt, lang)
+
+        # GUI hook: this exact prefix updates the Audio [] field in xtts_studio.py
+        print(f"  Next []    : {opt_audio_str}")
+
+        # ── Render outputs ────────────────────────────────────────────────────────
+        def default_output(suffix):
+            base = os.path.splitext(os.path.basename(args.reference))[0] + suffix
+            path = os.path.abspath(base + '.wav')
+            index = 1
+            while os.path.exists(path):
+                path = os.path.abspath(f'{base}_{index}.wav')
+                index += 1
+            return path
+        out_clone = args.output or default_output('_comparison_base')
+        out_opt = args.output_optimised or default_output('_comparison_optimised')
+        out_raw = args.output_raw or default_output('_comparison_raw')
+        if len({os.path.realpath(path) for path in (out_clone,out_opt,out_raw)})!=3:
+            raise ValueError('Raw, base and optimised outputs must have distinct paths')
+        for path in (out_clone, out_opt, out_raw):
+            if os.path.realpath(path) in {os.path.realpath(r) for r in [args.reference] + refs}:
+                raise ValueError('Comparison output must differ from voice references')
+            if args.raw_clone and os.path.realpath(path) == os.path.realpath(args.raw_clone):
+                raise ValueError('Comparison output must differ from --raw-clone')
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        shutil.copyfile(raw,out_raw)
+        print(f"\n[*] Rendering base clone (original [])...")
+        apply_post(raw, out_clone, audio, xtts, lang, gen_path)
+        print(f"[*] Rendering optimised clone (fitted [])...")
+        apply_post(raw, out_opt, opt, xtts, lang, gen_path)
+
+        by, _ = load_mono(out_clone, target_sr=ref_sr)
+        _, bd = L.compute_ltas(by, ref_sr)
+        oy, _ = load_mono(out_opt, target_sr=ref_sr)
+        _, od = L.compute_ltas(oy, ref_sr)
+        res_base = float(np.sqrt(np.mean((ref_shape - (bd - bd.mean())) ** 2)))
+        res_opt  = float(np.sqrt(np.mean((ref_shape - (od - od.mean())) ** 2)))
+        print(f"  LTAS residual vs reference: base {res_base:.2f} dB -> optimised {res_opt:.2f} dB")
+
+        # ── Side-by-side diagnostic ──────────────────────────────────────────────
+        # A single residual says how far the clone is, not IN WHAT. This table
+        # shows where the difference actually sits, so a surprising fitted value
+        # can be traced to the measurement that produced it.
+        try:
+            from scipy.signal import welch
+
+            def _hnr(y, sr):
+                """Harmonics-to-noise ratio over voiced frames — the husky/veiled
+                component of a voice. A neural vocoder reconstructs the harmonic
+                structure well and smooths the aperiodic part, so a breathy speaker
+                can lose exactly what makes her recognisable. Returns nan if Praat
+                is unavailable."""
+                try:
+                    import parselmouth
+                    snd = parselmouth.Sound(np.asarray(y[:sr * 60], dtype='float64'), sr)
+                    v = snd.to_harmonicity().values
+                    v = v[v > -200]
+                    v = v[v > 0.0]
+                    return float(np.median(v)) if len(v) else float('nan')
+                except Exception:
+                    return float('nan')
+
+            def _probe(y, sr):
+                f, psd = welch(y, sr, nperseg=1024)
+                tot = float(np.sum(psd)) + 1e-12
+                rms = 20 * np.log10(np.sqrt(np.mean(y ** 2)) + 1e-12)
+                pk = float(np.max(np.abs(y)) + 1e-12)
+                band = lambda lo, hi: float(np.sum(psd[(f >= lo) & (f < hi)]) / tot * 100)
+                return {
+                    'RMS (dBFS)': rms,
+                    'Centroid (Hz)': float(np.sum(f * psd) / tot),
+                    'Crest (dB)': 20 * np.log10(pk) - rms,
+                    'Low 0-300 Hz (%)': band(0, 300),
+                    'Mid 0.3-3 kHz (%)': band(300, 3000),
+                    'High 3-8 kHz (%)': band(3000, 8000),
+                    'Sibilance (dB)': L.sibilance_db(y, sr),
+                    'HNR (dB)': _hnr(y, sr),
+                }
+
+            ry, _ = load_mono(args.reference, target_sr=ref_sr)
+            pr, pc = _probe(ry, ref_sr), _probe(oy, ref_sr)
+            print(f"\n  {'':<20}{'reference':>11}{'clone':>10}{'delta':>10}")
+            for k in pr:
+                if pr[k] != pr[k] or pc[k] != pc[k]:        # nan: Praat missing
+                    continue
+                d = pc[k] - pr[k]
+                flag = ''
+                if k == 'HNR (dB)' and d > 3.0:
+                    flag = '   <- clone is SMOOTHER: a husky voice loses its grain here'
+                print(f"  {k:<20}{pr[k]:>11.1f}{pc[k]:>10.1f}{d:>+10.1f}{flag}")
+            _which = ("identity-optimised" if _adopted[0] else "tone-fitted")
+            print(f"  (clone measured after the {_which} [] -- delta is what remains)")
         except Exception as _e:
-            print(f"  [!] Unseen-text identity check skipped ({_e})")
+            print(f"  [!] Comparison table unavailable ({_e})")
 
-    print(f"\n{'='*64}\n  RESULT\n{'='*64}")
-    print(f"  {xtts_str}")
-    print(f"  {opt_audio_str}")
-    print(f"\n  Base clone      : {out_clone}")
-    print(f"  Optimised clone : {out_opt}")
-    print("[OK] Done.")
+        # ── Identity on UNSEEN text — the figure that matches real usage ──────────
+        # With --auto-text the fit runs on the reference's OWN words, and identity
+        # measured there is systematically optimistic: the clone repeats sentences
+        # the speaker actually said, with matching prosody. Measured on new text —
+        # i.e. on the meditation you will actually generate — it drops noticeably
+        # (0.80 vs 0.69 on one measured voice). Report both so the number you read
+        # is the one that applies.
+        _fit_id = _unseen_id = None
+        if not args.no_identity_check:
+            try:
+                from speaker_identity import SpeakerEncoder
+                # ECAPA on CPU here: XTTS already fills a 4 GB card, and this is a
+                # single embedding on a few seconds of audio — about a second of
+                # CPU time, against an OOM that skipped the check entirely.
+                _enc = _encoder('cpu')
+                _ref = _enc.embed(args.reference)
+                _fit_id = float(_enc.cosine(_ref, _enc.embed(out_opt)))
+                try:
+                    import torch as _t
+                    _t.cuda.empty_cache()          # the 4 GB card OOMs here otherwise
+                except Exception:
+                    pass
+                UNSEEN = unseen_sentence(lang, text, hold_text, args.unseen_text)
+                _raw2 = os.path.join(tmpdir, 'clone_unseen_raw.wav')
+                _out2 = os.path.join(tmpdir, 'clone_unseen.wav')
+                XC.generate(model, UNSEEN, lang, latents, _raw2,
+                            temperature=xtts.get('temp', 0.65),
+                            length_penalty=xtts.get('len_pen', 1.0),
+                            repetition_penalty=xtts.get('rep_pen', 5.0),
+                            top_k=int(xtts.get('top_k', 50)),
+                            top_p=xtts.get('top_p', 0.85),
+                            num_beams=int(xtts.get('num_beams', 1)),
+                            do_sample=bool(xtts.get('do_sample', 1)),
+                            speed=1.0, seed=seed)
+                apply_post(_raw2, _out2, opt, xtts, lang, gen_path)
+                _unseen_id = float(_enc.cosine(_ref, _enc.embed(_out2)))
+                print(f"  Identity: {_fit_id:.4f} on the fitted sentence, "
+                      f"{_unseen_id:.4f} on UNSEEN text ({_unseen_id - _fit_id:+.4f})")
+                if _fit_id - _unseen_id > 0.05:
+                    print(f"  ^ the fitted figure is optimistic; {_unseen_id:.4f} is what "
+                          f"your generated meditation will resemble.")
+            except Exception as _e:
+                print(f"  [!] Unseen-text identity check skipped ({_e})")
+
+        # Saved only now, once the identity figures exist. It used to run before
+        # they were computed, so a preset never carried its scores.
+        if getattr(args, 'save_preset', False) or getattr(args, 'preset_name', None):
+            try:
+                import voice_presets as VP
+                _sc = {}
+                for _k, _v in (('identity', _fit_id), ('identity_unseen', _unseen_id)):
+                    if _v is not None:
+                        _sc[_k] = _v
+                nm = VP.save(args.preset_name or VP.name_from_reference(args.reference),
+                             xtts_str, opt_audio_str,
+                             reference=args.reference, source='comparator',
+                             scores=_sc or None, references=refs)
+                print(f"  Preset '{nm}' saved to {os.path.basename(VP.PRESET_DIR)}/")
+            except Exception as e:
+                print(f"  [!] Preset save failed: {e}")
+
+        print(f"\n{'='*64}\n  RESULT\n{'='*64}")
+        print(f"  {xtts_str}")
+        print(f"  {opt_audio_str}")
+        print(f"\n  Base clone      : {out_clone}")
+        print(f"  Optimised clone : {out_opt}")
+        print("[OK] Done.")
 
 
 if __name__ == '__main__':

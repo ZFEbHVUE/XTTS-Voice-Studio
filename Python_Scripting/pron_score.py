@@ -8,15 +8,10 @@ strong foreign accent on French keeps the reference timbre, so ECAPA rates it
 highly. To pick a seed that actually speaks clean French, we need a different,
 text/phonetics-aware signal.
 
-This scorer transcribes each candidate clone with Whisper and derives a
-"native-ness" score from three observable signals:
-  - detected language ≠ target  -> strong accent / wrong phonetics (heavy penalty)
-  - low avg_logprob             -> Whisper is "unsure" — typically mispronunciation
-  - high word error rate vs the known target text -> garbled pronunciation
-
-None of these is a calibrated accent meter, but together they correlate well with
-"sounds like a native speaker of <lang>" and — unlike ECAPA — they move when the
-accent is wrong. Trust your ear for the final call; this just ranks the seeds.
+This scorer measures ASR intelligibility and language consistency using detected
+language, ASR confidence and word error rate. It does not measure native accent
+or speaker likeness. Language detection can be wrong on short clips; use these
+heuristics for screening, then compare longer held-out sentences and listen.
 
 API:
   sc = PronScorer(device='cuda', model='small')
@@ -30,7 +25,8 @@ import numpy as np
 
 
 def _normalise(s):
-    s = s.lower()
+    import unicodedata
+    s = unicodedata.normalize('NFC', s).lower().replace('’', "'").replace('‐', '-')
     s = re.sub(r"[^\w\sàâäçéèêëîïôöùûüÿœæ'-]", ' ', s, flags=re.UNICODE)
     s = re.sub(r'\s+', ' ', s).strip()
     return s.split()
@@ -40,7 +36,7 @@ def word_error_rate(ref_text, hyp_text):
     """Levenshtein word error rate, clipped to [0,1]. 0 = perfect."""
     r = _normalise(ref_text); h = _normalise(hyp_text)
     if not r:
-        return 0.0
+        return 0.0 if not h else 1.0
     # word-level edit distance
     d = np.zeros((len(r) + 1, len(h) + 1), dtype=np.int32)
     d[:, 0] = np.arange(len(r) + 1)
@@ -61,7 +57,7 @@ class PronScorer:
         import torch
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         if compute_type is None:
-            compute_type = 'float16' if self.device == 'cuda' else 'int8'
+            compute_type = 'float16' if self.device.startswith('cuda') else 'int8'
         key = (model, self.device, compute_type)
         if PronScorer._model is None or PronScorer._model_key != key:
             PronScorer._model = WhisperModel(model, device=self.device,
@@ -78,21 +74,25 @@ class PronScorer:
         segs = list(segments)
         detected  = (info.language or '').lower()
         lang_prob = float(getattr(info, 'language_probability', 0.0) or 0.0)
+        lang_prob = float(np.clip(lang_prob, 0, 1)) if np.isfinite(lang_prob) else 0.0
         text = ' '.join(s.text for s in segs).strip()
 
         # Duration-weighted avg_logprob
         if segs:
             durs = np.array([max(s.end - s.start, 1e-3) for s in segs])
             alps = np.array([s.avg_logprob for s in segs])
-            avg_logprob = float(np.sum(alps * durs) / np.sum(durs))
+            valid = np.isfinite(alps) & np.isfinite(durs) & (durs > 0)
+            avg_logprob = float(np.sum(alps[valid] * durs[valid]) / np.sum(durs[valid])) if valid.any() else -2.0
         else:
             avg_logprob = -2.0
 
-        wer = word_error_rate(target_text, text) if target_text else None
+        wer = word_error_rate(target_text, text) if target_text is not None else None
 
-        # ── Combine into [0,1] (higher = cleaner / more native) ──────────────
+        # ── Combine into [0,1] (higher = easier for this ASR model) ──────────────
         lp_norm = float(np.clip((avg_logprob + 1.0) / 0.9, 0.0, 1.0))  # -1.0→0, -0.1→1
-        if detected != lang:
+        if not segs or not text:
+            score = 0.0
+        elif detected != lang:
             # Heard as a different language → wrong phonetics. Cap hard.
             score = 0.10 * lp_norm
         else:

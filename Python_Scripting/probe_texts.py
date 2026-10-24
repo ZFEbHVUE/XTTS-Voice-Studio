@@ -13,8 +13,8 @@ Sentences are phonetically varied, neutral in content, and of comparable
 length across languages so scores stay comparable.
 
 Coverage is deliberately honest: languages below are written to be idiomatic.
-For any other language the caller gets the English set plus an explicit warning
-telling it to pass --text, rather than a silently wrong default.
+Other languages require explicit text; English is never substituted into a
+measurement for another language.
 
 API:
     probe_texts('fr')        -> list of search sentences (first is the default)
@@ -74,12 +74,8 @@ def _resolve(table, lang, what):
     k = _key(lang)
     if k in table:
         return table[k]
-    if k not in _WARNED:
-        _WARNED.add(k)
-        print(f"   [!] No built-in {what} for language '{lang}'. Falling back to "
-              f"English — the accent score will be meaningless.")
-        print(f"   [!] Pass --text with a sentence in '{lang}' for a valid measurement.")
-    return table['en']
+    raise ValueError(f"No built-in {what} for language '{lang}'. "
+                     "Provide text in that language; English fallback would invalidate the measurement.")
 
 
 def probe_texts(lang, n=3):

@@ -36,6 +36,8 @@ except Exception:
     pass
 
 import argparse
+import json
+from xtts_settings import parse_block, format_block, validate
 import os
 import sys
 import tempfile
@@ -56,6 +58,12 @@ DEFAULT_PARAMS = {
     'rep_pen'     : 5.0,
     'len_pen'     : 1.0,
     'gpt_cond_len': 30,
+    'gpt_cond_chunk_len': 4,
+    'sound_norm_refs': 0,
+    'num_beams': 1,
+    'do_sample': 1,
+    'max_ref_len': 30,
+    'trim_start': 0, 'trim_end': 0, 'fade_in': 100, 'fade_out': 250,
     # Audio params
     'speed'       : 1.0,
     'vol'         : 0,
@@ -70,6 +78,7 @@ DEFAULT_PARAMS = {
     'reverb'      : 0,
     'noise_gate'  : 0,
     'pan'         : 0,
+    'limiter'     : 1,
 }
 
 PARAM_ALIASES = {
@@ -79,22 +88,13 @@ PARAM_ALIASES = {
 }
 
 # Audio params — applied post-processing (not passed to XTTS directly)
-AUDIO_PARAMS = {'speed','vol','eq_low','eq_mid','eq_high','hp','lp','NR','comp','de-ess','reverb','noise_gate','pan'}
+AUDIO_PARAMS = {'speed','vol','eq_low','eq_mid','eq_high','hp','lp','NR','comp','de-ess','reverb','noise_gate','pan','limiter'}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def format_xtts_block(p):
-    """Build a 14-value {} block string from a params dict (to paste into the comparator)."""
-    def f(v):
-        v = float(v)
-        return str(int(v)) if v == int(v) else str(round(v, 3))
-    order = [1, p.get('seed', 0), p.get('trim_start', 0), p.get('trim_end', 0),
-             p.get('fade_in', 100), p.get('fade_out', 250), p.get('temp', 0.65),
-             p.get('top_k', 50), p.get('top_p', 0.85), p.get('rep_pen', 5.0),
-             p.get('len_pen', 1.0), p.get('gpt_cond_len', 30),
-             p.get('gpt_cond_chunk_len', 6), p.get('sound_norm_refs', 0)]
-    return '{' + ', '.join(f(v) for v in order) + '}'
+    return format_block(p)
 
 
 def speak_label(tts, speaker_wav, language, label, output_path):
@@ -151,7 +151,7 @@ def main():
                         help='Language code (FR, EN, etc.) — can also be last positional arg')
     parser.add_argument('--device', default=None,
                         help='cuda or cpu (auto-detected if not specified)')
-    parser.add_argument('--gpt-cond-len', type=int, default=30,
+    parser.add_argument('--gpt-cond-len', type=int, default=None,
                         help='GPT conditioning length in seconds (default: 30)')
     parser.add_argument('--xtts-block', default=None,
                         help='XTTS {} block from voice_analyser (e.g. "{1, 42, 0, 200, ...}")')
@@ -171,7 +171,7 @@ def main():
                         help='faster-whisper model for accent scoring (default: small)')
     parser.add_argument('--whisper-device', default='cpu',
                         help="Device for Whisper scoring (default: cpu — frees VRAM)")
-    parser.add_argument('--max-ref-len', type=int, default=30,
+    parser.add_argument('--max-ref-len', type=int, default=None,
                         help='Seconds of reference for the speaker embedding (XTTS default 10)')
     parser.add_argument('--prioritise', default='accent',
                         choices=['accent', 'identity', 'balanced'],
@@ -199,6 +199,8 @@ def main():
             print(f"[ERR] Voice reference not found: {ref}")
             sys.exit(1)
 
+    if not voice_refs:
+        parser.error('At least one voice reference is required')
     speaker_wav = voice_refs if len(voice_refs) > 1 else voice_refs[0]
 
     # Build list of (param_key, [values]) pairs
@@ -206,6 +208,8 @@ def main():
         print("[ERR] At least one --param and --values required.")
         sys.exit(1)
 
+    if len(args.params) != len(args.values_list):
+        parser.error('Each --param requires exactly one --values group')
     param_value_pairs = []
     for p, vals in zip(args.params, args.values_list):
         param_key = PARAM_ALIASES.get(p, p)
@@ -222,45 +226,39 @@ def main():
     if args.xtts_block:
         try:
             import re as _re
-            nums = [float(x) for x in _re.findall(r'[-+]?\d+(?:\.\d+)?', args.xtts_block)]
-            keys_xtts = ['_N','seed','trim_start','trim_end','fade_in','fade_out',
-                         'temp','top_k','top_p','rep_pen','len_pen','gpt_cond_len',
-                         'gpt_cond_chunk_len','sound_norm_refs']
-            for i, k in enumerate(keys_xtts):
-                if i < len(nums) and k != '_N':
-                    base_params[k] = nums[i]
-            print(f"[*] XTTS block parsed: {len(nums)} values")
+            base_params.update(parse_block(args.xtts_block))
+            print('[*] XTTS block parsed')
         except Exception as e:
-            print(f"[!] Could not parse XTTS block: {e}")
+            parser.error(f"Could not parse XTTS block: {e}")
 
     if args.audio_block:
         try:
-            import re as _re
-            # Extract lang
-            lang_match = _re.search(r'\b(FR|EN|ES|DE|IT|PT|PL|TR|RU|NL|CS|AR|HU|KO|JA|HI)\b',
-                                    args.audio_block, _re.IGNORECASE)
-            if lang_match:
-                lang = lang_match.group(1).upper()
-            nums = [float(x) for x in _re.findall(r'[-+]?\d+(?:\.\d+)?', args.audio_block)]
-            keys_audio = ['speed','vol','eq_low','eq_mid','eq_high',
-                          'hp','lp','NR','comp','de-ess','reverb','noise_gate','pan','limiter']
-            # regex finds all numbers — first one is N, skip it
-            all_nums = [float(x) for x in _re.findall(r'[-+]?\d+(?:\.\d+)?', args.audio_block)]
-            numeric_vals = all_nums[1:]  # skip N
-            for i, k in enumerate(keys_audio):
-                if i < len(numeric_vals) and k != 'limiter':
-                    base_params[k] = numeric_vals[i]
-            print(f"[*] Audio block parsed: {len(nums)} values, lang={lang}")
-        except Exception as e:
-            print(f"[!] Could not parse audio block: {e}")
+            from voice_comparator import parse_audio_block
+            parsed_audio = parse_audio_block(args.audio_block)
+            lang = parsed_audio.pop('lang')
+            base_params.update(parsed_audio)
+            print(f"[*] Audio block parsed: lang={lang}")
+        except (ValueError, TypeError) as exc:
+            parser.error(f"Could not parse audio block: {exc}")
+
+    if args.gpt_cond_len is not None:
+        base_params['gpt_cond_len'] = args.gpt_cond_len
+    if args.max_ref_len is not None:
+        base_params['max_ref_len'] = args.max_ref_len
 
     # Resolve _base sentinel and convert values to float
     param_value_pairs = [(pk, [base_params.get(pk, DEFAULT_PARAMS.get(pk, 0))] if vals == ['_base']
-                          else [float(v) for v in vals])
+                          else [None if pk == 'seed' and str(v).lower() == 'none' else float(v) for v in vals])
                          for pk, vals in param_value_pairs]
     param_keys  = [p for p, _ in param_value_pairs]
     import itertools
-    all_combos  = list(itertools.product(*[vals for _, vals in param_value_pairs]))
+    all_combos = list(itertools.product(*[vals for _, vals in param_value_pairs]))
+    try:
+        base_params.update(validate(base_params))
+        for combo in all_combos:
+            validate(dict(base_params, **dict(zip(param_keys, combo))))
+    except ValueError as exc:
+        parser.error(str(exc))
 
     print(f"\n{'='*60}")
     print(f"  XTTS Voice Validator")
@@ -272,7 +270,10 @@ def main():
     print(f"  Combinations: {len(all_combos)}")
     if not args.text:
         from probe_texts import default_text as _dt
-        args.text = _dt(lang)
+        try:
+            args.text = _dt(lang)
+        except ValueError as exc:
+            parser.error(str(exc))
     print(f"  Text       : {args.text}")
     print(f"  Output     : {output_file}")
     print(f"{'='*60}\n")
@@ -295,8 +296,8 @@ def main():
     _lat_cache = {}
     def _latents_for(params):
         key = (int(params.get('gpt_cond_len', args.gpt_cond_len)),
-               int(params.get('gpt_cond_chunk_len', 6)),
-               int(args.max_ref_len),
+               int(params.get('gpt_cond_chunk_len', 4)),
+               int(params.get('max_ref_len', 30)),
                bool(int(params.get('sound_norm_refs', 0))))
         if key not in _lat_cache:
             _lat_cache[key] = XC.compute_latents(
@@ -312,275 +313,272 @@ def main():
                     top_k=int(params.get('top_k', 50)),
                     top_p=float(params.get('top_p', 0.85)),
                     num_beams=int(params.get('num_beams', 1)),
-                    speed=1.0, seed=int(params.get('seed', 0) or 0))
+                    do_sample=bool(params.get('do_sample', 1)),
+                    speed=1.0, seed=params.get('seed'))
 
     silence = AudioSegment.silent(duration=SILENCE_MS)
     label_pause = AudioSegment.silent(duration=LABEL_PAUSE)
     final_audio = AudioSegment.silent(duration=500)  # intro silence
 
-    tmpdir = tempfile.mkdtemp()
-
-    # Import process_audio from generator
-    gen_path = os.path.join(os.path.dirname(__file__), 'guided_meditation_generator_v23.py')
-    _process_audio = None
-    _apply_speed   = None
-    if os.path.exists(gen_path):
-        import importlib.util as _ilu
-        _spec = _ilu.spec_from_file_location('gmg', gen_path)
-        _gmg  = _ilu.module_from_spec(_spec)
-        try:
-            _spec.loader.exec_module(_gmg)
-            _process_audio = getattr(_gmg, 'process_audio', None)
-            _apply_speed   = getattr(_gmg, 'apply_speed_rubberband', None)
-            if _process_audio:
-                print("[*] process_audio imported from generator")
-        except Exception as e:
-            print(f"[!] Could not import generator: {e}")
-
-    def apply_audio(audio, params):
-        """Apply audio post-processing using base_params + current variation."""
-        if _apply_speed:
-            spd = float(params.get('speed', 1.0))
-            if abs(spd - 1.0) > 0.01:
-                audio = _apply_speed(audio, spd)
-        if _process_audio:
-            # Build config and xtts_params dicts as expected by process_audio
-            config = {
-                'speed':          float(params.get('speed', 1.0)),
-                'volume':         int(params.get('vol', 0)),
-                'eq_low':         float(params.get('eq_low', 0)),
-                'eq_mid':         float(params.get('eq_mid', 0)),
-                'eq_high':        float(params.get('eq_high', 0)),
-                'highpass':       float(params.get('hp', 0)),
-                'lowpass':        float(params.get('lp', 0)),
-                'noise_reduction':float(params.get('NR', 0)),
-                'compression':    float(params.get('comp', 0)),
-                'deesser':        float(params.get('de-ess', 0)),
-                'reverb':         float(params.get('reverb', 0)),
-                'noise_gate':     float(params.get('noise_gate', 0)),
-                'pan':            float(params.get('pan', 0)),
-                'language':       lang.lower(),
-            }
-            xtts_p = {
-                'trim_start': int(params.get('trim_start', 0)),
-                'trim_end':   int(params.get('trim_end', 0)),
-                'fade_in':    int(params.get('fade_in', 100)),
-                'fade_out':   int(params.get('fade_out', 250)),
-                'limiter':    1,
-            }
-            audio = _process_audio(audio, config, xtts_p)
-        else:
-            # Fallback — basic volume only
-            vol = int(params.get('vol', 0))
-            if vol != 0:
-                audio = audio + vol
-        return audio
-
-    # For audio-only params: generate base audio once
-    audio_only_params = AUDIO_PARAMS
-    all_audio = all(p in audio_only_params for p in param_keys)
-
-    # Audio-only sweeps ARE scorable: the clone is identical, but post-processing
-    # changes the rendered spectrum, and ECAPA identity is measured on that.
-    # (Accent may also move if heavy processing hurts intelligibility — useful.)
-    do_score = not args.no_score
-    pron = None; enc = None; ref_emb = None; scores = []
-    if do_score:
-        ref0 = voice_refs[0] if isinstance(voice_refs, list) else voice_refs
-        try:
-            from pron_score import PronScorer
-            print(f"[*] Loading faster-whisper '{args.whisper_model}' on {args.whisper_device} (accent)...")
-            pron = PronScorer(device=args.whisper_device, model=args.whisper_model)
-        except Exception as e:
-            print(f"[!] Accent scoring off ({e})")
-        try:
-            from speaker_identity import SpeakerEncoder
-            print("[*] Loading ECAPA-TDNN (identity)...")
-            enc = SpeakerEncoder(device='cpu' if device == 'cuda' else device)
-            ref_emb = enc.embed(ref0)
-        except Exception as e:
-            print(f"[!] Identity scoring off ({e})")
-        if pron is None and enc is None:
-            do_score = False
-
-    if all_audio:
-        print(f"[*] All audio params -- generating base audio once\n")
-        base_wav = os.path.join(tmpdir, 'base.wav')
-        gen_variant(base_params, base_wav)
-        base_audio_raw = AudioSegment.from_wav(base_wav)
-        print(f"[OK] Base audio: {len(base_audio_raw)/1000:.1f}s\n")
-
-    # Blind mode: hearing "N R zero point three" just before a clip biases the
-    # judgement. Randomise the order, drop the spoken labels, and reveal the key
-    # only at the end — so the ear decides before the label does.
-    order = list(range(len(all_combos)))
-    if args.blind:
-        import random as _rnd
-        _rnd.Random(args.blind_seed).shuffle(order)
-        print(f"[*] BLIND mode: {len(order)} variants in random order, no spoken "
-              f"labels. The key is printed at the end.\n")
-    blind_key = []
-    noise_floor = [None]
-
-    for pos, i in enumerate(order):
-        combo = all_combos[i]
-        params = base_params.copy()
-        for pk, pv in zip(param_keys, combo):
-            params[pk] = pv
-
-        combo_str = '  '.join(f"{pk}={pv}" for pk, pv in zip(param_keys, combo))
-        blind_key.append((pos + 1, combo_str))
-        if args.blind:
-            print(f"[{pos+1}/{len(all_combos)}] (hidden)")
-        else:
-            print(f"[{pos+1}/{len(all_combos)}] {combo_str}")
-
-        # Spoken label ("variant N" only in blind mode, so you can still count)
-        if args.blind:
-            label_path = os.path.join(tmpdir, f'label_{i}.wav')
+    with tempfile.TemporaryDirectory(prefix='xtts_work_') as tmpdir:
+        # The generator's own render chain, so a variant sounds exactly as it
+        # will in the final render.
+        gen_path = os.path.join(os.path.dirname(__file__), 'guided_meditation_generator_v23.py')
+        _render_chain = None
+        if os.path.exists(gen_path):
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location('gmg', gen_path)
+            _gmg  = _ilu.module_from_spec(_spec)
             try:
-                speak_label(tts, speaker_wav, lang, f"Variante {pos+1}.", label_path)
-                final_audio = final_audio + AudioSegment.from_wav(label_path) + label_pause
+                _spec.loader.exec_module(_gmg)
+                _render_chain = getattr(_gmg, 'render_voice_chain', None)
+                if _render_chain:
+                    print("[*] Render chain imported from generator")
+                else:
+                    print("[!] The generator has no render_voice_chain: it is older "
+                          "than this validator. Install both files together.")
             except Exception as e:
-                print(f"   [!] Label failed: {e}")
-        elif not args.no_labels:
-            label_text = '  '.join(f"{pk} {pv}" for pk, pv in zip(param_keys, combo)) + '.'
-            label_path = os.path.join(tmpdir, f'label_{i}.wav')
-            try:
-                speak_label(tts, speaker_wav, lang, label_text, label_path)
-                label_audio = AudioSegment.from_wav(label_path)
-                final_audio = final_audio + label_audio + label_pause
-            except Exception as e:
-                print(f"   [!] Label failed: {e}")
+                print(f"[!] Could not import generator: {e}")
 
-        t0 = time.time()
-        try:
-            if all_audio:
-                audio = apply_audio(base_audio_raw, params)
+        if _render_chain is None:
+            raise RuntimeError("Generator audio chain unavailable; validation would not match the final render")
+
+        def apply_audio(audio, params):
+            """Apply audio post-processing using base_params + current variation."""
+            if _render_chain:
+                # Build config and xtts_params dicts as expected by the chain
+                config = {
+                    'speed':          float(params.get('speed', 1.0)),
+                    'volume':         float(params.get('vol', 0)),
+                    'eq_low':         float(params.get('eq_low', 0)),
+                    'eq_mid':         float(params.get('eq_mid', 0)),
+                    'eq_high':        float(params.get('eq_high', 0)),
+                    'highpass':       float(params.get('hp', 0)),
+                    'lowpass':        float(params.get('lp', 0)),
+                    'noise_reduction':float(params.get('NR', 0)),
+                    'compression':    float(params.get('comp', 0)),
+                    'deesser':        float(params.get('de-ess', 0)),
+                    'reverb':         float(params.get('reverb', 0)),
+                    'noise_gate':     float(params.get('noise_gate', 0)),
+                    'pan':            float(params.get('pan', 0)),
+                    # The chain reads the limiter from CONFIG; it was set in
+                    # the xtts dict, where nothing reads it, so it never ran.
+                    'limiter':        int(params.get('limiter', 1)),
+                    'language':       lang.lower(),
+                }
+                xtts_p = {
+                    'trim_start': int(params.get('trim_start', 0)),
+                    'trim_end':   int(params.get('trim_end', 0)),
+                    'fade_in':    int(params.get('fade_in', 100)),
+                    'fade_out':   int(params.get('fade_out', 250)),
+                }
+                # effects -> speed -> volume -> limiter, the generator's order
+                audio = _render_chain(audio, config, xtts_p)
+            return audio
+
+        # For audio-only params: generate base audio once
+        audio_only_params = AUDIO_PARAMS
+        all_audio = all(p in audio_only_params for p in param_keys)
+
+        # Audio-only sweeps ARE scorable: the clone is identical, but post-processing
+        # changes the rendered spectrum, and ECAPA identity is measured on that.
+        # (Accent may also move if heavy processing hurts intelligibility — useful.)
+        do_score = not args.no_score
+        pron = None; enc = None; ref_emb = None; scores = []
+        if do_score:
+            ref0 = voice_refs[0] if isinstance(voice_refs, list) else voice_refs
+            try:
+                from pron_score import PronScorer
+                print(f"[*] Loading faster-whisper '{args.whisper_model}' on {args.whisper_device} (accent)...")
+                pron = PronScorer(device=args.whisper_device, model=args.whisper_model)
+            except Exception as e:
+                print(f"[!] Accent scoring off ({e})")
+            try:
+                from speaker_identity import SpeakerEncoder
+                print("[*] Loading ECAPA-TDNN (identity)...")
+                enc = SpeakerEncoder(device='cpu' if device == 'cuda' else device)
+                ref_emb = enc.embed(ref0)
+            except Exception as e:
+                print(f"[!] Identity scoring off ({e})")
+            if pron is None and enc is None:
+                do_score = False
+
+        if all_audio:
+            print(f"[*] All audio params -- generating base audio once\n")
+            base_wav = os.path.join(tmpdir, 'base.wav')
+            gen_variant(base_params, base_wav)
+            base_audio_raw = AudioSegment.from_wav(base_wav)
+            print(f"[OK] Base audio: {len(base_audio_raw)/1000:.1f}s\n")
+
+        # Blind mode: hearing "N R zero point three" just before a clip biases the
+        # judgement. Randomise the order, drop the spoken labels, and reveal the key
+        # only at the end — so the ear decides before the label does.
+        order = list(range(len(all_combos)))
+        if args.blind:
+            import random as _rnd
+            _rnd.Random(args.blind_seed).shuffle(order)
+            print(f"[*] BLIND mode: {len(order)} variants in random order, no spoken "
+                  f"labels. The key is printed at the end.\n")
+        blind_key = []
+        noise_floor = [None]
+
+        for pos, i in enumerate(order):
+            combo = all_combos[i]
+            params = base_params.copy()
+            for pk, pv in zip(param_keys, combo):
+                params[pk] = pv
+
+            combo_str = '  '.join(f"{pk}={pv}" for pk, pv in zip(param_keys, combo))
+            blind_key.append((pos + 1, combo_str))
+            if args.blind:
+                print(f"[{pos+1}/{len(all_combos)}] (hidden)")
             else:
-                out_path = os.path.join(tmpdir, f'var_{i}.wav')
-                gen_variant(params, out_path)
-                if device == 'cuda':
-                    try: torch.cuda.empty_cache()
-                    except Exception: pass
-                audio = AudioSegment.from_wav(out_path)
-                audio = apply_audio(audio, params)
+                print(f"[{pos+1}/{len(all_combos)}] {combo_str}")
 
-            # Score the audio you will actually HEAR — i.e. AFTER post-processing.
-            # Scoring the raw clone meant the [] parameters could never influence
-            # the ranking, and audio-only sweeps were left unscored entirely.
-            # ECAPA reads the processed spectrum, so EQ/NR/filters DO move identity.
-            if do_score:
-                scored_path = os.path.join(tmpdir, f'scored_{i}.wav')
-                audio.export(scored_path, format='wav')
-                rec = {'combo': list(zip(param_keys, combo)),
-                       'fr': None, 'detected': '', 'wer': None, 'cos': None}
-                if pron is not None:
-                    pr = pron.score(scored_path, lang=lang, target_text=args.text)
-                    rec['fr'] = pr['score']; rec['detected'] = pr['detected']; rec['wer'] = pr['wer']
-                if enc is not None:
-                    rec['cos'] = enc.cosine(ref_emb, enc.embed(scored_path))
-                    # Noise floor, measured once: identity of each half of the
-                    # same render. Same voice, so their spread is this clip's
-                    # measurement variability — the bar a difference must clear
-                    # before it means anything.
-                    if noise_floor[0] is None:
-                        try:
-                            import soundfile as _sf
-                            _y, _sr = _sf.read(scored_path)
-                            if getattr(_y, 'ndim', 1) > 1:
-                                _y = _y.mean(axis=1)
-                            _h = len(_y) // 2
-                            noise_floor[0] = max(0.004, abs(
-                                float(enc.cosine(ref_emb, enc.embed(_y[:_h], sr=_sr))) -
-                                float(enc.cosine(ref_emb, enc.embed(_y[_h:], sr=_sr)))) / 2.0)
-                            print(f"   [noise floor] identity differences below "
-                                  f"±{noise_floor[0]:.4f} are not meaningful")
-                        except Exception:
-                            noise_floor[0] = 0.004
-                scores.append(rec)
-                sc = (f"french={rec['fr']:.3f} " if rec['fr'] is not None else "") + \
-                     (f"identity={rec['cos']:.4f}" if rec['cos'] is not None else "")
-                print(f"   [score] {sc}")
+            # Spoken label ("variant N" only in blind mode, so you can still count)
+            if args.blind:
+                label_path = os.path.join(tmpdir, f'label_{i}.wav')
+                try:
+                    speak_label(tts, speaker_wav, lang, f"Variante {pos+1}.", label_path)
+                    final_audio = final_audio + AudioSegment.from_wav(label_path) + label_pause
+                except Exception as e:
+                    print(f"   [!] Label failed: {e}")
+            elif not args.no_labels:
+                label_text = '  '.join(f"{pk} {pv}" for pk, pv in zip(param_keys, combo)) + '.'
+                label_path = os.path.join(tmpdir, f'label_{i}.wav')
+                try:
+                    speak_label(tts, speaker_wav, lang, label_text, label_path)
+                    label_audio = AudioSegment.from_wav(label_path)
+                    final_audio = final_audio + label_audio + label_pause
+                except Exception as e:
+                    print(f"   [!] Label failed: {e}")
 
-            elapsed = time.time() - t0
-            final_audio = final_audio + audio + silence
-            print(f"   [OK] {len(audio)/1000:.1f}s in {elapsed:.1f}s")
-        except Exception as e:
-            print(f"   [ERR] {e}")
-            import traceback; traceback.print_exc()
+            t0 = time.time()
+            try:
+                if all_audio:
+                    audio = apply_audio(base_audio_raw, params)
+                else:
+                    out_path = os.path.join(tmpdir, f'var_{i}.wav')
+                    gen_variant(params, out_path)
+                    if device == 'cuda':
+                        try: torch.cuda.empty_cache()
+                        except Exception: pass
+                    audio = AudioSegment.from_wav(out_path)
+                    audio = apply_audio(audio, params)
 
-    # ── Ranked scores + winning {} block to paste into the comparator ─────────
-    if scores:
-        def rankkey(r):
-            fr = r['fr'] if r['fr'] is not None else -1.0
-            co = r['cos'] if r['cos'] is not None else -1.0
-            if args.prioritise == 'identity': return (co, fr)
-            if args.prioritise == 'balanced': return (0.6 * fr + 0.4 * ((co + 1) / 2),)
-            return (fr, co)   # accent first
-        ranked = sorted(scores, key=rankkey, reverse=True)
-        print(f"\n{'='*60}\n  RANKING (by {args.prioritise})\n{'='*60}")
-        hdr = '  '.join(f"{k:>10}" for k in param_keys)
-        print(f"  {hdr}{'french':>10}{'wer':>7}{'identity':>11}")
-        nf = noise_floor[0] or 0.004
-        top = ranked[0]
-        n_tied = 0
-        for r in ranked:
-            vals = '  '.join(f"{str(v):>10}" for _, v in r['combo'])
-            fr = f"{r['fr']:.3f}" if r['fr'] is not None else "  -  "
-            we = f"{r['wer']:.2f}" if r['wer'] is not None else "  -  "
-            co = f"{r['cos']:.4f}" if r['cos'] is not None else "   -   "
-            tie = ''
-            if (r is not top and r['cos'] is not None and top['cos'] is not None
-                    and abs(top['cos'] - r['cos']) <= nf):
-                tie = ' ='; n_tied += 1
-            print(f"  {vals}{fr:>10}{we:>7}{co:>11}{tie}")
-        if n_tied:
-            print(f"\n  '=' marks {n_tied} variant(s) whose identity is within the "
-                  f"±{nf:.4f} noise floor of the best —")
-            print(f"  the measurement cannot separate them. THIS is where your ear "
-                  f"decides, not the ranking.")
+                # Score the audio you will actually HEAR — i.e. AFTER post-processing.
+                # Scoring the raw clone meant the [] parameters could never influence
+                # the ranking, and audio-only sweeps were left unscored entirely.
+                # ECAPA reads the processed spectrum, so EQ/NR/filters DO move identity.
+                if do_score:
+                    scored_path = os.path.join(tmpdir, f'scored_{i}.wav')
+                    audio.export(scored_path, format='wav')
+                    rec = {'combo': list(zip(param_keys, combo)),
+                           'fr': None, 'detected': '', 'wer': None, 'cos': None}
+                    if pron is not None:
+                        pr = pron.score(scored_path, lang=lang, target_text=args.text)
+                        rec['fr'] = pr['score']; rec['detected'] = pr['detected']; rec['wer'] = pr['wer']
+                    if enc is not None:
+                        rec['cos'] = enc.cosine(ref_emb, enc.embed(scored_path))
+                        # Noise floor, measured once: identity of each half of the
+                        # same render. Same voice, so their spread is this clip's
+                        # measurement variability — the bar a difference must clear
+                        # before it means anything.
+                        if noise_floor[0] is None:
+                            try:
+                                import soundfile as _sf
+                                _y, _sr = _sf.read(scored_path)
+                                if getattr(_y, 'ndim', 1) > 1:
+                                    _y = _y.mean(axis=1)
+                                _h = len(_y) // 2
+                                noise_floor[0] = max(0.004, abs(
+                                    float(enc.cosine(ref_emb, enc.embed(_y[:_h], sr=_sr))) -
+                                    float(enc.cosine(ref_emb, enc.embed(_y[_h:], sr=_sr)))) / 2.0)
+                                print(f"   [heuristic tolerance] ±{noise_floor[0]:.4f} "
+                                      "(split-half anchor, not statistical uncertainty)")
+                            except Exception:
+                                noise_floor[0] = 0.004
+                    scores.append(rec)
+                    sc = (f"ASR={rec['fr']:.3f} " if rec['fr'] is not None else "") + \
+                         (f"identity={rec['cos']:.4f}" if rec['cos'] is not None else "")
+                    print(f"   [score] {sc}")
 
-        winner = base_params.copy()
-        for k, v in ranked[0]['combo']:
-            winner[k] = v
-        print(f"\n  Best {args.prioritise}: " +
-              '  '.join(f"{k}={v}" for k, v in ranked[0]['combo']))
-        swept_audio = [k for k in param_keys if k in AUDIO_PARAMS]
-        if swept_audio:
-            # Audio params live in the [] block, not the {} one.
-            a = dict(base_params)
+                elapsed = time.time() - t0
+                final_audio = final_audio + audio + silence
+                print(f"   [OK] {len(audio)/1000:.1f}s in {elapsed:.1f}s")
+            except Exception as e:
+                print(f"   [ERR] {e}")
+                import traceback; traceback.print_exc()
+
+        # ── Ranked scores + winning {} block to paste into the comparator ─────────
+        if scores:
+            def rankkey(r):
+                fr = r['fr'] if r['fr'] is not None else -1.0
+                co = r['cos'] if r['cos'] is not None else -1.0
+                if args.prioritise == 'identity': return (co, fr)
+                if args.prioritise == 'balanced': return (0.6 * fr + 0.4 * ((co + 1) / 2),)
+                return (fr, co)   # accent first
+            ranked = sorted(scores, key=rankkey, reverse=True)
+            print(f"\n{'='*60}\n  RANKING (by {args.prioritise})\n{'='*60}")
+            hdr = '  '.join(f"{k:>10}" for k in param_keys)
+            print(f"  {hdr}{'ASR':>10}{'wer':>7}{'identity':>11}")
+            nf = noise_floor[0] or 0.004
+            top = ranked[0]
+            n_tied = 0
+            for r in ranked:
+                vals = '  '.join(f"{str(v):>10}" for _, v in r['combo'])
+                fr = f"{r['fr']:.3f}" if r['fr'] is not None else "  -  "
+                we = f"{r['wer']:.2f}" if r['wer'] is not None else "  -  "
+                co = f"{r['cos']:.4f}" if r['cos'] is not None else "   -   "
+                tie = ''
+                if (r is not top and r['cos'] is not None and top['cos'] is not None
+                        and abs(top['cos'] - r['cos']) <= nf):
+                    tie = ' ='; n_tied += 1
+                print(f"  {vals}{fr:>10}{we:>7}{co:>11}{tie}")
+            if n_tied:
+                print(f"\n  '=' marks {n_tied} variant(s) whose identity is within the "
+                      f"±{nf:.4f} heuristic tolerance of the best —")
+                print(f"  this tolerance is not a significance test. Your ear "
+                      f"decides, not the ranking.")
+
+            print('XTTS_REFS_JSON: ' + json.dumps([os.path.abspath(r) for r in voice_refs]))
+            winner = base_params.copy()
             for k, v in ranked[0]['combo']:
-                if k in AUDIO_PARAMS:
-                    a[k] = v
-            order = ['speed', 'vol', 'eq_low', 'eq_mid', 'eq_high', 'hp', 'lp',
-                     'NR', 'comp', 'de-ess', 'reverb', 'noise_gate', 'pan', 'limiter']
-            def _f(x):
-                x = float(x)
-                return str(int(x)) if abs(x - round(x)) < 1e-9 else f"{x:g}"
-            vals = ', '.join(_f(a.get(k, 1 if k in ('speed', 'limiter') else 0))
-                             for k in order)
-            print(f"  Paste into the generator / comparator (audio block):")
-            print(f"  [1, {lang}, {vals}]")
-        if any(k not in AUDIO_PARAMS for k in param_keys):
-            print(f"  Paste into the comparator (frozen seed/temp/...):")
-            print(f"  {format_xtts_block(winner)}")
+                winner[k] = v
+            print(f"\n  Best {args.prioritise}: " +
+                  '  '.join(f"{k}={v}" for k, v in ranked[0]['combo']))
+            swept_audio = [k for k in param_keys if k in AUDIO_PARAMS]
+            if swept_audio:
+                # Audio params live in the [] block, not the {} one.
+                a = dict(base_params)
+                for k, v in ranked[0]['combo']:
+                    if k in AUDIO_PARAMS:
+                        a[k] = v
+                order = ['speed', 'vol', 'eq_low', 'eq_mid', 'eq_high', 'hp', 'lp',
+                         'NR', 'comp', 'de-ess', 'reverb', 'noise_gate', 'pan', 'limiter']
+                def _f(x):
+                    x = float(x)
+                    return str(int(x)) if abs(x - round(x)) < 1e-9 else f"{x:g}"
+                vals = ', '.join(_f(a.get(k, 1 if k in ('speed', 'limiter') else 0))
+                                 for k in order)
+                print(f"  Paste into the generator / comparator (audio block):")
+                print(f"  [1, {lang}, {vals}]")
+            if any(k not in AUDIO_PARAMS for k in param_keys):
+                print(f"  Paste into the comparator (frozen seed/temp/...):")
+                print(f"  {format_xtts_block(winner)}")
 
-    if args.blind and blind_key:
-        print(f"\n{'='*60}\n  BLIND KEY (read AFTER listening)\n{'='*60}")
-        for n, desc in blind_key:
-            print(f"  Variante {n}: {desc}")
+        if args.blind and blind_key:
+            print(f"\n{'='*60}\n  BLIND KEY (read AFTER listening)\n{'='*60}")
+            for n, desc in blind_key:
+                print(f"  Variante {n}: {desc}")
 
-    # Save
-    print(f"\n[*] Saving {output_file}...")
-    final_audio.export(output_file, format='wav')
-    duration = len(final_audio) / 1000
-    print(f"[OK] Done -- {duration:.1f}s total ({len(all_combos)} combinations)")
-    print(f"[*] Output: {os.path.abspath(output_file)}")
+        # Save
+        print(f"\n[*] Saving {output_file}...")
+        final_audio.export(output_file, format='wav')
+        duration = len(final_audio) / 1000
+        print(f"[OK] Done -- {duration:.1f}s total ({len(all_combos)} combinations)")
+        print(f"[*] Output: {os.path.abspath(output_file)}")
 
-    # Cleanup
-    import shutil
-    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == '__main__':

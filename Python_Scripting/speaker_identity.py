@@ -7,7 +7,7 @@ Wraps SpeechBrain's `spkrec-ecapa-voxceleb` speaker-verification encoder. The
 cosine similarity between two utterances' embeddings is the standard metric for
 "is this the same speaker" — independent of what was said. Used by the
 comparator to (a) pick the best XTTS seed and (b) report a meaningful identity
-score (0 = unrelated, 1 = identical speaker).
+cosine score (not a calibrated probability or identity verdict).
 
 The model loads once and is cached. First call downloads ~80 MB from HuggingFace.
 
@@ -19,6 +19,9 @@ API:
 """
 
 import numpy as np
+import os
+import tempfile
+from audio_checks import mono_audio
 
 _TARGET_SR = 16000   # ECAPA-TDNN was trained at 16 kHz
 
@@ -32,6 +35,9 @@ def _load_audio(path, target_sr=_TARGET_SR):
 
 
 def _resample(y, sr, target_sr):
+    y = mono_audio(y, sr)
+    if not isinstance(target_sr, int) or target_sr <= 0:
+        raise ValueError("target_sr must be a positive integer")
     if sr == target_sr:
         return y.astype(np.float32)
     from math import gcd
@@ -41,7 +47,7 @@ def _resample(y, sr, target_sr):
 
 
 class SpeakerEncoder:
-    _model = None
+    _models = {}
 
     def __init__(self, device=None, savedir=None):
         import torch
@@ -52,10 +58,11 @@ class SpeakerEncoder:
         if device == 'cuda':
             device = 'cuda:0'
         self.device = device
-        self.savedir = savedir or '/tmp/ecapa_spkrec'
-        if SpeakerEncoder._model is None:
-            SpeakerEncoder._model = self._build()
-        self.model = SpeakerEncoder._model
+        self.savedir = os.path.abspath(os.path.expanduser(savedir or os.path.join(tempfile.gettempdir(), 'ecapa_spkrec')))
+        key = (str(device), self.savedir)
+        if key not in SpeakerEncoder._models:
+            SpeakerEncoder._models[key] = self._build()
+        self.model = SpeakerEncoder._models[key]
 
     def _build(self):
         # Import path moved across SpeechBrain versions — try newest first.
@@ -79,17 +86,20 @@ class SpeakerEncoder:
 
     def embed(self, audio, sr=None):
         """Return an L2-normalised ECAPA embedding for a path or float array."""
-        if isinstance(audio, str):
+        if isinstance(audio, (str, os.PathLike)):
             y, _ = _load_audio(audio)
         else:
             y = np.asarray(audio, dtype=np.float32)
+            y = mono_audio(y, sr).astype(np.float32)
             if sr is not None and sr != _TARGET_SR:
                 y = _resample(y, sr, _TARGET_SR)
         sig = self.torch.from_numpy(y).unsqueeze(0).to(self.device)
         with self.torch.no_grad():
             emb = self.model.encode_batch(sig).squeeze().detach().cpu().numpy()
         emb = emb.astype(np.float64)
-        n = np.linalg.norm(emb) + 1e-12
+        if not np.isfinite(emb).all() or np.linalg.norm(emb) <= 1e-12:
+            raise ValueError("Encoder produced an invalid embedding")
+        n = np.linalg.norm(emb)
         return emb / n
 
     def similarity(self, ref, clone):
@@ -98,24 +108,24 @@ class SpeakerEncoder:
     @staticmethod
     def cosine(a, b):
         a = np.asarray(a, float); b = np.asarray(b, float)
-        return float(np.dot(a, b) /
-                     ((np.linalg.norm(a) + 1e-12) * (np.linalg.norm(b) + 1e-12)))
+        if (a.ndim != 1 or a.shape != b.shape or not a.size
+                or not np.isfinite(a).all() or not np.isfinite(b).all()
+                or min(np.linalg.norm(a), np.linalg.norm(b)) <= 1e-12):
+            raise ValueError("Cosine requires two finite nonzero vectors of the same size")
+        return float(np.clip(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)), -1., 1.))
 
 
     def self_ceiling(self, reference):
-        """Estimate the SAME-SPEAKER ceiling for this reference: split it in two
-        halves and score them against each other. Both halves are the same
-        person, same mic, same session — so this cosine is the practical upper
-        bound for that recording, and it makes identity scores interpretable
-        (0.847 out of a 0.93 ceiling = 91 % of what is reachable).
+        """Descriptive split-half reference anchor, not an upper bound or accuracy.
 
-        The generic '>0.80 = same speaker' threshold comes from VoxCeleb EER on
-        REAL recordings; applied to synthetic speech it is not calibrated, so
-        this per-reference anchor is the honest reading."""
-        y, _ = _load_audio(reference) if isinstance(reference, str) else (reference, None)
-        y = np.asarray(y, dtype=np.float32)
+        The historical method name is retained for compatibility. Session,
+        phonetic content and noise can change this value in either direction.
+        Arrays are assumed to be 16 kHz, as in embed().
+        """
+        y, _ = _load_audio(reference) if isinstance(reference, (str, os.PathLike)) else (reference, None)
+        y = mono_audio(y, _TARGET_SR, allow_silence=True).astype(np.float32)
         h = len(y) // 2
-        if h < _TARGET_SR:            # under 1 s per half: meaningless
+        if h < _TARGET_SR or min(np.sqrt(np.mean(y[:h] ** 2)), np.sqrt(np.mean(y[h:] ** 2))) < 1e-5:            # under 1 s per half: meaningless
             return None
         return self.cosine(self.embed(y[:h], sr=_TARGET_SR),
                            self.embed(y[h:], sr=_TARGET_SR))
@@ -134,12 +144,8 @@ if __name__ == '__main__':
     _ref = _enc.embed(_sys.argv[1])
     print(f"  reference: {_sys.argv[1]}")
     _ceil = _enc.self_ceiling(_sys.argv[1])
-    if _ceil:
-        print(f"  same-speaker ceiling for this recording: {_ceil:.4f}  "
-              f"(reference split in two halves — the practical maximum)")
+    if _ceil is not None:
+        print(f"  reference split-half cosine: {_ceil:.4f} (descriptive anchor)")
     for _cand in _sys.argv[2:]:
         _c = _enc.cosine(_ref, _enc.embed(_cand))
-        _verdict = ("same speaker" if _c > 0.80 else
-                    "close" if _c > 0.60 else "different")
-        _rel = f"  [{100.0 * _c / _ceil:.0f}% of ceiling]" if _ceil else ""
-        print(f"  identity {_c:.4f}  ({_verdict}){_rel}  {_cand}")
+        print(f"  identity cosine {_c:.4f}  {_cand}")

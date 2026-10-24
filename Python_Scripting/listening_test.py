@@ -35,6 +35,8 @@ from math import comb
 
 def sign_test_p(k, n):
     """Two-sided exact binomial p-value under H0: p = 0.5 (no preference)."""
+    if not isinstance(n, int) or not isinstance(k, int) or n < 0 or not 0 <= k <= n:
+        raise ValueError("Require integer counts 0 <= k <= n")
     if n == 0:
         return 1.0
     k = max(k, n - k)                      # count of the more-preferred option
@@ -50,7 +52,7 @@ def find_player(explicit=None):
 
 
 def play(player, path):
-    if player == 'ffplay':
+    if os.path.basename(player).lower() in ('ffplay', 'ffplay.exe'):
         cmd = [player, '-nodisp', '-autoexit', '-loglevel', 'quiet', path]
     else:
         cmd = [player, path]
@@ -72,6 +74,10 @@ def main():
                         'overall quality when no reference is given)')
     args = p.parse_args()
 
+    if args.trials <= 0:
+        p.error("trials must be positive")
+    if os.path.realpath(args.file_a) == os.path.realpath(args.file_b):
+        p.error("Choose two different candidate files")
     for f in (args.file_a, args.file_b, args.reference):
         if f and not os.path.exists(f):
             sys.exit(f"[ERR] Not found: {f}")
@@ -122,11 +128,13 @@ def main():
         print("  No trials scored."); return
     pv = sign_test_p(ka, done)
     winner = args.file_a if ka > kb else args.file_b
-    print(f"  two-sided sign test: p = {pv:.3f}")
+    print(f"  two-sided sign test (independent votes assumed): p = {pv:.3f}")
+    print("  Repeated listening by one person to one pair is not independent evidence")
+    print("  across speakers or listeners. This p-value is descriptive for this session.")
     if ka == kb:
         print("  VERDICT: perfect tie — no audible preference.")
     elif pv < 0.05:
-        print(f"  VERDICT: {os.path.basename(winner)} is preferred, significant (p<0.05).")
+        print(f"  VERDICT: {os.path.basename(winner)} is preferred in this session (nominal p<0.05).")
     else:
         print(f"  VERDICT: {os.path.basename(winner)} leads but NOT conclusive at this "
               f"sample size.")

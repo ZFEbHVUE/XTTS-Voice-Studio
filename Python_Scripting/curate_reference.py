@@ -11,7 +11,8 @@ embedding over the whole reference, so those segments dilute the identity.
 This tool windows the reference, embeds each window with ECAPA-TDNN, computes a
 robust centroid (trimmed to reject outliers), scores each window by cosine to that
 centroid, and concatenates the most coherent windows (up to a target duration)
-into a curated reference WAV. Feed that to the Validator / Comparator / Generator.
+into a curated reference WAV. Coherence is not a noise/music/second-speaker
+detector: review the selected audio by ear. Feed it to the Validator / Comparator.
 
 Usage:
   python curate_reference.py ref1.wav [ref2.wav ...] -o curated.wav \\
@@ -21,6 +22,7 @@ Usage:
 import os
 import argparse
 import numpy as np
+from audio_checks import mono_audio
 
 SR16 = 16000
 
@@ -30,10 +32,13 @@ def _load_mono(path):
     y, sr = sf.read(path, always_2d=False)
     if y.ndim > 1:
         y = y.mean(axis=1)
-    return y.astype(np.float32), sr
+    return mono_audio(y, sr).astype(np.float32), sr
 
 
 def _resample(y, sr, target):
+    y = mono_audio(y, sr)
+    if not isinstance(target, (int, np.integer)) or target <= 0:
+        raise ValueError("Target sample rate must be a positive integer")
     if sr == target:
         return y.astype(np.float32)
     from math import gcd
@@ -43,24 +48,38 @@ def _resample(y, sr, target):
 
 
 def _voiced_fraction(seg16, thr_ratio=0.06):
-    """Fraction of frames above an energy gate (cheap voiced-activity estimate)."""
+    """Energy-active frames; this gate cannot distinguish speech from noise/music."""
     fl = 512
     if len(seg16) < fl:
         return 0.0
     n = len(seg16) // fl
     frames = seg16[:n * fl].reshape(n, fl)
-    rms = np.sqrt((frames ** 2).mean(axis=1) + 1e-12)
-    gate = rms.max() * thr_ratio
+    if not np.isfinite(frames).all():
+        return 0.0
+    rms = np.sqrt((frames.astype(np.float64) ** 2).mean(axis=1))
+    gate = max(float(rms.max()) * thr_ratio, 1e-5)
     return float((rms > gate).mean())
 
 
 def curate(refs, out_path, keep_seconds=45.0, window=4.0, hop=2.0,
            min_score='auto', device=None, verbose=True):
-    from speaker_identity import SpeakerEncoder
-    enc = SpeakerEncoder(device=device)
+    if not refs:
+        raise ValueError("At least one reference is required")
+    for name, value in (("keep_seconds", keep_seconds), ("window", window), ("hop", hop)):
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if hop > window:
+        raise ValueError("hop must be <= window to avoid unexamined gaps")
+    if min_score != 'auto' and (not np.isfinite(float(min_score)) or not -1 <= float(min_score) <= 1):
+        raise ValueError("min_score must be auto or a cosine in [-1, 1]")
+    for path in refs:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        if os.path.realpath(path) == os.path.realpath(out_path):
+            raise ValueError("Output must differ from every reference")
 
     # Concatenate all references (original sr from the first file)
-    sigs, sr0 = [], None
+    sigs, sr0, boundaries, offset = [], None, [], 0
     for r in refs:
         y, sr = _load_mono(r)
         if sr0 is None:
@@ -68,23 +87,33 @@ def curate(refs, out_path, keep_seconds=45.0, window=4.0, hop=2.0,
         elif sr != sr0:
             y = _resample(y, sr, sr0); sr = sr0
         sigs.append(y)
+        boundaries.append((offset, offset + len(y)))
+        offset += len(y)
     orig = np.concatenate(sigs)
     sig16 = _resample(orig, sr0, SR16)
 
     win_o, hop_o = int(window * sr0), int(hop * sr0)
     win_16       = int(window * SR16)
+    if min(win_o, hop_o, win_16) < 1:
+        raise ValueError("Window and hop must cover at least one sample")
+    from speaker_identity import SpeakerEncoder
+    enc = SpeakerEncoder(device=device)
 
     # ── Window + embed ────────────────────────────────────────────────────────
     wins = []   # (start_orig, end_orig, emb, voiced)
-    pos = 0
-    while pos + win_o <= len(orig):
-        s16 = int(pos / sr0 * SR16)
-        seg16 = sig16[s16:s16 + win_16]
-        vf = _voiced_fraction(seg16)
-        if vf >= 0.5:
-            emb = enc.embed(seg16, sr=SR16)
-            wins.append([pos, pos + win_o, emb, vf])
-        pos += hop_o
+    for begin, end in boundaries:
+        if end - begin < win_o:
+            continue
+        starts = list(range(begin, end - win_o + 1, hop_o))
+        if starts[-1] != end - win_o:
+            starts.append(end - win_o)
+        for pos in starts:
+            s16 = round(pos / sr0 * SR16)
+            seg16 = sig16[s16:s16 + win_16]
+            vf = _voiced_fraction(seg16)
+            if vf >= 0.5:
+                emb = enc.embed(seg16, sr=SR16)
+                wins.append([pos, pos + win_o, emb, vf])
 
     if len(wins) < 2:
         raise RuntimeError("Not enough voiced material to curate "
@@ -125,6 +154,12 @@ def curate(refs, out_path, keep_seconds=45.0, window=4.0, hop=2.0,
                 out.append([s, e])
         return out
 
+    # Segments are joined with a 10 ms crossfade, which overlaps them by xf
+    # samples: the selection has to count that loss. It used to stop as soon as
+    # the segments ADDED UP to keep_seconds, and windows on a 2 s grid often add
+    # up exactly, so an even Keep s came out short by 10 ms per join (29.95 s
+    # for 30): the analyser then started gpt_cond_len at 29 instead of 30.
+    xf = int(0.01 * sr0)
     chosen, unions, total = [], [], 0.0
     for idx in order:
         if cos[idx] < thr:
@@ -135,17 +170,13 @@ def curate(refs, out_path, keep_seconds=45.0, window=4.0, hop=2.0,
             continue                          # fully covered already — no new audio
         chosen.append(idx)
         unions = _merge(unions + [[s, e]])
-        total = sum(ue - us for us, ue in unions) / sr0
+        total = (sum(ue - us for us, ue in unions) - xf * (len(unions) - 1)) / sr0
         if total >= keep_seconds:
             break
-    if not chosen:                            # safety: keep the single best
-        idx = int(order[0])
-        chosen = [idx]
-        unions = [[wins[idx][0], wins[idx][1]]]
-        total = (wins[idx][1] - wins[idx][0]) / sr0
+    if not chosen:
+        raise RuntimeError("No window meets min_score; lower the threshold or check the references")
 
     # ── Concatenate merged segments with short crossfades ─────────────────────
-    xf = int(0.01 * sr0)                       # 10 ms
     out = np.zeros(0, dtype=np.float32)
     for k, (s, e) in enumerate(unions):
         seg = orig[s:e].copy()
@@ -155,7 +186,12 @@ def curate(refs, out_path, keep_seconds=45.0, window=4.0, hop=2.0,
             seg = seg[xf:]
         out = np.concatenate([out, seg])
 
+    out = out[:max(1, int(keep_seconds * sr0))]
+    if not out.size:
+        raise RuntimeError("Curation selected no audio")
+    total = len(out) / sr0
     import soundfile as sf
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     sf.write(out_path, out, sr0)
 
     if verbose:
@@ -186,7 +222,7 @@ def main():
     p.add_argument('--window', type=float, default=4.0, help='Window seconds (default: 4)')
     p.add_argument('--hop', type=float, default=2.0, help='Hop seconds (default: 2)')
     p.add_argument('--min-score', default='auto',
-                   help="Coherence threshold: 'auto' (median−MAD) or a float in [0,1]")
+                   help="Coherence threshold: 'auto' (median−MAD) or a float in [-1,1]")
     p.add_argument('--device', default=None, help='cpu or cuda (default: auto)')
     args = p.parse_args()
 

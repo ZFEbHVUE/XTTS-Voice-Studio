@@ -26,7 +26,7 @@ import subprocess
 
 def find_applio_python(applio_dir):
     """Locate the python of Applio's own environment."""
-    for rel in ('.venv/bin/python', 'env/bin/python', '.venv/Scripts/python.exe'):
+    for rel in ('.venv/bin/python', 'env/bin/python', '.venv/Scripts/python.exe', 'env/Scripts/python.exe'):
         p = os.path.join(applio_dir, rel)
         if os.path.exists(p):
             return p
@@ -50,7 +50,15 @@ def main():
     p.add_argument('--f0-method', default='rmvpe')
     args = p.parse_args()
 
-    applio = os.path.expanduser(args.applio_dir)
+    import math
+    if not math.isfinite(args.index_rate) or not 0 <= args.index_rate <= 1:
+        p.error("index-rate must be in [0, 1]")
+    if not math.isfinite(args.protect) or not 0 <= args.protect <= 0.5:
+        p.error("protect must be in [0, 0.5]")
+    for name in ('input', 'model', 'index', 'applio_dir'):
+        setattr(args, name, os.path.abspath(os.path.expanduser(getattr(args, name))))
+    args.output = os.path.abspath(os.path.expanduser(args.output)) if args.output else None
+    applio = args.applio_dir
     core = os.path.join(applio, 'core.py')
     if not os.path.exists(core):
         sys.exit(f"[ERR] Applio not found at {applio} (no core.py). "
@@ -64,6 +72,11 @@ def main():
             sys.exit(f"[ERR] {tag} not found: {f}")
 
     out = args.output or (os.path.splitext(args.input)[0] + '_rvc.wav')
+    if os.path.realpath(out) in {os.path.realpath(x) for x in (args.input, args.model, args.index)}:
+        p.error("Output must differ from input, model and index")
+    if os.path.exists(out):
+        p.error("Output already exists; choose a new filename")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
     cmd = [py, core, 'infer',
            '--pitch', str(args.pitch),
            '--index_rate', str(args.index_rate),

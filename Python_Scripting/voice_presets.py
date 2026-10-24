@@ -27,6 +27,7 @@ import os
 import re
 import glob
 import datetime
+import json
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 PRESET_DIR = os.path.join(os.path.dirname(_HERE), 'Voice_Presets')
@@ -77,6 +78,14 @@ def read_file(path):
         m = re.search(rf'^\s*#\s*{key}\s*:\s*(.+)$', raw, re.M)
         if m:
             e[field] = m.group(1).strip()
+    refs = re.search(r'^\s*#\s*Clone references\s*:\s*(.+)$', raw, re.M)
+    if refs:
+        try:
+            value = json.loads(refs.group(1))
+            if isinstance(value, list) and all(isinstance(r, str) for r in value):
+                e['references'] = value
+        except ValueError:
+            pass
     if 'source' in e and '|' in e['source']:
         src, _, date = e['source'].partition('|')
         e['source'], e['date'] = src.strip(), date.strip()
@@ -102,7 +111,7 @@ def get(name):
 
 
 def save(name, xtts, audio, reference=None, source='tool', scores=None,
-         note=None, acoustics=None, overwrite=True):
+         note=None, acoustics=None, overwrite=True, references=None):
     """Write one preset file. Returns the name actually used."""
     if not name or not xtts or not audio:
         raise ValueError("name, xtts and audio are all required")
@@ -118,6 +127,8 @@ def save(name, xtts, audio, reference=None, source='tool', scores=None,
              f"# Source    : {source}  |  {when}"]
     if reference:
         lines.append(f"# Reference : {reference}")
+    if references:
+        lines.append('# Clone references: ' + json.dumps([os.path.abspath(r) for r in references], ensure_ascii=False))
     if acoustics:
         # One line, not the full diagnostic dump: what this VOICE is, so that
         # opening a preset months later identifies the speaker at a glance

@@ -8,7 +8,7 @@ ceiling) trains best on 10+ minutes of clean, single-speaker utterances of a
 few seconds each. This tool bridges from your raw reference to that format:
 
   1. ECAPA coherence selection (same engine as curate_reference, but keeping
-     MINUTES instead of ~45 s): drops noise, breaths, off-voice regions.
+     MINUTES instead of ~45 s): ranks speaker coherence; does not detect all noise or additional speakers.
   2. Splits the kept audio into utterances on silences (3–10 s each).
   3. Resamples to the RVC training rate (default 40 kHz) mono, light peak
      normalisation, writes dataset/NNN.wav + a summary.
@@ -22,19 +22,23 @@ Then point Applio's training at the output folder (see docs/RVC_GUIDE.md).
 
 import os
 import argparse
+import json
+import tempfile
+from audio_checks import mono_audio
 import numpy as np
 
 def _resample(y, sr, target):
-    if sr == target:
-        return y.astype(np.float32)
-    from math import gcd
-    from scipy.signal import resample_poly
-    g = gcd(int(sr), int(target))
-    return resample_poly(y, target // g, sr // g).astype(np.float32)
+    from curate_reference import _resample as resample
+    return resample(mono_audio(y, sr), sr, target)
 
 
 def split_utterances(y, sr, min_utt=3.0, max_utt=10.0, top_db=35):
     """Split on silences into utterances between min_utt and max_utt seconds."""
+    y = mono_audio(y, sr)
+    if not (np.isfinite(min_utt) and np.isfinite(max_utt) and 0 < min_utt <= max_utt):
+        raise ValueError("Require 0 < min_utt <= max_utt")
+    if not np.isfinite(top_db) or top_db <= 0:
+        raise ValueError("top_db must be finite and positive")
     import librosa
     intervals = librosa.effects.split(y, top_db=top_db)
     # Merge short gaps, then pack into 3–10 s utterances
@@ -62,7 +66,7 @@ def split_utterances(y, sr, min_utt=3.0, max_utt=10.0, top_db=35):
             n = int(np.ceil(dur / max_utt))
             step = (e - s) // n
             for k in range(n):
-                a, b = s + k * step, min(e, s + (k + 1) * step)
+                a, b = s + k * step, (e if k == n - 1 else s + (k + 1) * step)
                 if (b - a) / sr >= min_utt:
                     out.append((a, b))
     return out
@@ -86,6 +90,18 @@ def main():
     p.add_argument('--device', default=None)
     args = p.parse_args()
 
+    if not (np.isfinite(args.keep_minutes) and args.keep_minutes > 0 and args.sr > 0
+            and np.isfinite(args.min_utt) and np.isfinite(args.max_utt)
+            and 0 < args.min_utt <= args.max_utt and np.isfinite(args.top_db) and args.top_db > 0):
+        p.error("Positive durations/rate/threshold required; min-utt must not exceed max-utt")
+    args.refs = [os.path.abspath(os.path.expanduser(r)) for r in args.refs]
+    args.out_dir = os.path.abspath(os.path.expanduser(args.out_dir))
+    for ref in args.refs:
+        if not os.path.isfile(ref):
+            p.error(f"Reference not found: {ref}")
+    # A fresh destination prevents old numbered clips contaminating a new run.
+    if os.path.exists(args.out_dir) and os.listdir(args.out_dir):
+        p.error("Output directory must be empty; choose a new folder to preserve existing files")
     import soundfile as sf
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -109,14 +125,16 @@ def main():
         print(f"[*] Curation skipped — {len(clean)/sr0/60:.1f} min raw")
     else:
         from curate_reference import curate
-        tmp = os.path.join(args.out_dir, '_curated_long.wav')
-        curate(args.refs, tmp, keep_seconds=args.keep_minutes * 60.0,
-               device=args.device)
-        clean, sr0 = sf.read(tmp)
+        with tempfile.TemporaryDirectory(prefix='rvc_curate_') as td:
+            tmp = os.path.join(td, 'curated.wav')
+            curate(args.refs, tmp, keep_seconds=args.keep_minutes * 60.0,
+                   device=args.device)
+            clean, sr0 = sf.read(tmp)
         if clean.ndim > 1:
             clean = clean.mean(axis=1)
         clean = clean.astype(np.float32)
 
+    clean = mono_audio(clean, sr0).astype(np.float32)
     kept_min = len(clean) / sr0 / 60
     if kept_min < 5:
         print(f"[!] Only {kept_min:.1f} min of coherent audio — RVC will underfit.")
@@ -128,6 +146,7 @@ def main():
         raise SystemExit("[ERR] No utterances found — lower --top-db or --min-utt.")
 
     total = 0.0
+    clips = []
     for k, (s, e) in enumerate(utts, 1):
         seg = clean[s:e]
         seg = _resample(seg, sr0, args.sr)
@@ -136,7 +155,14 @@ def main():
             seg = seg * (0.95 / peak)       # light peak safety only — no processing
         sf.write(os.path.join(args.out_dir, f"{k:04d}.wav"), seg, args.sr)
         total += len(seg) / args.sr
+        clips.append(dict(file=f"{k:04d}.wav", start_sample=int(s), end_sample=int(e),
+                          duration=len(seg) / args.sr))
 
+    with open(os.path.join(args.out_dir, 'dataset_manifest.json'), 'w', encoding='utf-8') as manifest:
+        json.dump(dict(references=args.refs, curated=not args.no_curate,
+                       timeline_sample_rate=int(sr0), output_sample_rate=args.sr,
+                       timeline="concatenated raw audio" if args.no_curate else "curated audio",
+                       clips=clips), manifest, ensure_ascii=False, indent=2)
     print(f"\n[OK] Dataset: {len(utts)} utterances, {total/60:.1f} min "
           f"@ {args.sr} Hz mono -> {args.out_dir}/")
     print("     Next: train in Applio on this folder (see docs/RVC_GUIDE.md).")

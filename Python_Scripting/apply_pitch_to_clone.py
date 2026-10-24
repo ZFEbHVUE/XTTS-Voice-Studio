@@ -1,429 +1,181 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Apply [p:+N] word pitch marks to an existing clone using Whisper/Rubberband.
+
+Corrections belong to token occurrences, including repeated words. Exact ordered
+ASR matches are required; unmatched marks are reported and skipped. Pitch-only
+edits preserve the input duration and use Rubberband formant preservation.
+
+Dependencies: pydub, openai-whisper, rubberband-cli.
 """
-Apply pitch corrections to an existing cloned voice WAV file.
-Uses annotated .txt (with [p:±N] tags) + Whisper timestamps + rubberband.
-
-Usage:
-  python apply_pitch_to_clone.py clone.wav annotated.txt output.wav [options]
-
-Options:
-  --global-shift N   Apply a global pitch shift of N semitones first (default: 0)
-                     Use this to match the original's median pitch.
-                     Example: --global-shift +4
-  --lang LANG        Language for Whisper (default: fr)
-  --model MODEL      Whisper model: tiny/base/small/medium (default: small)
-  --no-per-word      Skip per-word pitch, only apply global shift
-
-Examples:
-  # Global shift only
-  python apply_pitch_to_clone.py clone.wav script.txt output.wav --global-shift +4
-
-  # Global shift + per-word pitch
-  python apply_pitch_to_clone.py clone.wav script.txt output.wav --global-shift +4 --lang fr
-
-  # Per-word only (no global shift)
-  python apply_pitch_to_clone.py clone.wav script.txt output.wav
-
-Dependencies:
-  pip install pydub openai-whisper
-  apt install rubberband-cli
-"""
-
-import sys
+import argparse
+import math
 import os
 import re
 import subprocess
 import tempfile
-import argparse
-import time
+from text_alignment import words, ordered_matches
 
-try:
-    from pydub import AudioSegment
-except ImportError:
-    sys.exit("❌  pydub missing → pip install pydub")
-
-try:
-    import whisper
-except ImportError:
-    sys.exit("❌  whisper missing → pip install openai-whisper")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pitch tag parsing
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_pitch_tags(text):
-    """
-    Extract per-word pitch annotations from text.
-    Returns (clean_text, pitch_map)
-      clean_text : text without [p:N] tags
-      pitch_map  : {word: semitones}  — only words with semitones != 0
-    """
-    pitch_map = {}
-    RE_WORD_TAG = re.compile(r'(\S+?)\[p:([+-]?\d+)\]')
-    RE_TAG      = re.compile(r'\[p:[+-]?\d+\]')
-
-    for m in RE_WORD_TAG.finditer(text):
-        word_raw  = m.group(1)
-        semitones = int(m.group(2))
-        key = re.sub(r'[.,!?;:]+$', '', word_raw)
-        if key and semitones != 0:
-            pitch_map[key] = semitones
-
-    clean = RE_TAG.sub('', text).strip()
-    return clean, pitch_map
+    """Return clean text and ordered records (word positions, word, semitones)."""
+    clean_parts, corrections, offset = [], [], 0
+    for raw in text.split():
+        tags = re.findall(r'\[p:([+-]?\d+)\]', raw)
+        clean = re.sub(r'\[p:[+-]?\d+\]', '', raw)
+        pieces = words(clean)
+        if len(tags) > 1:
+            raise ValueError(f"Multiple pitch tags on one token: {raw}")
+        if tags and pieces and int(tags[0]):
+            shift = int(tags[0])
+            if abs(shift) > 24:
+                raise ValueError("Per-word pitch must be in [-24, 24] semitones")
+            corrections.append(dict(start=offset, end=offset + len(pieces),
+                                    word=clean, semitones=shift))
+        clean_parts.append(clean)
+        offset += len(pieces)
+    return ' '.join(clean_parts).strip(), corrections
 
 
 def load_annotated_txt(txt_file):
-    """
-    Read annotated .txt and return list of (clean_sentence, pitch_map).
-    Ignores [pause=...], {XTTS params}, [audio params], # comments.
-    """
     sentences = []
-    with open(txt_file, encoding='utf-8') as f:
-        for line in f:
+    with open(txt_file, encoding='utf-8-sig') as handle:
+        for line in handle:
             line = line.strip()
-            if not line:
+            if not line or line.startswith(('#', '{', '[pause', '[music', '[ambiance')):
                 continue
-            if line.startswith('#'):
+            if line.startswith('[') and ',' in line and '[p:' not in line:
                 continue
-            if line.startswith('[pause') or line.startswith('[music') or \
-               line.startswith('[ambiance') or line.startswith('{') or \
-               (line.startswith('[') and ',' in line and not '[p:' in line):
-                continue
-            # Remove inline [pause=...] from text lines
-            line = re.sub(r'\[pause=[^\]]+\]', '', line).strip()
-            if not line:
-                continue
-            clean, pitch_map = parse_pitch_tags(line)
-            clean = clean.strip()
-            if clean:
-                sentences.append((clean, pitch_map))
+            line = re.sub(r'\[pause=[^\]]+\]', ' ', line)
+            clean, corrections = parse_pitch_tags(line)
+            if words(clean):
+                sentences.append((clean, corrections))
     return sentences
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Rubberband helpers
-# ─────────────────────────────────────────────────────────────────────────────
+def combine_annotations(sentences):
+    texts, corrections, offset = [], [], 0
+    for text, marks in sentences:
+        texts.append(text)
+        corrections.extend(dict(mark, start=mark['start'] + offset,
+                                end=mark['end'] + offset) for mark in marks)
+        offset += len(words(text))
+    return ' '.join(texts), corrections
 
-def rubberband_pitch(audio_segment, semitones, tmp_dir='/tmp'):
-    """Apply pitch shift of N semitones using rubberband."""
-    if semitones == 0:
+
+def aligned_corrections(sentence_text, corrections, result, duration_ms):
+    observed, timings = [], []
+    for segment in result.get('segments', []):
+        for word in segment.get('words', []):
+            start, end = float(word['start']), float(word['end'])
+            if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end):
+                continue
+            for part in words(word.get('word', '')):
+                observed.append(part)
+                timings.append((max(0, round(start * 1000)), min(duration_ms, round(end * 1000))))
+    mapping = ordered_matches(words(sentence_text), observed)
+    edits, previous_end = [], 0
+    for mark in corrections:
+        indices = list(range(mark['start'], mark['end']))
+        if not indices or not all(i in mapping for i in indices):
+            print(f"[!] Unmatched pitch mark skipped: {mark['word']}")
+            continue
+        found = [mapping[i] for i in indices]
+        if found != list(range(found[0], found[-1] + 1)):
+            continue
+        begin, end = timings[found[0]][0], timings[found[-1]][1]
+        if begin < previous_end or end <= begin:
+            print(f"[!] Overlapping/invalid pitch interval skipped: {mark['word']}")
+            continue
+        edits.append((begin, end, mark['semitones'], mark['word']))
+        previous_end = end
+    return edits
+
+
+def rubberband_pitch(audio_segment, semitones, tmp_dir=None):
+    from pydub import AudioSegment
+    if not math.isfinite(semitones) or abs(semitones) > 24:
+        raise ValueError("Pitch must be finite and in [-24, 24] semitones")
+    if semitones == 0 or not len(audio_segment):
         return audio_segment
-
-    tmp_in  = os.path.join(tmp_dir, 'rb_pitch_in.wav')
-    tmp_out = os.path.join(tmp_dir, 'rb_pitch_out.wav')
-
-    audio_segment.export(tmp_in, format='wav')
-    result = subprocess.run(
-        ['rubberband', '--pitch', str(semitones), '-c', '1', tmp_in, tmp_out],
-        capture_output=True
-    )
-    if result.returncode != 0:
-        print(f"  ⚠️  rubberband error: {result.stderr.decode()[:200]}")
-        return audio_segment
-
-    shifted = AudioSegment.from_wav(tmp_out)
-    for f in (tmp_in, tmp_out):
-        if os.path.exists(f): os.remove(f)
-    return shifted
+    with tempfile.TemporaryDirectory(prefix='xtts_pitch_', dir=tmp_dir) as work:
+        source, target = os.path.join(work, 'in.wav'), os.path.join(work, 'out.wav')
+        audio_segment.export(source, format='wav')
+        subprocess.run(['rubberband', '--pitch', str(semitones), '--formant',
+                        '-c', '1', source, target], check=True, capture_output=True)
+        shifted = AudioSegment.from_wav(target).set_frame_rate(audio_segment.frame_rate)
+        shifted = shifted.set_channels(audio_segment.channels).set_sample_width(audio_segment.sample_width)
+        # Exact frame count prevents later word timestamps drifting after each edit.
+        wanted = len(audio_segment.raw_data)
+        raw = shifted.raw_data[:wanted].ljust(wanted, b'\0')
+        return audio_segment._spawn(raw)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-word pitch via Whisper timestamps
-# ─────────────────────────────────────────────────────────────────────────────
+def _apply_edits(audio, edits, tmp_dir):
+    count = 0
+    for start, end, shift, word in reversed(edits):
+        segment = audio[start:end]
+        shifted = rubberband_pitch(segment, shift, tmp_dir)
+        # Splice raw frames at the same sample boundaries, without ms rounding.
+        first = int(audio.frame_count(ms=start)) * audio.frame_width
+        last = first + len(segment.raw_data)
+        audio = audio._spawn(audio.raw_data[:first] + shifted.raw_data + audio.raw_data[last:])
+        print(f"  {word}: {shift:+d} semitones ({start}-{end} ms)")
+        count += 1
+    return audio, count
+
 
 def apply_pitch_per_word(audio_segment, pitch_map, sentence_text,
-                          whisper_model, language='fr', tmp_dir='/tmp'):
-    """
-    Apply per-word pitch using Whisper timestamps on the audio segment.
-    """
+                         whisper_model, language='fr', tmp_dir=None):
     if not pitch_map:
         return audio_segment, 0
-
-    tmp_in = os.path.join(tmp_dir, 'pw_in.wav')
-    audio_segment.export(tmp_in, format='wav')
-
-    result = whisper_model.transcribe(
-        tmp_in,
-        word_timestamps=True,
-        language=language,
-        verbose=False
-    )
-
-    # Build word → (start_ms, end_ms) map
-    word_times = {}
-    for seg in result['segments']:
-        for w in seg.get('words', []):
-            raw = w['word'].strip()
-            # Fuse apostrophe/hyphen fragments
-            key = re.sub(r'[.,!?;:]+$', '', raw).lower()
-            if key:
-                word_times[key] = (
-                    int(w['start'] * 1000),
-                    int(w['end']   * 1000)
-                )
-
-    n_applied = 0
-    tmp_seg_in  = os.path.join(tmp_dir, 'seg_in.wav')
-    tmp_seg_out = os.path.join(tmp_dir, 'seg_out.wav')
-
-    for word, semitones in pitch_map.items():
-        if semitones == 0:
-            continue
-        key = re.sub(r'[.,!?;:]+$', '', word).lower()
-        if key not in word_times:
-            # Try partial match
-            matches = [k for k in word_times if k in key or key in k]
-            if matches:
-                key = matches[0]
-            else:
-                continue
-
-        t_start_ms, t_end_ms = word_times[key]
-        if t_end_ms <= t_start_ms:
-            continue
-
-        seg_audio = audio_segment[t_start_ms:t_end_ms]
-        seg_audio.export(tmp_seg_in, format='wav')
-
-        rb = subprocess.run(
-            ['rubberband', '--pitch', str(semitones), '-c', '1',
-             tmp_seg_in, tmp_seg_out],
-            capture_output=True
-        )
-        if rb.returncode != 0:
-            continue
-
-        seg_pitched = AudioSegment.from_wav(tmp_seg_out)
-        audio_segment = (
-            audio_segment[:t_start_ms] +
-            seg_pitched +
-            audio_segment[t_end_ms:]
-        )
-        n_applied += 1
-        print(f"      🎵  {word}: {semitones:+d}st")
-
-        for f in (tmp_seg_in, tmp_seg_out):
-            if os.path.exists(f): os.remove(f)
-
-    if os.path.exists(tmp_in): os.remove(tmp_in)
-    return audio_segment, n_applied
+    with tempfile.TemporaryDirectory(prefix='xtts_align_', dir=tmp_dir) as work:
+        source = os.path.join(work, 'audio.wav')
+        audio_segment.export(source, format='wav')
+        result = whisper_model.transcribe(source, word_timestamps=True,
+                                          language=language, verbose=False)
+        edits = aligned_corrections(sentence_text, pitch_map, result, len(audio_segment))
+        return _apply_edits(audio_segment, edits, work)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sentence alignment via Whisper on full file
-# ─────────────────────────────────────────────────────────────────────────────
-
-def align_sentences_to_audio(audio, sentences, whisper_model, language, tmp_dir):
-    """
-    Use Whisper on full audio to find approximate start/end of each sentence.
-    Returns list of (start_ms, end_ms, sentence_idx).
-    Simple approach: match Whisper segments to sentence list by order.
-    """
-    print("  🔄  Aligning sentences to audio with Whisper...")
-    tmp_full = os.path.join(tmp_dir, 'full_align.wav')
-    audio.export(tmp_full, format='wav')
-
-    result = whisper_model.transcribe(
-        tmp_full,
-        word_timestamps=True,
-        language=language,
-        verbose=False
-    )
-
-    if os.path.exists(tmp_full): os.remove(tmp_full)
-
-    # Group words into segments approximating our sentences
-    segments = result['segments']
-    alignments = []
-
-    # Simple mapping: one Whisper segment ≈ one sentence
-    for i, (clean, _) in enumerate(sentences):
-        if i < len(segments):
-            seg = segments[i]
-            start_ms = int(seg['start'] * 1000)
-            end_ms   = int(seg['end']   * 1000)
-            alignments.append((start_ms, end_ms, i))
-
-    return alignments
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main processing
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process(clone_wav, txt_file, output_wav,
-            global_shift=0, language='fr',
+def process(clone_wav, txt_file, output_wav, global_shift=0, language='fr',
             whisper_model_name='small', per_word=True):
-
-    t0 = time.time()
-    print(f"\n🎵  Pitch correction pipeline")
-    print(f"   Clone    : {os.path.basename(clone_wav)}")
-    print(f"   Script   : {os.path.basename(txt_file)}")
-    print(f"   Output   : {os.path.basename(output_wav)}")
-    print(f"   Global   : {global_shift:+d} semitones")
-    print(f"   Per-word : {'enabled (Whisper ' + whisper_model_name + ')' if per_word else 'disabled'}")
-
-    # Load audio
-    print("\n📂  Loading audio...")
+    from pydub import AudioSegment
+    if os.path.realpath(clone_wav) == os.path.realpath(output_wav):
+        raise ValueError("Output must differ from source")
     audio = AudioSegment.from_file(clone_wav)
-    dur   = len(audio) / 1000
-    print(f"   Duration : {dur:.1f}s  SR:{audio.frame_rate}Hz  Ch:{audio.channels}")
+    if not len(audio):
+        raise ValueError("Input audio is empty")
+    with tempfile.TemporaryDirectory(prefix='xtts_pitch_run_') as work:
+        audio = rubberband_pitch(audio, global_shift, work)
+        if per_word:
+            text, corrections = combine_annotations(load_annotated_txt(txt_file))
+            if corrections:
+                import whisper
+                model = whisper.load_model(whisper_model_name, device='cpu')
+                audio, count = apply_pitch_per_word(audio, corrections, text, model, language, work)
+                print(f"Applied {count}/{len(corrections)} occurrence-specific pitch marks")
+        os.makedirs(os.path.dirname(os.path.abspath(output_wav)), exist_ok=True)
+        audio.export(output_wav, format='wav')
+    print(f"[OK] {output_wav}")
 
-    tmp_dir = tempfile.mkdtemp()
-
-    # ── Step 1: Global pitch shift ─────────────────────────────────────────
-    if global_shift != 0:
-        print(f"\n🎚️  Applying global pitch shift: {global_shift:+d} semitones...")
-        t = time.time()
-        audio = rubberband_pitch(audio, global_shift, tmp_dir)
-        print(f"   ⏱️  Done in {time.time()-t:.1f}s")
-
-    # ── Step 2: Per-word pitch ─────────────────────────────────────────────
-    if per_word:
-        print(f"\n📝  Loading annotated script...")
-        sentences = load_annotated_txt(txt_file)
-        has_pitch = [(c, p) for c, p in sentences if p]
-        print(f"   {len(sentences)} sentences  —  {len(has_pitch)} with pitch annotations")
-
-        if has_pitch:
-            print(f"\n🔬  Loading Whisper '{whisper_model_name}'...")
-            t = time.time()
-            wmodel = whisper.load_model(whisper_model_name, device="cpu")
-            print(f"   ⏱️  Loaded in {time.time()-t:.1f}s")
-
-            print(f"\n🎵  Applying per-word pitch (full audio + Whisper alignment)...")
-            t = time.time()
-
-            # Transcribe full audio to get word timestamps
-            tmp_full = os.path.join(tmp_dir, 'full.wav')
-            audio.export(tmp_full, format='wav')
-            result = wmodel.transcribe(
-                tmp_full,
-                word_timestamps=True,
-                language=language,
-                verbose=False
-            )
-            if os.path.exists(tmp_full): os.remove(tmp_full)
-            print(f"   ⏱️  Whisper done in {time.time()-t:.1f}s")
-
-            # Build global word→time map
-            word_times = {}
-            for seg in result['segments']:
-                for w in seg.get('words', []):
-                    raw = w['word'].strip()
-                    key = re.sub(r'[.,!?;:]+$', '', raw).lower()
-                    if key:
-                        word_times[key] = (
-                            int(w['start'] * 1000),
-                            int(w['end']   * 1000)
-                        )
-
-            # Collect all pitch corrections
-            all_corrections = {}
-            for clean, pitch_map in sentences:
-                for word, semitones in pitch_map.items():
-                    if semitones != 0:
-                        key = re.sub(r'[.,!?;:]+$', '', word).lower()
-                        all_corrections[key] = semitones
-
-            # Apply all corrections
-            print(f"   Applying {len(all_corrections)} unique word corrections...")
-            tmp_seg_in  = os.path.join(tmp_dir, 'seg_in.wav')
-            tmp_seg_out = os.path.join(tmp_dir, 'seg_out.wav')
-            n_applied = 0
-
-            for key, semitones in sorted(all_corrections.items(),
-                                          key=lambda x: word_times.get(
-                                              re.sub(r'[.,!?;:]+$','',x[0]).lower(),
-                                              (0,0))[0]):
-                if key not in word_times:
-                    matches = [k for k in word_times if k in key or key in k]
-                    if matches:
-                        key = matches[0]
-                    else:
-                        continue
-
-                t_start_ms, t_end_ms = word_times[key]
-                if t_end_ms <= t_start_ms or t_end_ms > len(audio):
-                    continue
-
-                seg_audio = audio[t_start_ms:t_end_ms]
-                seg_audio.export(tmp_seg_in, format='wav')
-
-                rb = subprocess.run(
-                    ['rubberband', '--pitch', str(semitones), '-c', '1',
-                     tmp_seg_in, tmp_seg_out],
-                    capture_output=True
-                )
-                if rb.returncode != 0:
-                    continue
-
-                seg_pitched = AudioSegment.from_wav(tmp_seg_out)
-                audio = (
-                    audio[:t_start_ms] +
-                    seg_pitched +
-                    audio[t_end_ms:]
-                )
-                n_applied += 1
-
-                for f in (tmp_seg_in, tmp_seg_out):
-                    if os.path.exists(f): os.remove(f)
-
-            print(f"   ✅  {n_applied} word corrections applied")
-
-    # ── Save ──────────────────────────────────────────────────────────────
-    print(f"\n💾  Saving → {output_wav}")
-    audio.export(output_wav, format='wav')
-    print(f"   ⏱️  Total time: {time.time()-t0:.1f}s")
-    print(f"✅  Done")
-
-    # Cleanup
-    import shutil
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Apply pitch corrections to a cloned voice WAV file.',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
-    )
-    parser.add_argument('clone_wav',   help='Input clone WAV file')
-    parser.add_argument('txt_file',    help='Annotated .txt with [p:±N] tags')
-    parser.add_argument('output_wav',  help='Output WAV file')
-    parser.add_argument('--global-shift', type=int, default=0,
-                        help='Global pitch shift in semitones (default: 0)')
-    parser.add_argument('--lang',    default='fr',
-                        help='Language for Whisper (default: fr)')
-    parser.add_argument('--model',   default='small',
-                        choices=['tiny','base','small','medium','large'],
-                        help='Whisper model (default: small)')
-    parser.add_argument('--no-per-word', action='store_true',
-                        help='Skip per-word pitch, only apply global shift')
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('clone_wav')
+    parser.add_argument('txt_file')
+    parser.add_argument('output_wav')
+    parser.add_argument('--global-shift', type=int, default=0)
+    parser.add_argument('--lang', default='fr')
+    parser.add_argument('--model', default='small', choices=['tiny', 'base', 'small', 'medium', 'large'])
+    parser.add_argument('--no-per-word', action='store_true')
     args = parser.parse_args()
-
-    if not os.path.exists(args.clone_wav):
-        sys.exit(f"❌  File not found: {args.clone_wav}")
-    if not os.path.exists(args.txt_file):
-        sys.exit(f"❌  File not found: {args.txt_file}")
-
-    process(
-        clone_wav         = args.clone_wav,
-        txt_file          = args.txt_file,
-        output_wav        = args.output_wav,
-        global_shift      = args.global_shift,
-        language          = args.lang,
-        whisper_model_name= args.model,
-        per_word          = not args.no_per_word,
-    )
+    if abs(args.global_shift) > 24:
+        parser.error("global-shift must be in [-24, 24]")
+    for name in ('clone_wav', 'txt_file'):
+        if not os.path.isfile(getattr(args, name)):
+            parser.error(f"File not found: {getattr(args, name)}")
+    process(args.clone_wav, args.txt_file, args.output_wav, args.global_shift,
+            args.lang, args.model, not args.no_per_word)
 
 
 if __name__ == '__main__':

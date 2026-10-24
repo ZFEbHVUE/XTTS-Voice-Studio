@@ -72,12 +72,14 @@ def main():
                         help='Whisper model (default: small)')
     parser.add_argument('--lang',        default='fr',   help='Language code (default: fr)')
     parser.add_argument('--pause',       default='0.3',  help='Min silence for pause marker in s (default: 0.3)')
-    parser.add_argument('--device',      default='cuda', choices=['cpu','cuda'],
+    parser.add_argument('--device',      default='cpu', choices=['cpu','cuda'],
                         help='Device (default: cpu)')
     parser.add_argument('--pitch',       action='store_true', help='Add per-word pitch annotation')
     parser.add_argument('--vad',         action='store_true', help='Enable Silero VAD pre-filtering')
 
     args = parser.parse_args()
+    args.input = os.path.abspath(os.path.expanduser(args.input))
+    args.output = os.path.abspath(os.path.expanduser(args.output))
 
     if not os.path.exists(args.input):
         print(f"[!] Input file not found: {args.input}")
@@ -87,6 +89,18 @@ def main():
         print(f"[!] transcribeSong2txt_with_pause.py not found at: {TRANSCRIBE}")
         sys.exit(1)
 
+    args.input = os.path.abspath(os.path.expanduser(args.input))
+    args.output = os.path.abspath(os.path.expanduser(args.output))
+    if os.path.realpath(args.input) == os.path.realpath(args.output):
+        parser.error("Output must differ from input")
+    try:
+        pause = float(args.pause)
+        import math
+        if not math.isfinite(pause) or pause < 0:
+            raise ValueError
+    except ValueError:
+        parser.error("pause must be finite and nonnegative")
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
     # Extract audio to temp WAV
     tmp = tempfile.NamedTemporaryFile(suffix='_video2txt.wav', delete=False)
     tmp.close()
@@ -115,17 +129,21 @@ def main():
         # os.setsid() creates a new process group — when the GUI terminates
         # video2txt.py, SIGTERM propagates to ffmpeg/whisper children too.
         import signal
-        proc = subprocess.Popen(cmd, start_new_session=True)
+        proc = subprocess.Popen(cmd, start_new_session=(os.name == "posix"))
         _proc_holder[0] = proc
 
         def _kill_tree():
             """Kill the child process and its entire process group."""
             try:
-                pgid = os.getpgid(proc.pid)
+                if os.name != "posix":
+                    subprocess.run(['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                pgid = proc.pid  # child is its own session/group leader
                 os.killpg(pgid, signal.SIGTERM)
                 import time; time.sleep(0.5)
                 try:
-                    os.killpg(pgid, _sig.SIGKILL)  # force-kill if still alive
+                    os.killpg(pgid, signal.SIGKILL)  # force-kill if still alive
                 except ProcessLookupError:
                     pass
             except Exception:

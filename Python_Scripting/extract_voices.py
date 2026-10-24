@@ -1,47 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Female / male voice separation — v2 multi-feature approach.
+"""Voice routing and optional two-source separation.
 
-Classification:
-  female_solo  -> F0 >= threshold, faible variance, centroïde élevé
-  male_solo    -> F0 <  threshold, faible variance, centroïde bas
-  overlap      -> large plage F0 (2 voix simultanées)
-  silence      -> trop peu de trames voisées
+f0: short pitch regions, with an unknown category. Pitch is not speaker identity.
+ecapa: speaker embeddings, optionally anchored by --female-ref / --male-ref.
+sepformer: separate all speech blocks first, then route the estimated sources.
+pyannote: speaker turns; mixed/uncertain audio is retained in _review.wav.
 
-Options --keep:
-  female, male, overlap, all, female,male, vocals only
-
-Options --silence:
-  auto  -> durée naturelle
-  0     -> pas de silence
-  N     -> N secondes entre chaque segment gardé
-
-Options --dereverberate:
-  none, noisereduce, wpe, deepfilter
-
-Options --method:
-  f0        -> classification par F0 + centroïde spectral (défaut)
-  pyannote  -> diarisation pyannote.audio + genre par locuteur (meilleur, requiert --hf-token)
-
-Options nouvelles:
-  --analyze       Affiche un tableau par segment (F0, centroïde, label) — pas de sortie
-  --split-output  Génère OUTPUT_female.ext + OUTPUT_male.ext en un seul passage
-
-Format de sortie auto-détecté par extension: .wav, .mp3, .flac, .ogg
-
-Usage:
-  python extract_voices.py input.mp3 output.wav --keep female --silence 0.5
-  python extract_voices.py input.mp3 --analyze
-  python extract_voices.py input.mp3 output.wav --split-output
-  python extract_voices.py input.mp3 output.wav --method pyannote --hf-token hf_xxx
-  python extract_voices.py input.mp3 output.mp3 --keep female --mp3-bitrate 256 --mp3-mode vbr
-  python extract_voices.py input.mp3 output.mp3 --remove-music --mp3-bitrate 192
+--split-output writes _female / _male, plus _review.wav when needed and a JSON
+report. With --silence auto outputs keep the original timeline. With --silence 0
+selected regions are concatenated. Solo reference labels are chosen by the user;
+they override pitch assumptions and should contain only that target speaker.
 """
 
 import numpy as np
-import soundfile as sf
-import librosa
+try:
+    import soundfile as sf
+except ImportError:
+    sf = None
+try:
+    import librosa
+except ImportError:
+    librosa = None
 import argparse
 import os
 import re
@@ -490,34 +470,32 @@ def save_audio(y, sr, output_file, mp3_bitrate=192, mp3_mode='cbr'):
 
 # ── Segment detection (RMS-based VAD) ────────────────────────────────────────
 
-def detect_segments(y, sr, min_silence=0.15, min_speech=0.2):
-    hop = 512
-    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop)[0]
-    times = librosa.times_like(rms, sr=sr, hop_length=hop)
-    rms_norm = rms / (np.max(rms) + 1e-10)
-
-    threshold = max(0.02, np.median(rms_norm) * 0.4)
-    if np.sum(rms_norm > threshold) < 3:
-        nonzero = rms_norm[rms_norm > 0.001]
-        threshold = float(np.percentile(nonzero, 10)) if len(nonzero) > 0 else 0.01
-        print(f"   [*] Adaptive RMS threshold: {threshold:.4f} (fallback)")
-
-    is_speech = rms_norm > threshold
-    segs = []; in_seg = False; t0 = 0.0
-    for i, sp in enumerate(is_speech):
-        if sp and not in_seg:   t0 = float(times[i]); in_seg = True
-        elif not sp and in_seg:
-            if float(times[i]) - t0 >= min_speech: segs.append((t0, float(times[i])))
-            in_seg = False
-    if in_seg and float(times[-1]) - t0 >= min_speech:
-        segs.append((t0, float(times[-1])))
-    if not segs: return []
-    merged = [segs[0]]
-    for s, e in segs[1:]:
-        ps, pe = merged[-1]
-        if s - pe < min_silence: merged[-1] = (ps, e)
-        else: merged.append((s, e))
-    return merged
+def detect_segments(y,sr,min_silence=.15,min_speech=.2):
+    from audio_checks import mono_audio
+    y=mono_audio(y,sr,allow_silence=True)
+    if min_silence<0 or min_speech<0 or not np.isfinite(min_silence+min_speech):
+        raise ValueError('Speech and silence durations must be finite and nonnegative')
+    hop=max(1,round(.01*sr))
+    starts=np.arange(0,len(y),hop)
+    rms=np.array([np.sqrt(np.mean(y[i:min(len(y),i+hop)]**2)) for i in starts])
+    if not len(rms) or rms.max()<1e-5:
+        return []
+    gate=max(1e-5,float(np.percentile(rms,95))*.04,float(np.median(rms))*.3)
+    active=rms>gate
+    raw=[];begin=None
+    for index,on in enumerate(np.r_[active,False]):
+        if on and begin is None:
+            begin=int(starts[index])
+        if not on and begin is not None:
+            end=min(len(y),index*hop)
+            raw.append([begin/sr,end/sr]);begin=None
+    merged=[]
+    for start,end in raw:
+        if merged and start-merged[-1][1]<=min_silence:
+            merged[-1][1]=end
+        else:
+            merged.append([start,end])
+    return [(start,end) for start,end in merged if end-start>=min_speech]
 
 
 # ── F0 estimation — pyin (CPU) ou torchcrepe (GPU) ──────────────────────────
@@ -576,181 +554,31 @@ def _f0_crepe(seg, sr, device='cuda'):
 # ── Worker multiprocessing (top-level = picklable) ───────────────────────────
 
 def _classify_worker(args):
-    """
-    Appelé par ProcessPoolExecutor — doit être une fonction top-level.
-    args = (seg_bytes, sr, f0_thr, ov_range)
-    Retourne (label, f0_med, cent_med, voiced_ratio_pct)
-    """
-    import numpy as np, librosa
+    seg_bytes, sr, threshold, overlap_range = args
+    chunk = np.frombuffer(seg_bytes, dtype=np.float32).copy()
+    label, median, centroid = classify(chunk, sr, 0, len(chunk)/sr, threshold, overlap_range)
+    return label, median, centroid, 0
 
-    seg_bytes, sr, f0_thr, ov_range = args
-    seg = np.frombuffer(seg_bytes, dtype=np.float32).copy()
-
-    if len(seg) < 1024:
-        return ('silence', None, None, 0)
-
-    frame_len = min(2048, max(1024, len(seg) // 2))
-    hop       = min(512,  frame_len // 4)
-
-    f0, voiced, _ = librosa.pyin(seg, fmin=60, fmax=500, sr=sr,
-                                   frame_length=frame_len, hop_length=hop)
-    vr = float(np.sum(voiced)) / max(len(voiced), 1)
-
-    if vr < 0.12:
-        return ('silence', None, None, int(100 * vr))
-
-    f0v = f0[voiced & ~np.isnan(f0)]
-    if len(f0v) < 2:
-        return ('silence', None, None, int(100 * vr))
-
-    med = float(np.median(f0v))
-    rng = float(np.percentile(f0v, 90) - np.percentile(f0v, 10)) if len(f0v) >= 4 else 0.0
-
-    centroid = librosa.feature.spectral_centroid(y=seg, sr=sr, hop_length=hop)[0]
-    med_cent = float(np.median(centroid))
-
-    if rng > ov_range:
-        return ('overlap', med, med_cent, int(100 * vr))
-
-    diff = med - f0_thr
-    if abs(diff) >= 15.0:
-        label = 'female_solo' if diff >= 0 else 'male_solo'
-    else:
-        f0_score   = diff / 15.0
-        cent_score = (med_cent - 1350.0) / 300.0
-        score      = 0.65 * f0_score + 0.35 * cent_score
-        label      = 'female_solo' if score >= 0 else 'male_solo'
-
-    return (label, med, med_cent, int(100 * vr))
-
-
-# ── Classification — dispatch CPU/GPU ────────────────────────────────────────
 
 def classify(y, sr, start, end, f0_thr=165, ov_range=80, device='cpu'):
-    """
-    Classify un segment. device='cpu' -> pyin, device='cuda' -> torchcrepe.
-    Retourne (label, f0_median, centroid_median).
-    """
-    seg = y[int(start * sr):int(end * sr)]
-    if len(seg) < 1024:
+    from voice_routing import pitch_label
+    chunk = y[int(start*sr):int(end*sr)]
+    if len(chunk) < 1024 or np.max(np.abs(chunk), initial=0) < 1e-5:
         return 'silence', None, None
-
-    if device == 'cuda':
-        f0, voiced, vr, hop = _f0_crepe(seg, sr, device)
-    else:
-        f0, voiced, vr, hop = _f0_pyin(seg, sr)
-
-    if vr < 0.12:
-        return 'silence', None, None
-
-    f0v = f0[voiced & ~np.isnan(f0)]
-    if len(f0v) < 2:
-        return 'silence', None, None
-
-    med = float(np.median(f0v))
-    rng = float(np.percentile(f0v, 90) - np.percentile(f0v, 10)) if len(f0v) >= 4 else 0.0
-
-    centroid = librosa.feature.spectral_centroid(y=seg, sr=sr, hop_length=hop)[0]
-    med_cent = float(np.median(centroid))
-
-    if rng > ov_range:
-        return 'overlap', med, med_cent
-
-    diff = med - f0_thr
-    if abs(diff) >= 15.0:
-        label = 'female_solo' if diff >= 0 else 'male_solo'
-    else:
-        f0_score   = diff / 15.0
-        cent_score = (med_cent - 1350.0) / 300.0
-        score      = 0.65 * f0_score + 0.35 * cent_score
-        label      = 'female_solo' if score >= 0 else 'male_solo'
-
-    return label, med, med_cent
+    estimate = _f0_crepe(chunk, sr, device) if device == 'cuda' else _f0_pyin(chunk, sr)
+    f0, voiced, ratio, _ = estimate
+    values = np.asarray(f0, float)
+    values = values[np.asarray(voiced, bool) & np.isfinite(values)]
+    if ratio < .12 or len(values) < 3:
+        return 'unknown', None, None
+    label, median = pitch_label(values, f0_thr)
+    return (label + '_solo' if label in ('female', 'male') else label), median, None
 
 
 # ── Mode Analyse — multicore CPU ou GPU ──────────────────────────────────────
 
-def analyze(input_file, f0_thr=165, ov_range=80, min_silence=0.15, device='cpu'):
-    """
-    Affiche un tableau par segment : label, F0, centroïde, voiced ratio.
-    CPU  -> ProcessPoolExecutor  (tous les coeurs en parallèle)
-    CUDA -> torchcrepe           (GPU batch)
-    """
-    import os
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-
-    print(f"\n[ANALYZE] Chargement: {input_file}")
-    y, sr = librosa.load(input_file, sr=None, mono=True)
-    segs  = detect_segments(y, sr, min_silence=min_silence)
-    total = len(y) / sr
-    n_cpu = os.cpu_count() or 4
-
-    print(f"[ANALYZE] Duree: {total:.1f}s | {len(segs)} segments | "
-          f"Device: {device.upper()} | Workers CPU: {n_cpu}")
-    print(f"          Seuil F0: {f0_thr} Hz | Plage overlap: {ov_range} Hz\n")
-    print(f"  {'#':>3}  {'Debut':>7}  {'Fin':>7}  {'Dur':>5}  "
-          f"{'Label':14}  {'F0 (Hz)':>8}  {'Centroide':>10}  {'VR%':>5}")
-    print("  " + "-" * 76)
-
-    results = [None] * len(segs)
-
-    if device == 'cuda':
-        # ── GPU : boucle torchcrepe, pas de multiprocessing
-        for i, (start, end) in enumerate(segs):
-            label, f0, cent = classify(y, sr, start, end, f0_thr, ov_range, device='cuda')
-            # voiced ratio via crepe pour affichage
-            seg = y[int(start * sr):int(end * sr)]
-            if len(seg) >= 1024:
-                _, _, vr, _ = _f0_crepe(seg, sr, 'cuda')
-                vr_pct = int(100 * vr)
-            else:
-                vr_pct = 0
-            results[i] = (label, f0, cent, vr_pct)
-            print(f"  {i+1:>3}  {start:7.2f}  {end:7.2f}  {end-start:5.2f}  "
-                  f"{label:14}  "
-                  f"{f0:7.0f}" if f0 is not None else f"  {'':7}",
-                  end='')
-            # flush immediat pour voir dans la console GUI
-            import sys; sys.stdout.flush()
-
-    else:
-        # ── CPU multicore : ProcessPoolExecutor
-        # Serialise chaque segment en bytes (evite pickle de l'array complet)
-        tasks = []
-        for start, end in segs:
-            seg = y[int(start * sr):int(end * sr)].astype(np.float32)
-            tasks.append((seg.tobytes(), sr, f0_thr, ov_range))
-
-        futures = {}
-        with ProcessPoolExecutor(max_workers=n_cpu) as ex:
-            for i, task in enumerate(tasks):
-                fut = ex.submit(_classify_worker, task)
-                futures[fut] = i
-
-            done_count = 0
-            for fut in as_completed(futures):
-                i = futures[fut]
-                results[i] = fut.result()
-                done_count += 1
-                print(f"   ... {done_count}/{len(segs)} segments traites\r",
-                      end='', flush=True)
-
-        print()  # newline apres le \r
-
-    # ── Affichage du tableau trié par index ──────────────────────────────
-    counts = {}
-    for i, (start, end) in enumerate(segs):
-        label, f0, cent, vr_pct = results[i]
-        counts[label] = counts.get(label, 0) + 1
-        f0_s   = f"{f0:7.0f}"  if f0   is not None else "      -"
-        cent_s = f"{cent:8.0f}" if cent is not None else "       -"
-        print(f"  {i+1:>3}  {start:7.2f}  {end:7.2f}  {end-start:5.2f}  "
-              f"{label:14}  {f0_s}  {cent_s}  {vr_pct:>4}%")
-
-    print(f"\n  Resume: {dict(counts)}")
-    print(f"  Conseil: si des labels H sont errones, augmentez --overlap-range (actuel: {ov_range})")
-    print(f"           si seuil F/H mal place, ajustez --threshold (actuel: {f0_thr} Hz)")
-    print(f"  F0 femme typique: 165-255 Hz | F0 homme typique: 85-180 Hz\n")
+def analyze(input_file,f0_thr=165,ov_range=80,min_silence=.15,device='cpu'):
+    return analyze_routing(input_file,'f0',f0_thr,min_silence,device)
 
 
 # ── Méthode SepFormer — séparation neuronale réelle ─────────────────────────
@@ -781,7 +609,37 @@ def _load_sepformer(device='cpu'):
     return model
 
 
-def _sepformer_separate(model, seg, sr, debug_dir=None, seg_idx=0):
+def _fullband_from_estimates(mix, est1, est2, sr, sep_sr):
+    """Turn two band-limited source estimates into full-band sources.
+
+    Soft ratio mask |E1| / (|E1| + |E2|) on the ORIGINAL mixture's STFT. Below
+    ~0.45 x sep_sr the mask comes straight from the estimates; above it, each
+    frame reuses the mean mask of the top band the model actually covered.
+    Returns (out1, out2) at the original rate, same length as mix.
+    """
+    n = len(mix)
+    n_fft = 2048 if sr >= 32000 else 1024
+    hop = n_fft // 4
+    if n < n_fft:
+        return est1, est2
+    S = librosa.stft(mix.astype(np.float32), n_fft=n_fft, hop_length=hop)
+    A = np.abs(librosa.stft(est1.astype(np.float32), n_fft=n_fft, hop_length=hop))
+    B = np.abs(librosa.stft(est2.astype(np.float32), n_fft=n_fft, hop_length=hop))
+    m = min(S.shape[1], A.shape[1], B.shape[1])
+    S, A, B = S[:, :m], A[:, :m], B[:, :m]
+    m1 = A / (A + B + 1e-9)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    cutoff = 0.45 * sep_sr
+    ref = (freqs >= 0.30 * sep_sr) & (freqs < cutoff)
+    hi = freqs >= cutoff
+    if ref.any() and hi.any():
+        m1[hi, :] = m1[ref, :].mean(axis=0, keepdims=True)
+    out1 = librosa.istft(S * m1, hop_length=hop, length=n).astype(np.float32)
+    out2 = librosa.istft(S * (1.0 - m1), hop_length=hop, length=n).astype(np.float32)
+    return out1, out2
+
+
+def _sepformer_separate(model, seg, sr, debug_dir=None, seg_idx=0, restore_high_band=False):
     """
     Separe seg (mono float32) en 2 sources via separate_file().
     Retourne (src1, src2) numpy float32 au sr original.
@@ -826,6 +684,15 @@ def _sepformer_separate(model, seg, sr, debug_dir=None, seg_idx=0):
     src1 *= peak
     src2 *= peak
 
+    # The model runs at 8 kHz, so its outputs stop at 4 kHz. Used as-is they
+    # made a cloning reference with no upper band at all. Instead, the two
+    # estimates only DECIDE how the original full-band signal is shared out:
+    # a ratio mask applied to the original spectrum keeps its full bandwidth
+    # and phase. Above the model's band the mask is carried over, frame by
+    # frame, from the top of the band the model did see.
+    if restore_high_band:
+        src1, src2 = _fullband_from_estimates(seg, src1, src2, sr, SEP_SR)
+
     # Sauvegarde debug (3 premiers segments)
     if debug_dir and seg_idx < 3:
         os.makedirs(debug_dir, exist_ok=True)
@@ -838,677 +705,299 @@ def _sepformer_separate(model, seg, sr, debug_dir=None, seg_idx=0):
 
 
 
-def _pick_source(src1, src2, sr, target_gender, f0_thr):
-    """
-    Parmi les 2 sources SepFormer, retourne celle qui correspond à target_gender.
-    Classifie chaque source par F0 médian.
-    """
-    def median_f0(seg):
-        if len(seg) < 1024:
-            return None
-        frame_len = min(2048, max(1024, len(seg) // 2))
-        hop = min(512, frame_len // 4)
-        f0, voiced, _ = librosa.pyin(seg, fmin=60, fmax=500, sr=sr,
-                                      frame_length=frame_len, hop_length=hop)
-        f0v = f0[voiced & ~np.isnan(f0)] if voiced is not None else []
-        return float(np.median(f0v)) if len(f0v) >= 2 else None
+def _estimate_pitch(chunk, sr, device='cpu'):
+    return _f0_crepe(chunk, sr, device) if device == 'cuda' else _f0_pyin(chunk, sr)
 
-    f1 = median_f0(src1)
-    f2 = median_f0(src2)
 
-    # Fallback si F0 indétectable : retourne src avec le plus d'énergie
-    if f1 is None and f2 is None:
-        return src1 if np.mean(src1 ** 2) >= np.mean(src2 ** 2) else src2
-
-    if f1 is None:
-        return src2 if (target_gender == 'female_solo') == (f2 >= f0_thr) else src1
-    if f2 is None:
-        return src1 if (target_gender == 'female_solo') == (f1 >= f0_thr) else src2
-
-    # Les deux F0 détectés : choisir celle dont le genre correspond
-    src1_is_female = f1 >= f0_thr
-    src2_is_female = f2 >= f0_thr
-    want_female    = (target_gender == 'female_solo')
-
-    if want_female:
-        if src1_is_female and not src2_is_female:   return src1
-        if src2_is_female and not src1_is_female:   return src2
-        # Ambigüité : prendre la F0 la plus haute
-        return src1 if f1 >= f2 else src2
-    else:
-        if not src1_is_female and src2_is_female:   return src1
-        if not src2_is_female and src1_is_female:   return src2
-        # Ambigüité : prendre la F0 la plus basse
-        return src1 if f1 <= f2 else src2
-
-
-def process_sepformer(input_file, output_file, keep_set=None, silence_mode='auto',
-                      deverb_method='none', f0_thr=165, ov_range=80, min_dur=0.2,
-                      debug=False, device='cpu', mp3_bitrate=192, mp3_mode='cbr',
-                      min_silence=0.15, split_output=False):
-    """
-    Séparation réelle des voix via SepFormer (speechbrain).
-    Pour chaque segment, SepFormer extrait 2 sources, on garde celle
-    qui correspond au genre cible — la voix de fond disparaît réellement.
-
-    pip install speechbrain  (déjà installé)
-    Modèle : speechbrain/sepformer-wsj02mix (téléchargé automatiquement ~200 MB)
-    """
-    if keep_set is None:
-        keep_set = {'female_solo'}
-
-    print(f"[*] SepFormer — séparation réelle des voix")
-    print(f"   [*] Chargement modèle SepFormer ({device.upper()})...")
-    try:
-        model = _load_sepformer(device)
-    except Exception as e:
-        print(f"[!] Erreur chargement SepFormer: {e}")
-        print("    Fallback vers methode F0 classique...")
-        process(input_file, output_file, keep_set, silence_mode, deverb_method,
-                f0_thr, ov_range, min_dur, debug, False, 'htdemucs_ft', device,
-                mp3_bitrate, mp3_mode, min_silence, split_output)
-        return
-
-    print(f"   [OK] SepFormer prêt")
-    print(f"   [*] Chargement audio: {input_file}")
-    y, sr = librosa.load(input_file, sr=None, mono=True)
-
-    if deverb_method != 'none':
-        y = dereverberate(y, sr, deverb_method, device)
-
-    total_dur = len(y) / sr
-    segs      = detect_segments(y, sr, min_silence=min_silence)
-    print(f"   Durée: {total_dur:.1f}s | {len(segs)} segments détectés")
-
-    sil_n = (None     if silence_mode == 'auto'
-             else 0   if silence_mode == 0.0
-             else int(float(silence_mode) * sr))
-
-    def _assemble_one(target_kind):
-        result      = []
-        last_end    = None
-        kept        = 0
-        sep_idx     = 0   # index pour le debug SepFormer
-        debug_dir   = (os.path.join(os.path.dirname(output_file),
-                        "sepformer_debug") if debug else None)
-
-        for idx, (start, end) in enumerate(segs):
-            dur           = end - start
-            kind, f0, _   = classify(y, sr, start, end, f0_thr, ov_range,
-                                     device if device == 'cuda' else 'cpu')
-
-            if dur < min_dur:
-                continue
-
-            # Inclure seulement les segments du genre cible (pas overlap —
-            # sur les segments solo la voix adverse est en fond, SepFormer
-            # peut la retirer; sur overlap les deux voix sont egales, moins fiable)
-            if kind != target_kind:
-                continue
-
-            seg = y[int(start * sr):int(end * sr)].copy()
-
-            try:
-                src1, src2 = _sepformer_separate(model, seg, sr,
-                                                  debug_dir=debug_dir,
-                                                  seg_idx=sep_idx)
-                sep_idx   += 1
-                chosen     = _pick_source(src1, src2, sr, target_kind, f0_thr)
-                if debug:
-                    def _mf0(s):
-                        fl = min(2048, max(1024, len(s)//2))
-                        hp = min(512, fl//4)
-                        f0r, vr, _ = librosa.pyin(s, fmin=60, fmax=500,
-                                                   sr=sr, frame_length=fl, hop_length=hp)
-                        fv = f0r[vr & ~np.isnan(f0r)] if vr is not None else []
-                        return f"{np.median(fv):.0f}" if len(fv) >= 2 else "?"
-                    # A conditional cannot live inside a format spec:
-                    # f"{f0:.0f if f0 else '?'}" raises ValueError, so sepformer
-                    # + --debug crashed every time. Format first, then insert.
-                    _f0s = f"{f0:.0f}" if f0 is not None else "?"
-                    print(f"   {start:6.1f}-{end:6.1f}s  {kind:12s}  "
-                          f"F0 mix={_f0s}  "
-                          f"src1={_mf0(src1)}Hz  src2={_mf0(src2)}Hz  "
-                          f"-> {'src1' if np.array_equal(chosen, src1) else 'src2'}")
-            except Exception as e:
-                print(f"   [!] SepFormer seg {idx}: {e} -> chunk brut")
-                chosen = seg
-
-            # Silence avant
-            if last_end is not None:
-                gap = start - last_end
-                n   = (int(gap * sr) if silence_mode == 'auto' else sil_n or 0)
-                if n > 0:
-                    result.append(np.zeros(n, dtype=np.float32))
-
-            # Fade in/out
-            fade = min(int(0.02 * sr), len(chosen) // 4)
-            if fade > 0:
-                chosen[:fade]  *= np.linspace(0, 1, fade)
-                chosen[-fade:] *= np.linspace(1, 0, fade)
-
-            result.append(chosen)
-            last_end = end
-            kept += 1
-
-            print(f"   [{idx+1}/{len(segs)}] {start:.1f}-{end:.1f}s  "
-                  f"{kind:14s}  -> garde  ({kept} gardes)", end='\r')
-
-        print()
-        return np.concatenate(result) if result else None
-
-    if split_output:
-        base, ext = os.path.splitext(output_file)
-        for tag, kind in [('female', 'female_solo'), ('male', 'male_solo')]:
-            print(f"\n[*] Extraction {tag.upper()}...")
-            arr = _assemble_one(kind)
-            if arr is not None:
-                save_audio(arr, sr, base + f'_{tag}' + ext, mp3_bitrate, mp3_mode)
-            else:
-                print(f"[!] Aucun segment {tag} trouvé.")
-    else:
-        # keep_set peut contenir female_solo ou male_solo ou les deux
-        # On prend le premier genre non-overlap de keep_set
-        target = next((k for k in keep_set if k in ('female_solo', 'male_solo')), 'female_solo')
-        print(f"\n[*] Extraction {target}...")
-        arr = _assemble_one(target)
-        if arr is not None:
-            save_audio(arr, sr, output_file, mp3_bitrate, mp3_mode)
-        else:
-            print("[!] Aucun segment gardé.")
-
-
-# ── Classification pyannote (methode diarisation) ────────────────────────────
-
-def process_pyannote(input_file, output_file, keep_set, silence_mode,
-                     deverb_method, f0_thr, hf_token, device='cpu',
-                     mp3_bitrate=192, mp3_mode='cbr', split_output=False):
-    """
-    Diarise avec pyannote.audio, assigne le genre par locuteur (F0 agrégé
-    sur l'ensemble de ses segments — bien plus robuste que segment par segment).
-
-    Installs: pip install pyannote.audio
-    Token:    https://hf.co/settings/tokens  (accept pyannote/speaker-diarization-3.1)
-    """
-    try:
-        from pyannote.audio import Pipeline
-    except ImportError:
-        print("[!] pyannote.audio non installé: pip install pyannote.audio")
-        return
-
-    import torch
-
-    print(f"[*] Pyannote diarization: {input_file}")
-    if not hf_token:
-        print("[!] --hf-token requis pour pyannote.audio"); return
-
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token
-    )
-    if device == 'cuda' and torch.cuda.is_available():
-        pipeline = pipeline.to(torch.device('cuda'))
-
-    diarization = pipeline(input_file)
-
-    print("   [*] Chargement audio...")
-    y, sr = librosa.load(input_file, sr=None, mono=True)
-    if deverb_method != 'none':
-        y = dereverberate(y, sr, deverb_method, device)
-
-    # Collecter segments par locuteur
-    speaker_segs = {}
-    for turn, _, spk in diarization.itertracks(yield_label=True):
-        speaker_segs.setdefault(spk, []).append((turn.start, turn.end))
-
-    print(f"   {len(speaker_segs)} locuteur(s) détecté(s)")
-
-    # F0 agrégé par locuteur → genre
-    speaker_gender = {}
-    for spk, segs in sorted(speaker_segs.items()):
-        all_f0 = []
-        for start, end in segs:
-            seg = y[int(start * sr):min(int(end * sr), len(y))]
-            if len(seg) < 1024: continue
-            f0, voiced, _ = librosa.pyin(seg, fmin=60, fmax=500, sr=sr,
-                                          frame_length=2048, hop_length=512)
-            if voiced is not None:
-                f0v = f0[voiced & ~np.isnan(f0)]
-                all_f0.extend(f0v.tolist())
-
-        if len(all_f0) >= 5:
-            med    = float(np.median(all_f0))
-            gender = 'female_solo' if med >= f0_thr else 'male_solo'
-            total_dur = sum(e - s for s, e in segs)
-            print(f"   {spk}: F0 médian={med:.0f} Hz | {len(segs)} seg(s) | "
-                  f"{total_dur:.1f}s => {gender}")
-        else:
-            gender = 'unknown'
-            print(f"   {spk}: trop peu de trames voisées => unknown")
-        speaker_gender[spk] = gender
-
-    # Construire liste labelée
-    labeled = [(turn.start, turn.end, speaker_gender.get(spk, 'unknown'))
-               for turn, _, spk in diarization.itertracks(yield_label=True)]
-
-    def _assemble(target_kinds):
-        result, last_end = [], None
-        for start, end, kind in labeled:
-            if kind not in target_kinds or (end - start) < 0.2: continue
-            if last_end is not None:
-                gap = start - last_end
-                n = (int(gap * sr)          if silence_mode == 'auto'
-                     else 0                 if silence_mode == 0.0
-                     else int(float(silence_mode) * sr))
-                if n > 0: result.append(np.zeros(n, dtype=np.float32))
-            chunk = y[int(start * sr):int(end * sr)].copy()
-            fade  = min(int(0.02 * sr), len(chunk) // 4)
-            if fade > 0:
-                chunk[:fade]  *= np.linspace(0, 1, fade)
-                chunk[-fade:] *= np.linspace(1, 0, fade)
-            result.append(chunk)
-            last_end = end
-        return np.concatenate(result) if result else None
-
-    if split_output:
-        base, ext = os.path.splitext(output_file)
-        for tag, kinds in [('female', {'female_solo'}), ('male', {'male_solo'})]:
-            arr = _assemble(kinds)
-            if arr is not None:
-                save_audio(arr, sr, base + f'_{tag}' + ext, mp3_bitrate, mp3_mode)
-            else:
-                print(f"[!] Aucun segment {tag} trouvé.")
-    else:
-        arr = _assemble(keep_set)
-        if arr is not None: save_audio(arr, sr, output_file, mp3_bitrate, mp3_mode)
-        else: print("[!] Aucun segment gardé.")
-
-
-# ── Clustering global des locuteurs (k-means sur F0) ────────────────────────
-
-def cluster_speakers(y, sr, segs, ov_range=80, device='cpu'):
-    """
-    Passe globale sur tous les segments pour collecter les F0 médians,
-    puis k-means k=2 pour séparer les deux locuteurs.
-
-    Retourne un dict {seg_idx: 'female'|'male'|'silence'} et un résumé
-    (centroide_female_hz, centroide_male_hz).
-
-    Avantage vs seuil fixe : s'adapte automatiquement aux deux voix
-    présentes dans l'enregistrement, même en zone ambiguë.
-    """
-    from scipy.cluster.vq import kmeans2
-
-    print("   [*] Clustering global F0 (k-means k=2)...")
-
-    # -- Collecte F0 median par segment --------------------------------------
-    seg_f0 = []   # (seg_idx, f0_median, voiced_ratio)
-    n_overlap = 0
-    for i, (start, end) in enumerate(segs):
-        seg = y[int(start * sr):int(end * sr)]
-        if len(seg) < 1024:
-            seg_f0.append((i, None, 0.0))
-            continue
-
-        if device == 'cuda':
-            f0, voiced, vr, _ = _f0_crepe(seg, sr, 'cuda')
-        else:
-            f0, voiced, vr, _ = _f0_pyin(seg, sr)
-
-        if vr < 0.12:
-            seg_f0.append((i, None, vr))
-            continue
-
-        f0v = f0[voiced & ~np.isnan(f0)]
-        if len(f0v) < 2:
-            seg_f0.append((i, None, vr))
-            continue
-
-        med = float(np.median(f0v))
-        # A segment whose F0 sweeps a wide range in a short time is the sign
-        # of two speakers inside ONE segment (one finishes, the other starts,
-        # with less gap between them than min_silence). classify() already
-        # rejects this case as 'overlap' -- cluster_speakers() computed the
-        # same range but never checked it, so a mixed segment got a median F0
-        # that looks clean and was written whole into one output file, voices
-        # and all. ov_range is the same threshold classify() uses.
-        rng = float(np.percentile(f0v, 90) - np.percentile(f0v, 10)) if len(f0v) >= 4 else 0.0
-        if rng > ov_range:
-            seg_f0.append((i, None, vr))
-            n_overlap += 1
-            print(f"   [*] Collecte F0: {i+1}/{len(segs)}\r", end="", flush=True)
-            continue
-        seg_f0.append((i, med, vr))
-
-        print(f"   [*] Collecte F0: {i+1}/{len(segs)}\r", end="", flush=True)
-
-    print()
-    if n_overlap:
-        print(f"   [*] {n_overlap}/{len(segs)} segment(s) rejected: F0 range wider "
-              f"than {ov_range} Hz, i.e. two speakers inside one segment. "
-              f"Lower --min-silence to cut between them instead of dropping them.")
-
-    # -- Filtrer les segments avec F0 valide ---------------------------------
-    valid = [(i, f0) for i, f0, vr in seg_f0 if f0 is not None]
-    if len(valid) < 4:
-        print("   [!] Pas assez de segments voises pour le clustering -> seuil fixe")
-        return None, (None, None)
-
-    idxs    = np.array([v[0] for v in valid])
-    f0_vals = np.array([v[1] for v in valid], dtype=np.float64)
-
-    # -- K-means k=2 sur F0 -------------------------------------------------
-    # Normalisation pour kmeans2
-    mu, sigma = f0_vals.mean(), f0_vals.std() + 1e-8
-    f0_norm   = ((f0_vals - mu) / sigma).reshape(-1, 1)
-
-    try:
-        # minit='points' : initialise les centroïdes sur des points existants
-        centroids, labels = kmeans2(f0_norm, 2, minit='points', iter=30)
-    except Exception as e:
-        print(f"   [!] kmeans2 error: {e} -> seuil fixe")
-        return None, (None, None)
-
-    # -- Identifier quel cluster est female (F0 plus élevé) ------------------
-    c0_mean = float(np.mean(f0_vals[labels == 0]))
-    c1_mean = float(np.mean(f0_vals[labels == 1]))
-    female_cluster = 0 if c0_mean > c1_mean else 1
-    male_cluster   = 1 - female_cluster
-
-    f_centroid = c0_mean if female_cluster == 0 else c1_mean
-    m_centroid = c0_mean if male_cluster   == 0 else c1_mean
-
-    print(f"   [OK] Clustering: femme={f_centroid:.0f} Hz  homme={m_centroid:.0f} Hz")
-    print(f"        (delta={f_centroid-m_centroid:.0f} Hz, "
-          f"{sum(labels==female_cluster)} seg F / {sum(labels==male_cluster)} seg H)")
-
-    # -- Construire le dict de labels ----------------------------------------
-    result = {}
-    for j, (seg_idx, _) in enumerate(valid):
-        result[seg_idx] = 'female' if labels[j] == female_cluster else 'male'
-
-    # Les segments silence/pas de F0
-    for i, f0, _ in seg_f0:
-        if f0 is None:
-            result[i] = 'silence'
-
-    return result, (f_centroid, m_centroid)
-
-
-def cluster_speakers_ecapa(y, sr, segs, device='cpu'):
-    """
-    SPEAKER-based clustering: ECAPA-TDNN embedding per segment + k-means k=2.
-
-    Unlike F0 clustering, this separates by WHO is speaking, not by pitch —
-    so two women, or a high-pitched man vs a low-pitched woman, are separable
-    (pitch-based separation fails there by construction). Clusters are then
-    labelled female/male from their median F0 so --keep female/male keeps
-    working. Same return contract as cluster_speakers:
-      ({seg_idx: 'female'|'male'|'silence'}, (f0_female_hz, f0_male_hz))
-    Falls back to F0 clustering if speechbrain/ECAPA is unavailable.
-    """
-    try:
-        from speaker_identity import SpeakerEncoder
-        enc = SpeakerEncoder(device=device)
-    except Exception as e:
-        print(f"   [!] ECAPA unavailable ({e}) -> F0 clustering fallback")
-        return cluster_speakers(y, sr, segs, device=device)
-    from scipy.signal import resample_poly
-    from scipy.cluster.vq import kmeans2
-    from math import gcd
-
-    g16 = gcd(int(sr), 16000)
-    embs, idxs = [], []
-    print(f"   [*] ECAPA embeddings on {len(segs)} segments...")
-    for i, (start, end) in enumerate(segs):
-        if end - start < 0.5:                      # too short for a reliable embedding
-            continue
-        seg = y[int(start * sr):int(end * sr)]
-        s16 = resample_poly(seg, 16000 // g16, sr // g16).astype(np.float32)
-        try:
-            e = np.asarray(enc.embed(s16, sr=16000), dtype=np.float64).ravel()
-        except Exception:
-            continue
-        embs.append(e / (np.linalg.norm(e) + 1e-9))
-        idxs.append(i)
-        print(f"   [*] {len(embs)} embedded\r", end="", flush=True)
-    print()
-    if len(embs) < 4:
-        print("   [!] Too few voiced segments for ECAPA clustering -> F0 fallback")
-        return cluster_speakers(y, sr, segs, device=device)
-
-    E = np.stack(embs)
-    np.random.seed(0)                              # deterministic k-means init
-    try:
-        centroids, labels = kmeans2(E, 2, minit='++', iter=50)
-    except Exception as e:
-        print(f"   [!] kmeans2 error: {e} -> F0 fallback")
-        return cluster_speakers(y, sr, segs, device=device)
-
-    c0 = centroids[0] / (np.linalg.norm(centroids[0]) + 1e-9)
-    c1 = centroids[1] / (np.linalg.norm(centroids[1]) + 1e-9)
-    inter = float(np.dot(c0, c1))
-    if inter > 0.85:
-        print(f"   [!] Clusters very similar (cosine {inter:.2f}) — this recording "
-              f"probably has a SINGLE speaker; the split will be arbitrary.")
-
-    # Label clusters female/male from median F0 of a few representative segments
-    def _cluster_f0(k, cen):
-        members = [j for j in range(len(idxs)) if labels[j] == k]
-        members.sort(key=lambda j: -float(np.dot(E[j], cen)))   # closest first
-        vals = []
-        for j in members[:6]:
-            s, e_ = segs[idxs[j]]
-            chunk = y[int(s * sr):int(e_ * sr)]
-            try:
-                f0r, vr, _ = librosa.pyin(chunk.astype(np.float32), fmin=60, fmax=500, sr=sr)
-                fv = f0r[vr & ~np.isnan(f0r)] if vr is not None else []
-                if len(fv) > 2:
-                    vals.append(float(np.median(fv)))
-            except Exception:
-                pass
-        return float(np.median(vals)) if vals else None
-
-    f0_c0, f0_c1 = _cluster_f0(0, c0), _cluster_f0(1, c1)
-    if f0_c0 is None and f0_c1 is None:
-        print("   [!] Could not measure cluster F0 — labelling arbitrarily (0=female).")
-        female_cluster, f_hz, m_hz = 0, 0.0, 0.0
-    else:
-        if f0_c0 is None: f0_c0 = (f0_c1 or 165) - 1
-        if f0_c1 is None: f0_c1 = (f0_c0 or 165) - 1
-        female_cluster = 0 if f0_c0 >= f0_c1 else 1
-        f_hz = f0_c0 if female_cluster == 0 else f0_c1
-        m_hz = f0_c1 if female_cluster == 0 else f0_c0
-
-    dur = lambda k: sum(segs[idxs[j]][1] - segs[idxs[j]][0]
-                        for j in range(len(idxs)) if labels[j] == k)
-    print(f"   [OK] ECAPA clustering: female={f_hz:.0f} Hz ({dur(female_cluster):.0f}s)  "
-          f"male={m_hz:.0f} Hz ({dur(1 - female_cluster):.0f}s)  "
-          f"inter-cluster cosine {inter:.2f}")
-
-    result = {i: 'silence' for i in range(len(segs))}
-    for j, seg_idx in enumerate(idxs):
-        result[seg_idx] = 'female' if labels[j] == female_cluster else 'male'
-    return result, (f_hz, m_hz)
-
-
-# ── Process principal (méthode F0) ───────────────────────────────────────────
-
-def process(input_file, output_file, keep_set=None, silence_mode='auto',
-            deverb_method='none', f0_thr=165, ov_range=80, min_dur=0.2,
-            debug=False, remove_music=False, demucs_model='htdemucs_ft', device='cpu',
-            mp3_bitrate=192, mp3_mode='cbr', min_silence=0.15, split_output=False,
-            demucs_shifts=2, cluster_method='f0'):
-
-    if keep_set is None:
-        keep_set = {'female_solo'}
-
-    print(f"[*]  {input_file}")
-    print(f"   [*] Device: {device}")
-
-    # -- Demucs music removal -------------------------------------------------
+def _load_processed_audio(input_file, deverb_method='none', device='cpu',
+                          remove_music=False, demucs_model='htdemucs_ft', demucs_shifts=2):
+    from audio_checks import mono_audio
     if remove_music:
         y, sr = remove_music_demucs(input_file, demucs_model, device, shifts=demucs_shifts)
         if y is None:
-            print("[!] Music removal failed — chargement direct")
-            y, sr = librosa.load(input_file, sr=None, mono=True)
-        else:
-            print("[OK] Musique supprimée. Sauvegarde des voix (sans filtrage F0).")
-            save_audio(y, sr, output_file, mp3_bitrate, mp3_mode)
-            return
+            raise RuntimeError('Music removal failed; separation aborted rather than using the original mix')
     else:
         y, sr = librosa.load(input_file, sr=None, mono=True)
-
-    total_dur = len(y) / sr
-    sil_str   = ('durée naturelle' if silence_mode == 'auto'
-                 else 'sans silence' if silence_mode == 0.0
-                 else f'{silence_mode}s fixe')
-    print(f"   Durée:{total_dur:.1f}s  Keep:{keep_set}  Silence:{sil_str}  Dereverb:{deverb_method}")
-
-    # -- Dereverbération -------------------------------------------------------
+    y = mono_audio(y, sr, allow_silence=True).astype(np.float32)
     if deverb_method != 'none':
         y = dereverberate(y, sr, deverb_method, device)
-        if 'vocals_only' in keep_set:
-            print("[OK] Dereverberation terminée. Sauvegarde directe.")
-            save_audio(y, sr, output_file, mp3_bitrate, mp3_mode)
-            return
+    return mono_audio(y, sr, allow_silence=True).astype(np.float32), sr
 
-    # 'vocals only' asks for the whole vocal track, not a speaker. classify()
-    # only ever returns female_solo / male_solo / overlap / silence, so a
-    # keep_set of {'vocals_only'} matches NOTHING and the run always ended on
-    # "Aucun segment gardé !". It only appeared to work when --remove-music or
-    # --dereverberate returned earlier. Handle it for what it means: keep the
-    # audio as it is.
-    if keep_set == {'vocals_only'}:
-        print("   [*] 'vocals only' with no music removal and no dereverberation:")
-        print("       nothing to separate -- saving the audio unchanged.")
-        print("       (add --remove-music to actually strip the backing track)")
-        save_audio(y, sr, output_file, mp3_bitrate, mp3_mode)
-        return
 
-    # -- Détection segments ---------------------------------------------------
-    segs = detect_segments(y, sr, min_silence=min_silence)
-    print(f"   {len(segs)} segments détectés")
+def _references(female_ref=None, male_ref=None):
+    refs = {key:os.path.abspath(os.path.expanduser(os.fspath(path)))
+            for key,path in (('female',female_ref),('male',male_ref)) if path}
+    for path in refs.values():
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'Solo reference not found: {path}')
+    if len(set(os.path.realpath(p) for p in refs.values())) != len(refs):
+        raise ValueError('Use different solo reference files for the two speakers')
+    return refs
 
+
+def _route(y, sr, segs, method, device, threshold, references=None,
+           minimum=.35, margin=.08):
     if not segs:
-        print("[!] Aucun segment détecté."); return
+        return []
+    from voice_routing import embedding_regions, pitch_regions
+    estimate = lambda audio,rate:_estimate_pitch(audio,rate,device)
+    if method == 'ecapa':
+        from speaker_identity import SpeakerEncoder
+        encoder = SpeakerEncoder(device=device)
+        return embedding_regions(y,sr,segs,encoder,estimate,references,minimum,margin,threshold)
+    if references:
+        raise ValueError('Reference matching requires method ecapa, sepformer or pyannote')
+    return pitch_regions(y,sr,segs,estimate,threshold)
 
-    # Silence fixe en samples
-    sil_n = None if silence_mode == 'auto' else (0 if silence_mode == 0.0 else int(float(silence_mode) * sr))
 
-    # -- Traitement split : clustering global F0 (k-means k=2) ----------------
-    # Plus robuste qu'un seuil fixe : s'adapte automatiquement aux deux voix.
-    if split_output:
-        # Passe 1 : clustering global
-        if cluster_method == 'ecapa':
-            seg_labels, (f_cent, m_cent) = cluster_speakers_ecapa(y, sr, segs, device)
+def _export_regions(y,sr,regions,output_file,keep_set,silence_mode,split_output,
+                    mp3_bitrate=192,mp3_mode='cbr',min_dur=.2,method='f0',references=None):
+    from voice_routing import assemble,write_report
+    base,ext=os.path.splitext(output_file)
+    ext=ext or '.wav'
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)),exist_ok=True)
+    targets = ([('female',{'female'}),('male',{'male'})] if split_output else
+               [('',{label.removesuffix('_solo') for label in keep_set})])
+    if keep_set == {'female_solo','male_solo','overlap'}:
+        targets=[('',{'female','male','overlap','unknown'})] if not split_output else targets
+    for suffix,labels in targets:
+        out=assemble(y,sr,regions,labels,silence_mode,minimum=min_dur)
+        destination=base+'_'+suffix+ext if suffix else output_file
+        if out is None:
+            if os.path.exists(destination):
+                raise FileExistsError(f'No confident new audio for {suffix or sorted(labels)}. '
+                                      f'Old output still exists: {destination}. Choose a new output name.')
+            print(f'[!] No confident audio for {suffix or sorted(labels)}; no file written.')
         else:
-            seg_labels, (f_cent, m_cent) = cluster_speakers(y, sr, segs, ov_range, device)
+            save_audio(out,sr,destination,mp3_bitrate,mp3_mode)
+    review=assemble(y,sr,regions,{'unknown','overlap'},silence_mode,minimum=0)
+    if review is not None:
+        save_audio(review,sr,base+'_review.wav',mp3_bitrate,mp3_mode)
+        print('[*] Ambiguous / simultaneous speech retained in _review.wav.')
+    report=write_report(base+'_separation.json',regions,method,references)
+    print('[*] Labelled seconds: '+', '.join(f'{key}={seconds:.1f}s' for key,seconds in sorted(report['durations'].items())))
+    print('[*] Report: '+base+'_separation.json')
+    if method != 'sepformer':
+        print('[*] Routing keeps original samples. It does not unmix simultaneous voices.')
 
-        if seg_labels is None:
-            # Fallback : logique inverse seuil fixe
-            print("   [!] Fallback seuil fixe pour le split")
-            seg_labels = {}
-            for i, (start, end) in enumerate(segs):
-                kind, f0, _ = classify(y, sr, start, end, f0_thr, ov_range, device)
-                seg_labels[i] = ('female' if kind == 'female_solo'
-                                 else 'silence' if kind == 'silence'
-                                 else 'male')
 
-        results   = {'female': [], 'male': []}
-        last_kept = {'female': None, 'male': None}
+def _source_labels(sources,sr,threshold,matcher=None):
+    from voice_routing import pitch_label
+    energy=[float(np.sqrt(np.mean(np.asarray(source,float)**2))) for source in sources]
+    loudest=max(energy,default=0)
+    labels=[]
+    for source,rms in zip(sources,energy):
+        if rms < max(1e-5,loudest*.03):
+            labels.append(('unknown',None,'silent_source'))
+            continue
+        if matcher:
+            labels.append(matcher.match(source,sr))
+        else:
+            f0,voiced,ratio,_=_f0_pyin(source,sr)
+            values=np.asarray(f0,float)
+            label,median=pitch_label(values[np.asarray(voiced,bool)],threshold)
+            labels.append((label,median,'separated_source_pitch'))
+    return labels
 
-        for i, (start, end) in enumerate(segs):
-            dur    = end - start
-            target = seg_labels.get(i, 'silence')
 
-            if debug:
-                kind_raw, f0_raw, cent_raw = classify(y, sr, start, end, f0_thr, ov_range, device)
-                f0_s   = f"{f0_raw:.0f}"   if f0_raw   is not None else "  -"
-                cent_s = f"{cent_raw:.0f}" if cent_raw is not None else "  -"
-                print(f"   {start:6.1f}-{end:6.1f}s  cluster={target:6s}  "
-                      f"F0={f0_s:>6} Hz  Cent={cent_s:>6} Hz")
+def _pick_source(src1,src2,sr,target_gender,f0_thr):
+    # Compatibility helper: uncertainty never means "take the louder source".
+    target=target_gender.removesuffix('_solo')
+    labels=_source_labels((src1,src2),sr,f0_thr)
+    matches=[source for source,result in zip((src1,src2),labels) if result[0]==target]
+    return np.sum(matches,axis=0) if matches else None
 
-            if dur < min_dur or target == 'silence':
+
+def process_sepformer(input_file,output_file,keep_set=None,silence_mode='auto',
+                      deverb_method='none',f0_thr=165,ov_range=80,min_dur=.2,
+                      debug=False,device='cpu',mp3_bitrate=192,mp3_mode='cbr',
+                      min_silence=.15,split_output=False,female_ref=None,male_ref=None,
+                      match_minimum=.35,match_margin=.08,remove_music=False,
+                      demucs_model='htdemucs_ft',demucs_shifts=2,restore_high_band=False):
+    from voice_routing import Region,ReferenceMatcher,assemble,write_report
+    keep_set=keep_set or {'female_solo'}
+    if keep_set=={'overlap'} and not split_output:
+        raise ValueError('SepFormer does not locate overlapping turns; choose female, male or split-output')
+    if keep_set=={'vocals_only'} and split_output:
+        raise ValueError('vocals only cannot be combined with split-output')
+    refs=_references(female_ref,male_ref)
+    matcher=None
+    if refs:
+        from speaker_identity import SpeakerEncoder
+        matcher=ReferenceMatcher(SpeakerEncoder(device=device),refs,match_minimum,match_margin)
+    y,sr=_load_processed_audio(input_file,deverb_method,device,remove_music,demucs_model,demucs_shifts)
+    if keep_set=={'vocals_only'} and not split_output:
+        save_audio(y,sr,output_file,mp3_bitrate,mp3_mode)
+        return
+    print('[*] SepFormer: processing every speech block, including overlapping voices.')
+    print('[*] Native separator band is 8 kHz audio (upper band limited); listen before cloning.')
+    if restore_high_band:
+        print('[!] High-band masking is approximate and can reintroduce the other voice.')
+    model=_load_sepformer(device)  # failure is explicit: never silently use F0 instead
+    speech=detect_segments(y,sr,min_silence=min_silence)
+    chunks=[]
+    for start,end in speech:
+        count=max(1,int(np.ceil((end-start)/8)))
+        edges=np.linspace(start,end,count+1)
+        chunks.extend(zip(edges[:-1],edges[1:]))
+    stems={key:np.zeros_like(y) for key in ('female','male','unknown')}
+    regions=[]
+    for index,(start,end) in enumerate(chunks):
+        first,last=round(start*sr),min(len(y),round(end*sr))
+        # Context avoids sharp model restarts at adjacent block boundaries.
+        left,right=max(0,first-round(.2*sr)),min(len(y),last+round(.2*sr))
+        debug_dir=os.path.join(os.path.dirname(output_file),'sepformer_debug') if debug else None
+        sources=_sepformer_separate(model,y[left:right],sr,debug_dir,index,restore_high_band)
+        sources=tuple(np.asarray(src[first-left:last-left],dtype=np.float32) for src in sources)
+        if any(len(src)!=last-first or not np.isfinite(src).all() for src in sources):
+            raise ValueError(f'Invalid separated audio in block {index+1}')
+        labels=_source_labels(sources,sr,f0_thr,matcher)
+        # Both source assignments use the same separation call, never a second pass.
+        for source,(label,score,reason) in zip(sources,labels):
+            if reason=='silent_source':
                 continue
+            stems[label][first:last]+=source
+            regions.append(Region(float(start),float(end),label,reason,score))
+        print(f'[*] Separated block {index+1}/{len(chunks)}')
+    peak=float(np.max(sum((np.abs(stem) for stem in stems.values()),np.zeros_like(y)),initial=0))
+    gain=min(1.,.98/max(peak,1e-9))
+    if gain<1:
+        print(f'[*] Common output attenuation {20*np.log10(gain):.1f} dB to prevent clipping')
+    base,ext=os.path.splitext(output_file);ext=ext or '.wav'
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)),exist_ok=True)
+    targets=([('female',{'female'}),('male',{'male'})] if split_output else
+             [('',{label.removesuffix('_solo') for label in keep_set})])
+    if keep_set=={'female_solo','male_solo','overlap'} and not split_output:
+        targets=[('',{'female','male','unknown'})]
+    for suffix,wanted in targets:
+        if 'overlap' in wanted:
+            raise ValueError('SepFormer outputs sources; use --keep female,male or --split-output, not overlap/all')
+        selected=[region for region in regions if region.label in wanted]
+        combined=sum((stems[label] for label in wanted if label in stems),np.zeros_like(y))*gain
+        out=assemble(combined,sr,selected,wanted,silence_mode,minimum=min_dur)
+        if out is not None:
+            save_audio(out,sr,base+'_'+suffix+ext if suffix else output_file,mp3_bitrate,mp3_mode)
+        else:
+            print(f'[!] No confident separated source for {suffix or sorted(wanted)}')
+    review=assemble(stems['unknown']*gain,sr,regions,{'unknown'},silence_mode)
+    if review is not None:
+        save_audio(review,sr,base+'_review.wav',mp3_bitrate,mp3_mode)
+    write_report(base+'_separation.json',regions,'sepformer',refs)
 
-            lk = last_kept[target]
-            if lk is not None:
-                gap = start - lk
-                n   = (int(gap * sr) if silence_mode == 'auto'
-                       else 0 if silence_mode == 0.0
-                       else sil_n)
-                if n and n > 0:
-                    results[target].append(np.zeros(n, dtype=np.float32))
 
-            chunk = y[int(start * sr):int(end * sr)].copy()
-            fade  = min(int(0.02 * sr), len(chunk) // 4)
-            if fade > 0:
-                chunk[:fade]  *= np.linspace(0, 1, fade)
-                chunk[-fade:] *= np.linspace(1, 0, fade)
-            results[target].append(chunk)
-            last_kept[target] = end
+def process_pyannote(input_file,output_file,keep_set,silence_mode,deverb_method,
+                     f0_thr,hf_token,device='cpu',mp3_bitrate=192,mp3_mode='cbr',
+                     split_output=False,female_ref=None,male_ref=None,match_minimum=.35,
+                     match_margin=.08,remove_music=False,demucs_model='htdemucs_ft',
+                     demucs_shifts=2,min_dur=.2,diarization_model='pyannote/speaker-diarization-3.1'):
+    from pyannote.audio import Pipeline
+    from voice_routing import ReferenceMatcher,partition_turns,pitch_label
+    import torch,inspect
+    if not hf_token:
+        raise ValueError('Pyannote requires HF_TOKEN in the environment or --hf-token, plus model access')
+    refs=_references(female_ref,male_ref)
+    matcher=None
+    if refs:
+        from speaker_identity import SpeakerEncoder
+        matcher=ReferenceMatcher(SpeakerEncoder(device=device),refs,match_minimum,match_margin)
+    y,sr=_load_processed_audio(input_file,deverb_method,device,remove_music,demucs_model,demucs_shifts)
+    keyword='token' if 'token' in inspect.signature(Pipeline.from_pretrained).parameters else 'use_auth_token'
+    pipeline=Pipeline.from_pretrained(diarization_model,**{keyword:hf_token})
+    if pipeline is None:
+        raise RuntimeError('Diarization model unavailable; check model access and installed pyannote version')
+    pipeline.to(torch.device(device))
+    result=pipeline(dict(waveform=torch.from_numpy(y[None]),sample_rate=sr))
+    annotation=getattr(result,'speaker_diarization',result)
+    turns=[(max(0,float(turn.start)),min(len(y)/sr,float(turn.end)),str(speaker))
+           for turn,_,speaker in annotation.itertracks(yield_label=True) if turn.end>turn.start]
+    # Obtain truly solo intervals before identifying each speaker. Do not learn
+    # a woman's identity or pitch from a mixed segment assigned to both people.
+    solo=partition_turns(turns,{speaker:speaker for _,_,speaker in turns})
+    labels={}
+    for speaker in sorted({speaker for _,_,speaker in turns}):
+        candidates=sorted((r for r in solo if r.label==speaker),key=lambda r:-(r.end-r.start))[:8]
+        if matcher:
+            embeddings=[matcher.encoder.embed(y[round(r.start*sr):round(min(r.end,r.start+5)*sr)],sr=sr)
+                        for r in candidates if r.end-r.start>=.5]
+            labels[speaker]=matcher.match_embedding(np.mean(embeddings,axis=0))[0] if embeddings else 'unknown'
+        else:
+            medians=[]
+            for r in candidates:
+                if r.end-r.start<.2:
+                    continue
+                f0,voiced,_,_=_estimate_pitch(y[round(r.start*sr):round(min(r.end,r.start+5)*sr)],sr,device)
+                values=np.asarray(f0,float)[np.asarray(voiced,bool)]
+                values=values[np.isfinite(values)]
+                if len(values)>=3:
+                    medians.append(float(np.median(values)))
+            labels[speaker]=pitch_label(np.repeat(medians,3),f0_thr)[0]
+        print(f'[*] {speaker}: {labels[speaker]}')
+    regions=partition_turns(turns,labels)
+    _export_regions(y,sr,regions,output_file,keep_set,silence_mode,split_output,
+                    mp3_bitrate,mp3_mode,min_dur,'pyannote',refs)
 
-        base, ext = os.path.splitext(output_file)
-        for tag in ('female', 'male'):
-            r = results[tag]
-            if r:
-                save_audio(np.concatenate(r), sr, base + f'_{tag}' + ext, mp3_bitrate, mp3_mode)
-            else:
-                print(f"[!] Aucun segment {tag} trouve.")
 
-    # -- Traitement simple (keep_set) -----------------------------------------
-    else:
-        result      = []
-        last_kept_end = None
+def cluster_speakers(y,sr,segs,ov_range=80,device='cpu'):
+    # Compatibility interface: never force a high/low k=2 split.
+    labels={}
+    pitches={'female':[],'male':[]}
+    for index,(start,end) in enumerate(segs):
+        kind,median,_=classify(y,sr,start,end,device=device)
+        label=kind.removesuffix('_solo')
+        labels[index]=label
+        if label in pitches and median is not None:
+            pitches[label].append(median)
+    return labels,tuple(float(np.median(pitches[key])) if pitches[key] else None for key in ('female','male'))
 
-        # ECAPA mode: one global speaker clustering, then map to keep labels.
-        seg_labels_ec = None
-        if cluster_method == 'ecapa' and keep_set and (keep_set & {'female_solo', 'male_solo'}):
-            seg_labels_ec, _ = cluster_speakers_ecapa(y, sr, segs, device)
 
-        for i, (start, end) in enumerate(segs):
-            dur = end - start
-            if seg_labels_ec is not None:
-                lab  = seg_labels_ec.get(i, 'silence')
-                kind = ('female_solo' if lab == 'female'
-                        else 'male_solo' if lab == 'male' else 'silence')
-                f0 = cent = None
-            else:
-                kind, f0, cent = classify(y, sr, start, end, f0_thr, ov_range, device)
+def cluster_speakers_ecapa(y,sr,segs,device='cpu'):
+    from speaker_identity import SpeakerEncoder
+    from voice_routing import embedding_regions
+    # Existing callers receive one label per interval; new processing uses finer cells.
+    regions=embedding_regions(y,sr,segs,SpeakerEncoder(device=device),lambda c,r:_estimate_pitch(c,r,device))
+    labels={}
+    for index,(start,end) in enumerate(segs):
+        durations={}
+        for region in regions:
+            overlap=max(0,min(end,region.end)-max(start,region.start))
+            durations[region.label]=durations.get(region.label,0)+overlap
+        labels[index]=max(durations,key=durations.get) if durations else 'unknown'
+    return labels,(None,None)
 
-            if debug:
-                f0_s   = f"{f0:.0f}"   if f0   is not None else "  -"
-                cent_s = f"{cent:.0f}" if cent is not None else "  -"
-                mark   = '[OK]' if kind in keep_set else '-> skip'
-                print(f"   {start:6.1f}-{end:6.1f}s  {kind:14s}  F0={f0_s:>6} Hz  Cent={cent_s:>6} Hz  {mark}")
 
-            if kind in keep_set and dur >= min_dur:
-                if last_kept_end is not None:
-                    gap = start - last_kept_end
-                    n   = (int(gap * sr) if silence_mode == 'auto'
-                           else 0 if silence_mode == 0.0
-                           else sil_n)
-                    if n and n > 0:
-                        result.append(np.zeros(n, dtype=np.float32))
-                chunk = y[int(start * sr):int(end * sr)].copy()
-                fade  = min(int(0.02 * sr), len(chunk) // 4)
-                if fade > 0:
-                    chunk[:fade]  *= np.linspace(0, 1, fade)
-                    chunk[-fade:] *= np.linspace(1, 0, fade)
-                result.append(chunk)
-                last_kept_end = end
+def process(input_file,output_file,keep_set=None,silence_mode='auto',
+            deverb_method='none',f0_thr=165,ov_range=80,min_dur=.2,
+            debug=False,remove_music=False,demucs_model='htdemucs_ft',device='cpu',
+            mp3_bitrate=192,mp3_mode='cbr',min_silence=.15,split_output=False,
+            demucs_shifts=2,cluster_method='f0',female_ref=None,male_ref=None,
+            match_minimum=.35,match_margin=.08):
+    keep_set=keep_set or {'female_solo'}
+    refs=_references(female_ref,male_ref)
+    y,sr=_load_processed_audio(input_file,deverb_method,device,remove_music,demucs_model,demucs_shifts)
+    if keep_set=={'vocals_only'}:
+        if split_output:
+            raise ValueError('vocals only cannot be combined with split-output')
+        save_audio(y,sr,output_file,mp3_bitrate,mp3_mode)
+        return
+    segments=detect_segments(y,sr,min_silence=min_silence)
+    regions=_route(y,sr,segments,cluster_method,device,f0_thr,refs,match_minimum,match_margin)
+    if debug:
+        for region in regions:
+            print(f'{region.start:.2f}-{region.end:.2f}s {region.label}: {region.reason}')
+    _export_regions(y,sr,regions,output_file,keep_set,silence_mode,split_output,
+                    mp3_bitrate,mp3_mode,min_dur,cluster_method,refs)
 
-        if not result:
-            print("[!] Aucun segment gardé !"); return
 
-        if last_kept_end is not None and last_kept_end < total_dur:
-            if silence_mode == 'auto':
-                result.append(np.zeros(int((total_dur - last_kept_end) * sr), dtype=np.float32))
-            elif sil_n and sil_n > 0:
-                result.append(np.zeros(sil_n, dtype=np.float32))
-
-        save_audio(np.concatenate(result), sr, output_file, mp3_bitrate, mp3_mode)
+def analyze_routing(input_file,method='f0',threshold=165,min_silence=.15,device='cpu',
+                    female_ref=None,male_ref=None,minimum=.35,margin=.08):
+    if method not in ('f0','ecapa'):
+        raise ValueError('Analyze previews routing with f0/ecapa. Use Separate for sepformer/pyannote.')
+    y,sr=_load_processed_audio(input_file)
+    regions=_route(y,sr,detect_segments(y,sr,min_silence=min_silence),method,device,
+                   threshold,_references(female_ref,male_ref),minimum,margin)
+    for region in regions:
+        print(f'{region.start:8.2f}-{region.end:8.2f}s {region.label:8} {region.reason}')
+    print('[*] Pitch labels are heuristic; use solo references for speaker identification.')
 
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
@@ -1535,11 +1024,12 @@ def parse_silence(s):
     s = s.strip().lower()
     if s == 'auto': return 'auto'
     v = float(s)
-    if v < 0: raise argparse.ArgumentTypeError("Valeur négative")
+    if not np.isfinite(v) or v < 0: raise argparse.ArgumentTypeError("Silence must be finite and nonnegative")
     return v
 
 
-if __name__ == "__main__":
+def main():
+    global _TEMPO
     p = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
 
@@ -1554,7 +1044,7 @@ if __name__ == "__main__":
     p.add_argument("--threshold", type=int, default=165,
                    help="Seuil F0 Hz pour séparer F/H (défaut: 165)")
     p.add_argument("--overlap-range", type=int, default=80,
-                   help="Plage F0 Hz au-delà de laquelle = overlap (défaut: 80)")
+                   help="Legacy compatibility option; pitch range no longer claims overlap")
     p.add_argument("--min-dur", type=float, default=0.2,
                    help="Durée minimale d'un segment gardé en secondes (défaut: 0.2)")
     p.add_argument("--min-silence", type=float, default=0.15,
@@ -1562,9 +1052,16 @@ if __name__ == "__main__":
     p.add_argument("--dereverberate", choices=['none', 'noisereduce', 'wpe', 'deepfilter'],
                    default='none')
     p.add_argument("--method", choices=['f0', 'ecapa', 'sepformer', 'pyannote'], default='f0',
-                   help="Methode: f0 (defaut) | sepformer (separation neuronale, recommande) | pyannote (requiert --hf-token)")
-    p.add_argument("--hf-token", default="",
+                   help="f0: pitch heuristic | ecapa: speaker matching | sepformer: unmix sources | pyannote: diarization")
+    p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", os.environ.get("HUGGINGFACE_HUB_TOKEN", "")),
                    help="Token HuggingFace pour pyannote.audio")
+    p.add_argument('--female-ref', help='Solo example for the female output speaker')
+    p.add_argument('--male-ref', help='Solo example for the male output speaker')
+    p.add_argument('--match-minimum', type=float, default=.35, help='Heuristic minimum reference cosine')
+    p.add_argument('--match-margin', type=float, default=.08, help='Heuristic gap between reference matches')
+    p.add_argument('--restore-high-band', action='store_true', help='Approximate SepFormer high band from the mixture; may reintroduce voices')
+    p.add_argument('--diarization-model', default='pyannote/speaker-diarization-3.1',
+                   choices=['pyannote/speaker-diarization-3.1','pyannote/speaker-diarization-community-1'])
     p.add_argument("--analyze", action="store_true",
                    help="Affiche stats par segment sans produire de sortie")
     p.add_argument("--split-output", action="store_true",
@@ -1607,7 +1104,36 @@ if __name__ == "__main__":
                    help="Time-stretch factor, pitch preserved (e.g. 0.85 slower, "
                         "1.25 faster; 1.0 = unchanged)")
     args = p.parse_args()
+    args.input=os.path.abspath(os.path.expanduser(args.input))
+    if args.output: args.output=os.path.abspath(os.path.expanduser(args.output))
 
+    import math
+    if sf is None or librosa is None:
+        p.error('Audio dependencies missing: install soundfile and librosa in your XTTS environment')
+    for name in ('tempo','threshold','min_dur','min_silence','match_minimum','match_margin'):
+        if not math.isfinite(getattr(args,name)):
+            p.error(f'{name} must be finite')
+    if args.tempo<=0 or args.threshold<=0 or args.min_dur<0 or args.min_silence<0:
+        p.error('Positive tempo/threshold and nonnegative segment durations are required')
+    if not 0<=args.match_minimum<=1 or not 0<=args.match_margin<=2:
+        p.error('match-minimum in [0,1] and match-margin in [0,2] required')
+    try:
+        _references(args.female_ref,args.male_ref)
+    except (ValueError,OSError) as exc:
+        p.error(str(exc))
+    if (args.female_ref or args.male_ref) and args.method=='f0':
+        p.error('Choose --method ecapa, sepformer or pyannote to use speaker references')
+    if args.output:
+        if not os.path.splitext(args.output)[1]: args.output += '.wav'
+        protected=[args.input,args.female_ref,args.male_ref]
+        base,ext=os.path.splitext(args.output)
+        destinations=[args.output,base+'_female'+ext,base+'_male'+ext,base+'_review.wav']
+        if any(os.path.realpath(dest)==os.path.realpath(src) for dest in destinations for src in protected if src):
+            p.error('Output files must differ from source and speaker references')
+    if not os.path.isfile(args.input):
+        p.error(f'Source not found: {args.input}')
+    if args.keep=={'overlap'} and args.method!='pyannote' and not args.split_output:
+        p.error('Only pyannote detects overlap intervals; SepFormer separates sources, F0/ECAPA route voices')
     _TEMPO = float(args.tempo)
     if abs(_TEMPO - 1.0) > 1e-3:
         print(f"[*] Tempo ×{_TEMPO} (pitch preserved) will be applied to outputs.")
@@ -1616,91 +1142,125 @@ if __name__ == "__main__":
     if not args.analyze and args.output is None:
         p.error("output est requis sauf avec --analyze")
 
-    # Video input → extract audio
-    VIDEO_EXT = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4a', '.m4v', '.ts', '.wmv', '.flv'}
-    if os.path.splitext(args.input)[1].lower() in VIDEO_EXT:
-        _tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-        _tmp.close()
-        print(f"[*] Vidéo détectée — extraction audio...")
-        subprocess.run(['ffmpeg', '-y', '-i', args.input, '-vn', '-ac', '1', '-ar', '16000', _tmp.name],
-                       check=True, capture_output=True)
-        print(f"[*] Audio extrait: {_tmp.name}")
-        args.input = _tmp.name
+    temporary_video_audio=None
+    try:
+        # Video input → extract audio
+        VIDEO_EXT = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4a', '.m4v', '.ts', '.wmv', '.flv'}
+        if os.path.splitext(args.input)[1].lower() in VIDEO_EXT:
+            _tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            _tmp.close()
+            temporary_video_audio=_tmp.name
+            print(f"[*] Vidéo détectée — extraction audio...")
+            # Keep the source sample rate. Forcing 16 kHz here threw away
+            # everything above 8 kHz before any processing, so a reference
+            # extracted from a video was band-limited for good -- and XTTS
+            # conditions on exactly that upper band for timbre.
+            subprocess.run(['ffmpeg', '-y', '-i', args.input, '-vn', '-ac', '1',
+                            '-c:a', 'pcm_s16le', _tmp.name],
+                           check=True, capture_output=True)
+            print(f"[*] Audio extrait: {_tmp.name}")
+            args.input = _tmp.name
 
-    # Mode analyse
-    if args.analyze:
-        analyze(args.input, args.threshold, args.overlap_range, args.min_silence, args.device)
+        # Mode analyse
+        if args.analyze:
+            analyze_routing(args.input,args.method,args.threshold,args.min_silence,args.device,
+                            args.female_ref,args.male_ref,args.match_minimum,args.match_margin)
 
-    # Shorten silences: keep the whole take, compress only the gaps. Runs
-    # instead of the segment pipeline, because the two answer different needs —
-    # segmenting sorts speakers, shortening cleans up a talky source.
-    elif args.shorten_silences is not None:
-        import soundfile as _sf
-        _y, _sr = librosa.load(args.input, sr=None, mono=True)
-        print(f"[*]  {args.input}")
-        print(f"   [*] Source: {len(_y) / _sr:.1f}s")
-        _out = shorten_silences(_y, _sr,
-                                target_ms=args.shorten_silences,
-                                min_gap_ms=args.shorten_min_gap)
-        _dest = args.output
-        if _dest and not os.path.splitext(_dest)[1]:
-            _dest += '.wav'
-            print(f"   [!] No extension given -> saving as {os.path.basename(_dest)}")
-        save_audio(_out, _sr, _dest, args.mp3_bitrate, args.mp3_mode)
-        print("[OK] Done.")
+        # Shorten silences: keep the whole take, compress only the gaps. Runs
+        # instead of the segment pipeline, because the two answer different needs —
+        # segmenting sorts speakers, shortening cleans up a talky source.
+        elif args.shorten_silences is not None:
+            import soundfile as _sf
+            _y, _sr = librosa.load(args.input, sr=None, mono=True)
+            print(f"[*]  {args.input}")
+            print(f"   [*] Source: {len(_y) / _sr:.1f}s")
+            _out = shorten_silences(_y, _sr,
+                                    target_ms=args.shorten_silences,
+                                    min_gap_ms=args.shorten_min_gap)
+            _dest = args.output
+            if _dest and not os.path.splitext(_dest)[1]:
+                _dest += '.wav'
+                print(f"   [!] No extension given -> saving as {os.path.basename(_dest)}")
+            save_audio(_out, _sr, _dest, args.mp3_bitrate, args.mp3_mode)
+            print("[OK] Done.")
 
-    # Age shift: a straight transform of the whole take, no segmenting.
-    elif args.age or args.pitch_shift is not None:
-        _y, _sr = librosa.load(args.input, sr=None, mono=True)
-        print(f"[*]  {args.input}")
-        if args.age:
-            _st = AGE_PRESETS[args.age][args.age_sex]
-            print(f"   [*] Preset '{args.age}' ({args.age_sex}): pitch {_st:+g} st")
+        # Age shift: a straight transform of the whole take, no segmenting.
+        elif args.age or args.pitch_shift is not None:
+            _y, _sr = librosa.load(args.input, sr=None, mono=True)
+            print(f"[*]  {args.input}")
+            if args.age:
+                _st = AGE_PRESETS[args.age][args.age_sex]
+                print(f"   [*] Preset '{args.age}' ({args.age_sex}): pitch {_st:+g} st")
+            else:
+                _st = 0.0
+            if args.pitch_shift is not None:
+                _st = args.pitch_shift
+            _f0h = None
+            try:
+                _f0, _vf, _ = librosa.pyin(_y[:int(30 * _sr)], fmin=60, fmax=400, sr=_sr)
+                _fv = _f0[_vf & ~np.isnan(_f0)]
+                if len(_fv):
+                    _f0h = float(np.median(_fv))
+                    print(f"   [*] Source F0: {_f0h:.0f} Hz")
+            except Exception:
+                pass
+            _w = age_warning(_st, _f0h)
+            if _w:
+                print(f"   [!] {_w}")
+            _out = shift_age(_y, _sr, semitones=_st,
+                             preserve_formants=args.preserve_formants)
+            _dest = args.output
+            if _dest and not os.path.splitext(_dest)[1]:
+                _dest += '.wav'
+                print(f"   [!] No extension given -> saving as {os.path.basename(_dest)}")
+            save_audio(_out, _sr, _dest, args.mp3_bitrate, args.mp3_mode)
+            print("   [*] LISTEN before cloning: past about 3 semitones the vocal "
+                  "tract stops sounding plausible.")
+            print("[OK] Done.")
+
+        # Whole vocal track is a preprocessing operation, independent of routing backend.
+        elif args.keep=={'vocals_only'}:
+            process(args.input,args.output,args.keep,args.silence,args.dereverberate,
+                    remove_music=args.remove_music,demucs_model=args.demucs_model,
+                    device=args.device,mp3_bitrate=args.mp3_bitrate,mp3_mode=args.mp3_mode,
+                    demucs_shifts=args.demucs_shifts,split_output=args.split_output)
+
+        # Méthode SepFormer (séparation neuronale réelle)
+        elif args.method == 'sepformer':
+            process_sepformer(args.input, args.output, args.keep, args.silence,
+                              args.dereverberate, args.threshold, args.overlap_range,
+                              args.min_dur, args.debug, args.device,
+                              args.mp3_bitrate, args.mp3_mode, args.min_silence, args.split_output,
+                              female_ref=args.female_ref,male_ref=args.male_ref,
+                              match_minimum=args.match_minimum,match_margin=args.match_margin,
+                              remove_music=args.remove_music,demucs_model=args.demucs_model,
+                              demucs_shifts=args.demucs_shifts,restore_high_band=args.restore_high_band)
+
+        # Méthode pyannote
+        elif args.method == 'pyannote':
+            process_pyannote(args.input, args.output, args.keep, args.silence,
+                             args.dereverberate, args.threshold, args.hf_token,
+                             args.device, args.mp3_bitrate, args.mp3_mode, args.split_output,
+                             female_ref=args.female_ref,male_ref=args.male_ref,
+                             match_minimum=args.match_minimum,match_margin=args.match_margin,
+                             remove_music=args.remove_music,demucs_model=args.demucs_model,
+                             demucs_shifts=args.demucs_shifts,min_dur=args.min_dur,
+                             diarization_model=args.diarization_model)
+
+        # Méthode F0 (défaut)
         else:
-            _st = 0.0
-        if args.pitch_shift is not None:
-            _st = args.pitch_shift
-        _f0h = None
-        try:
-            _f0, _vf, _ = librosa.pyin(_y[:int(30 * _sr)], fmin=60, fmax=400, sr=_sr)
-            _fv = _f0[_vf & ~np.isnan(_f0)]
-            if len(_fv):
-                _f0h = float(np.median(_fv))
-                print(f"   [*] Source F0: {_f0h:.0f} Hz")
-        except Exception:
-            pass
-        _w = age_warning(_st, _f0h)
-        if _w:
-            print(f"   [!] {_w}")
-        _out = shift_age(_y, _sr, semitones=_st,
-                         preserve_formants=args.preserve_formants)
-        _dest = args.output
-        if _dest and not os.path.splitext(_dest)[1]:
-            _dest += '.wav'
-            print(f"   [!] No extension given -> saving as {os.path.basename(_dest)}")
-        save_audio(_out, _sr, _dest, args.mp3_bitrate, args.mp3_mode)
-        print("   [*] LISTEN before cloning: past about 3 semitones the vocal "
-              "tract stops sounding plausible.")
-        print("[OK] Done.")
+            process(args.input, args.output, args.keep, args.silence, args.dereverberate,
+                    args.threshold, args.overlap_range, args.min_dur, args.debug,
+                    args.remove_music, args.demucs_model, args.device,
+                    args.mp3_bitrate, args.mp3_mode, args.min_silence, args.split_output,
+                    demucs_shifts=args.demucs_shifts,
+                    cluster_method=('ecapa' if args.method == 'ecapa' else 'f0'),
+                    female_ref=args.female_ref,male_ref=args.male_ref,
+                    match_minimum=args.match_minimum,match_margin=args.match_margin)
+    finally:
+        if temporary_video_audio and os.path.exists(temporary_video_audio):
+            os.unlink(temporary_video_audio)
 
-    # Méthode SepFormer (séparation neuronale réelle)
-    elif args.method == 'sepformer':
-        process_sepformer(args.input, args.output, args.keep, args.silence,
-                          args.dereverberate, args.threshold, args.overlap_range,
-                          args.min_dur, args.debug, args.device,
-                          args.mp3_bitrate, args.mp3_mode, args.min_silence, args.split_output)
 
-    # Méthode pyannote
-    elif args.method == 'pyannote':
-        process_pyannote(args.input, args.output, args.keep, args.silence,
-                         args.dereverberate, args.threshold, args.hf_token,
-                         args.device, args.mp3_bitrate, args.mp3_mode, args.split_output)
-
-    # Méthode F0 (défaut)
-    else:
-        process(args.input, args.output, args.keep, args.silence, args.dereverberate,
-                args.threshold, args.overlap_range, args.min_dur, args.debug,
-                args.remove_music, args.demucs_model, args.device,
-                args.mp3_bitrate, args.mp3_mode, args.min_silence, args.split_output,
-                demucs_shifts=args.demucs_shifts,
-                cluster_method=('ecapa' if args.method == 'ecapa' else 'f0'))
+if __name__ == '__main__':
+    main()

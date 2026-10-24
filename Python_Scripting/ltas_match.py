@@ -8,7 +8,7 @@ broadband volume offset so that the clone's LTAS matches the reference's LTAS in
 a least-squares sense over the speech band.
 
 The peaking responses modelled here are the EXACT responses FFmpeg applies:
-  low  : f0=200  Hz, BW=200  Hz  (Q = f0/BW = 1.00)
+  low  : f0=120  Hz, BW=160  Hz  (Q = f0/BW = 0.75)
   mid  : f0=1500 Hz, BW=2000 Hz  (Q = 0.75)
   high : f0=5000 Hz, BW=3000 Hz  (Q = 1.667)
 hp/lp are pydub one-pole (-6 dB/oct) filters, derived from the LTAS roll-off,
@@ -23,6 +23,7 @@ Public API:
 import numpy as np
 from scipy.signal import welch
 from scipy.optimize import least_squares
+from audio_checks import mono_audio
 
 # Generator EQ band definitions — must mirror apply_eq() in the generator.
 # eq_low sits at 120 Hz, not 200: a bell centred at 200 Hz delivers only ~19%
@@ -105,7 +106,11 @@ def compute_ltas(y, sr, fmin=FIT_FMIN, fmax=FIT_FMAX, n_grid=N_GRID):
     Returns (f_grid, ltas_db). The dB curve is *relative* (peak-normalised),
     so only its shape matters — absolute level is handled separately by `vol`.
     """
-    y = np.asarray(y, dtype=np.float64)
+    y = mono_audio(y, sr)
+    if not (np.isfinite(fmin) and np.isfinite(fmax) and 0 < fmin < min(fmax, sr / 2 - 1)):
+        raise ValueError("Invalid LTAS frequency interval for this sample rate")
+    if not isinstance(n_grid, (int, np.integer)) or n_grid < 4:
+        raise ValueError("LTAS requires at least four grid points")
     nper = min(4096, len(y))
     if nper < 256:
         nper = len(y)
@@ -138,7 +143,7 @@ def derive_hp_lp(f_grid, ref_db, clone_db, cur_hp=0, cur_lp=0):
             hp = float(np.clip((cur_hp or HP_MIN) + 30, HP_MIN, HP_MAX))
         elif excess_low < -3 and cur_hp > HP_MIN:
             hp = float(np.clip(cur_hp - 30, HP_MIN, HP_MAX))
-    hi = f_grid > 8000
+    hi = f_grid >= 6000  # measured upper band, inside the default 80–8000 Hz grid
     if hi.any():
         excess_high = float(np.mean(clone_db[hi] - ref_db[hi]))
         if excess_high > 3:
@@ -152,32 +157,18 @@ def derive_hp_lp(f_grid, ref_db, clone_db, cur_hp=0, cur_lp=0):
 
 def level_match_db(ref_y, clone_y, cur_vol=0, lo=-18, hi=18):
     """Volume correction (dB) from the RMS gap — the proper level match."""
-    r = 20.0 * np.log10(np.sqrt(np.mean(np.asarray(ref_y, float) ** 2)) + 1e-12)
-    c = 20.0 * np.log10(np.sqrt(np.mean(np.asarray(clone_y, float) ** 2)) + 1e-12)
+    ref_y = mono_audio(ref_y)
+    clone_y = mono_audio(clone_y)
+    r = 20.0 * np.log10(np.sqrt(np.mean(ref_y ** 2)) + 1e-12)
+    clone_y = mono_audio(clone_y)
+    c = 20.0 * np.log10(np.sqrt(np.mean(clone_y ** 2)) + 1e-12)
     return int(np.clip(round(cur_vol + (r - c)), lo, hi))
 
 
-def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000, weighting='a',
-              g_bounds=(-6.0, 6.0), cur_hp=0, cur_lp=0):
-    """Fit [g_low, g_mid, g_high] minimising ‖(clone_shape + EQ) − ref_shape‖²
-    over the speech band, using the EXACT generator EQ responses.
-
-    A free broadband offset `c` absorbs any residual level mismatch from the
-    peak-normalisation of the LTAS; it is a nuisance and discarded (level is
-    handled by `level_match_db` from the raw RMS). Returns the rounded EQ
-    gains, derived hp/lp, and the weighted RMS residual (dB) before/after.
-    """
-    D = ref_db - clone_db                       # dB the clone must gain at each f
-    # Weighting decides WHERE an error counts, and the right answer depends on
-    # the goal:
-    #   'a'     IEC A-weighting — equal-loudness. Correct for balance, but it
-    #           discounts 80 Hz by ~22 dB, i.e. the fundamental of a bass voice
-    #           weighs 4.6x less than the mid-range.
-    #   'voice' the reference's OWN spectrum — errors count where this speaker
-    #           actually has energy. Better when the goal is to resemble a
-    #           particular person rather than to sound evenly loud.
-    #   'blend' geometric mean of both: keeps the ear's emphasis without
-    #           erasing the speaker's low end.
+def spectrum_weights(f_grid, ref_db, weighting='a'):
+    if weighting not in ('a', 'voice', 'blend'):
+        raise ValueError('weighting must be a, voice or blend')
+    f_grid, ref_db = np.asarray(f_grid, float), np.asarray(ref_db, float)
     f2 = np.maximum(f_grid, 1.0) ** 2
     ra = (12194.0**2 * f2**2) / ((f2 + 20.6**2)
          * np.sqrt((f2 + 107.7**2) * (f2 + 737.9**2)) * (f2 + 12194.0**2))
@@ -192,6 +183,52 @@ def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000, weighting='a',
     else:
         w = w_a
     w = w / w.mean()
+    return w
+
+
+def spectral_shape_error(f_grid, ref_db, clone_db, weighting='a'):
+    """Weighted shape error measured on real audio, independent of level."""
+    ref_db, clone_db = np.asarray(ref_db,float), np.asarray(clone_db,float)
+    if ref_db.shape != clone_db.shape or not np.isfinite(ref_db-clone_db).all():
+        raise ValueError('Incompatible or non-finite spectra')
+    weights = spectrum_weights(f_grid, ref_db, weighting)
+    delta = clone_db-ref_db
+    delta -= np.average(delta,weights=weights)
+    return float(np.sqrt(np.average(delta**2,weights=weights)))
+
+
+def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000, weighting='a',
+              g_bounds=(-6.0, 6.0), cur_hp=0, cur_lp=0):
+    """Fit [g_low, g_mid, g_high] minimising ‖(clone_shape + EQ) − ref_shape‖²
+    over the speech band, using the EXACT generator EQ responses.
+
+    A free broadband offset `c` absorbs any residual level mismatch from the
+    peak-normalisation of the LTAS; it is a nuisance and discarded (level is
+    handled by `level_match_db` from the raw RMS). Returns the rounded EQ
+    gains, derived hp/lp, and the weighted RMS residual (dB) before/after.
+    """
+    f_grid, ref_db, clone_db = [np.asarray(x, float) for x in (f_grid, ref_db, clone_db)]
+    if (f_grid.ndim != 1 or len(f_grid) < 4 or ref_db.shape != f_grid.shape
+            or clone_db.shape != f_grid.shape or not all(np.isfinite(x).all() for x in (f_grid, ref_db, clone_db))
+            or np.any(np.diff(f_grid) <= 0) or f_grid[0] <= 0 or f_grid[-1] >= fs / 2
+            or not np.isfinite(fs) or fs <= 2 * max(b[1] for b in EQ_BANDS)):
+        raise ValueError("Invalid spectrum or sample rate for EQ fitting")
+    if weighting not in ('a', 'voice', 'blend'):
+        raise ValueError("weighting must be a, voice or blend")
+    if not np.isfinite(g_bounds).all() or g_bounds[0] >= g_bounds[1]:
+        raise ValueError("Invalid EQ gain bounds")
+    D = ref_db - clone_db                       # dB the clone must gain at each f
+    # Weighting decides WHERE an error counts, and the right answer depends on
+    # the goal:
+    #   'a'     IEC A-weighting — equal-loudness. Correct for balance, but it
+    #           discounts 80 Hz by ~22 dB, i.e. the fundamental of a bass voice
+    #           weighs 4.6x less than the mid-range.
+    #   'voice' the reference's OWN spectrum — errors count where this speaker
+    #           actually has energy. Better when the goal is to resemble a
+    #           particular person rather than to sound evenly loud.
+    #   'blend' geometric mean of both: keeps the ear's emphasis without
+    #           erasing the speaker's low end.
+    w = spectrum_weights(f_grid, ref_db, weighting)
     sw = np.sqrt(w)
 
     def residual(p):
@@ -201,24 +238,18 @@ def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000, weighting='a',
 
     lo = [-24.0, g_bounds[0], g_bounds[0], g_bounds[0]]
     hi = [+24.0, g_bounds[1], g_bounds[1], g_bounds[1]]
-    x0 = [float(np.average(D, weights=w)), 0.0, 0.0, 0.0]
+    x0 = np.clip([float(np.average(D, weights=w)), 0., 0., 0.], lo, hi)
 
     sol = least_squares(residual, x0, bounds=(lo, hi), method='trf')
     _c, gl, gm, gh = sol.x
 
-    # The three gains must describe a SHAPE, not a level. The model is EQ + c,
-    # and a constant offset applied to all three bands is indistinguishable
-    # from c, so least squares happily drifts them together until they hit the
-    # bounds — producing blocks like (+11.5, +11.0, +11.5), i.e. +11 dB of
-    # plain gain immediately cancelled by vol, correcting nothing. Re-centre
-    # them and let the volume carry the level.
-    mean_g = (gl + gm + gh) / 3.0
-    if abs(mean_g) > 0.05:
-        gl, gm, gh = gl - mean_g, gm - mean_g, gh - mean_g
-        _c = _c + mean_g
-
+    # Bell filters do not sum to a constant gain: never recenter their gains.
+    # Report the response of the rounded values actually exported to the renderer.
+    gl, gm, gh = [float(np.clip(round(float(g), 1), *g_bounds)) for g in (gl, gm, gh)]
+    remaining = eq_peaking_db(f_grid, fs, [gl, gm, gh]) - D
+    remaining -= np.average(remaining, weights=w)
     res_before = float(np.sqrt(np.average((D - np.average(D, weights=w)) ** 2, weights=w)))
-    res_after  = float(np.sqrt(np.average(residual(sol.x) ** 2)))
+    res_after = float(np.sqrt(np.average(remaining ** 2, weights=w)))
 
     hp, lp = derive_hp_lp(f_grid, ref_db, clone_db, cur_hp, cur_lp)
 
@@ -241,8 +272,8 @@ def sibilance_db(y, sr):
     """Sibilance ratio in dB: energy(5-8 kHz) vs energy(300-3 kHz).
     Comparing this between reference and clone gives a MEASURED de-esser
     setting instead of an by-ear guess."""
-    y = np.asarray(y, float)
-    n = min(len(y), sr * 60)
+    y = mono_audio(y, sr)
+    n = min(len(y), int(sr * 60))
     Y = np.abs(np.fft.rfft(y[:n] * np.hanning(n))) ** 2
     f = np.fft.rfftfreq(n, 1 / sr)
     def band(lo, hi):
@@ -255,7 +286,7 @@ def crest_db(y):
     """Crest factor in dB (peak vs RMS) — a proxy for dynamic range.
     Clone crest >> reference crest means the clone is more 'peaky' and a
     matching compression amount can be derived by measurement."""
-    y = np.asarray(y, float)
+    y = mono_audio(y)
     rms = float(np.sqrt(np.mean(y ** 2)) + 1e-12)
     peak = float(np.max(np.abs(y)) + 1e-12)
     return 20.0 * np.log10(peak / rms)
@@ -264,5 +295,6 @@ def crest_db(y):
 def level_to_target_db(clone_y, target_dbfs, cur_vol=0, lo=-18, hi=18):
     """Volume correction (dB) to bring the clone to an absolute RMS target,
     instead of matching a (possibly very quiet) reference."""
-    c = 20.0 * np.log10(np.sqrt(np.mean(np.asarray(clone_y, float) ** 2)) + 1e-12)
+    clone_y = mono_audio(clone_y)
+    c = 20.0 * np.log10(np.sqrt(np.mean(clone_y ** 2)) + 1e-12)
     return int(np.clip(round(cur_vol + (target_dbfs - c)), lo, hi))

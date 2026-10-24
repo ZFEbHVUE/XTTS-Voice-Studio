@@ -937,7 +937,7 @@ def validate_segment(seg):
     # Optional level of the GLOBAL music while this segment plays. Absent =
     # the session's global level.
     if seg.get("global_level") is not None:
-        seg["global_level"] = max(0.0, float(seg["global_level"]))
+        seg["global_level"] = float(seg["global_level"])
     else:
         seg.pop("global_level", None)
     if seg.get("bowl_name"):
@@ -950,6 +950,27 @@ def validate_segment(seg):
     else:
         seg.pop("music", None)
         seg.pop("music_level", None)
+    for key in ('carrier', 'duration', 'tone_level', 'drone', 'noise', 'music_level',
+                'global_level', 'duck', 'rot_rpm', 'rot_depth', 'stereo_phase'):
+        if key in seg:
+            seg[key] = float(seg[key])
+            if not np.isfinite(seg[key]):
+                raise ValueError(f"{key} must be finite")
+    for key in ('carrier', 'duration'):
+        if seg[key] <= 0:
+            raise ValueError(f"{key} must be positive")
+    for key in ('tone_level', 'drone', 'noise', 'music_level', 'global_level', 'rot_rpm'):
+        if seg.get(key, 0) < 0:
+            raise ValueError(f"{key} must be nonnegative")
+    beats = seg['beat'] if isinstance(seg['beat'], tuple) else (seg['beat'],)
+    if any(not np.isfinite(b) or b < 0 for b in beats):
+        raise ValueError("beat must be finite and nonnegative")
+    if not 0 <= seg.get('duck', 0) <= 0.9 or not 0 <= seg.get('rot_depth', 1) <= 1:
+        raise ValueError("duck must be in [0, .9] and rot_depth in [0, 1]")
+    if mode == 'isochronic' and not 0 < seg['duty'] < 1:
+        raise ValueError("duty must be in (0, 1)")
+    if seg.get('noise_color', 'pink') not in ('white', 'pink', 'brown'):
+        raise ValueError("noise_color must be white, pink or brown")
     return seg
 
 
@@ -1013,8 +1034,11 @@ def segments_to_text(segments, global_music=None):
 # ======================================================================
 class ToneToolbox:
     def __init__(self, sample_rate=44100, amplitude=0.7):
-        self.sr = sample_rate
-        self.amp = amplitude
+        if (not np.isfinite(sample_rate) or int(sample_rate) != sample_rate or sample_rate < 1
+                or not np.isfinite(amplitude) or amplitude < 0):
+            raise ValueError("Require a positive integer sample rate and finite nonnegative amplitude")
+        self.sr = int(sample_rate)
+        self.amp = float(amplitude)
 
     def _n(self, d):
         return int(round(self.sr * d))
@@ -1771,7 +1795,22 @@ class ToneToolbox:
         segments may carry their own {"music": path, "music_level": x}."""
         if not segments:
             raise ValueError("empty session")
-        block = block or self.BLOCK
+        if not all(np.isfinite(v) and v >= 0 for v in (noise, drone, fade, xfade, music_level)):
+            raise ValueError("Levels, fades and crossfades must be finite and nonnegative")
+        if not np.isfinite(duck) or not 0 <= duck <= .9:
+            raise ValueError("duck must be in [0, .9]")
+        defaults = dict(noise=noise, noise_color=noise_color, drone=drone,
+                        duck=duck, rot_rpm=rot_rpm, rot_depth=rot_depth,
+                        level_drone=level_drone, level_noise=level_noise)
+        segments = [validate_segment(dict(defaults, **s)) for s in segments]
+        for s in segments:
+            beats = s['beat'] if isinstance(s['beat'], tuple) else (s['beat'],)
+            upper = s['carrier'] + max(beats)  # conservative for all delivery modes
+            if upper >= self.sr / 2 or self._n(s['duration']) < 1:
+                raise ValueError("Segment frequency exceeds Nyquist or duration is shorter than one sample")
+        block = self.BLOCK if block is None else block
+        if not isinstance(block, int) or block <= 0:
+            raise ValueError("block must be a positive integer")
         nx = self._n(xfade)
         lens = [self._n(s["duration"]) for s in segments]
         _, total = self._session_layout(lens, nx)
@@ -1789,7 +1828,21 @@ class ToneToolbox:
         mlev = (max([music_level] + [float(s.get("global_level", 0.0))
                                      for s in segments])
                 if music is not None else 0.0)
-        gain = 0.9 / max(self.amp + drone + noise + mlev + seg_mlev, 1e-9)
+        bound = 0.0
+        for s in segments:
+            tl = s['tone_level']
+            local = (self.amp * tl
+                     + s.get('drone', 0) * (tl if s.get('level_drone') else 1)
+                     + s.get('noise', 0) * (tl if s.get('level_noise') else 1))
+            if s.get('music'):
+                local += float(s.get('music_level', .25)) * float(np.max(np.abs(music_arrays[s['music']])))
+            bound = max(bound, local)
+        if music is not None:
+            music = np.asarray(music, dtype=float)
+            if music.ndim != 2 or music.shape[1] != 2 or not music.size or not np.isfinite(music).all():
+                raise ValueError("Global music must be finite, nonempty stereo frames")
+            bound += mlev * float(np.max(np.abs(music)))
+        gain = min(1.0, 0.9 / max(bound, 1e-9))
         # Drone and noise are per segment now; nothing global left but the bed.
         dr = nz = None
         mus = _MusicStream(music, 1.0, self.sr) if music is not None else None
@@ -1837,7 +1890,11 @@ class ToneToolbox:
                         if hi.any():
                             env[hi] = np.maximum(0.0, (total - idx[hi]) / nf)
                         chunk = chunk * env[:, None]
-                    data = np.clip(chunk * gain, -1.0, 1.0)
+                    if not np.isfinite(chunk).all():
+                        raise ValueError("Non-finite samples in session mix")
+                    data = chunk * gain
+                    if np.max(np.abs(data), initial=0) > 1.0:
+                        raise ValueError("Mix exceeded its headroom; export aborted instead of clipping")
                     w.writeframes((data * 32767.0).astype(np.int16).tobytes())
                     written += m
                     if progress is not None:
@@ -1901,7 +1958,8 @@ def load_music(path, sr=44100):
         exe = shutil.which("ffmpeg")
         if not exe:
             raise RuntimeError("To load this format, install 'soundfile' or ffmpeg.")
-        tmp = tempfile.mktemp(suffix=".wav")
+        fd, tmp = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
         try:
             subprocess.run([exe, "-y", "-i", path, "-ac", "2", "-ar", str(sr),
                             "-c:a", "pcm_s16le", tmp], capture_output=True, check=True)
@@ -1922,6 +1980,8 @@ def load_music(path, sr=44100):
         t = np.linspace(0, len(a) / fr, int(len(a) / fr * sr), endpoint=False)
         xp = np.arange(len(a)) / fr
         a = np.stack([np.interp(t, xp, a[:, 0]), np.interp(t, xp, a[:, 1])], axis=1)
+    if not a.size or not np.isfinite(a).all():
+        raise ValueError("Music file is empty or non-finite")
     peak = np.max(np.abs(a)) or 1.0
     return (a / peak).astype(np.float64)            # normalized stereo
 
@@ -1933,6 +1993,9 @@ class _MusicStream:
         # rewrite the caller's array -- every Play session used to blend the
         # stored global music a little more at its start.
         self.a = np.array(audio, dtype=np.float64, copy=True)
+        if (self.a.ndim != 2 or self.a.shape[1] != 2 or not self.a.size
+                or not np.isfinite(self.a).all() or not np.isfinite(level) or level < 0):
+            raise ValueError("Music stream needs finite, nonempty stereo audio and a nonnegative level")
         self.level, self.pos, self.n = level, 0, len(self.a)
         nx = min(int(xfade * sr), self.n // 4)
         if nx > 0 and self.n > 2 * nx:              # pre-blend the loop seam once
