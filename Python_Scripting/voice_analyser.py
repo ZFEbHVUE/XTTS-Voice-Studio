@@ -11,7 +11,7 @@ parameters for both bracket types:
 
 Role (open-loop priors): this tool derives GENERATION priors from the reference
 acoustics — the {} block (temp, rep_pen, top_k/p, len_pen, gpt_cond_len, fades,
-trims) plus safe hp/lp and gentle NR/comp/de-ess suggestions. It does NOT set the
+trims) plus a safe hp (lp off) and gentle NR/comp/de-ess suggestions. It does NOT set the
 tonal EQ or the level: eq_low/eq_mid/eq_high and vol are emitted as 0 and fitted
 empirically by voice_comparator.py (closed-loop least-squares LTAS match on the
 actual clone). Deriving EQ from the reference alone double-counts the spectral
@@ -109,6 +109,20 @@ def band_energy(S, freqs, f_low, f_high):
     return float(np.mean(S[mask, :])) if mask.any() else 0.0
 
 
+# Rubberband stretching below this audibly smears the voice.
+PACE_SPEED_FLOOR = 0.80
+
+
+def pace_speed(rate, target, floor=PACE_SPEED_FLOOR):
+    """(speed, pace it gives, speed the target would need) for a measured
+    syllable rate. The speed is clamped to [floor, 1]: a fast reference may
+    not reach the target at all, and the message has to say so -- it used to
+    announce a 3.5/s pace for a 7.5/s voice at speed 0.8, which gives 6.0/s."""
+    needed = target / rate
+    speed = round(float(min(1.0, max(floor, needed))), 2)
+    return speed, rate * speed, needed
+
+
 def fmt(v):
     """Format a scalar without trailing zeros."""
     if isinstance(v, int):
@@ -180,7 +194,7 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True,
     print(f"   Natural silence: start {natural_start_ms}ms  end {natural_end_ms}ms")
     step(f"Silence  -> trim_start={trim_start}ms  trim_end={trim_end}ms", t0)
 
-    # -- 2. F0 estimation -> voice type, hp, lp ----------------------------
+    # -- 2. F0 estimation -> voice type, hp --------------------------------
     step("F0 estimation  (longest step...)")
     if fast:
         f0_raw      = librosa.yin(y,
@@ -379,7 +393,7 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True,
             # APQ5 — more accurate for compression than local shimmer
             praat_apq5 = parselmouth.praat.call(
                 [_snd, _pp], 'Get shimmer (apq5)', 0, 0, 0.0001, 0.02, 1.3, 1.6)
-            # Formants F1/F2 — for EQ and hp/lp targeting
+            # Formants F1/F2 — for EQ and hp targeting
             try:
                 _fmt  = parselmouth.praat.call(_snd, 'To Formant (burg)', 0, 5, 5500, 0.025, 50)
                 praat_f1 = parselmouth.praat.call(_fmt, 'Get mean', 1, 0, 0, 'Hertz')
@@ -428,19 +442,25 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True,
     except Exception as _e:
         print(f"   [*] Syllable rate unavailable ({_e})")
 
-    # Voice type classification
+    # Voice type classification. The low-pass is left off (0) for every type:
+    # the generator applies pydub's first-order filter, which on a 24 kHz XTTS
+    # render is no hiss guard but a tilt of the whole upper band -- the 7000 to
+    # 9000 Hz written here took 2.1 to 2.7 dB at 4 kHz and 4.5 to 5.5 dB at
+    # 8 kHz, which the Comparator's eq_high then spent its range giving back.
+    # The Comparator still sets one when the clone has too much treble.
+    lowpass = 0
     if f0_median < 110:
         voice_type = "bass / deep male"
-        highpass, lowpass = 55, 7000
+        highpass = 55
     elif f0_median < 155:
         voice_type = "baritone / contralto"
-        highpass, lowpass = 65, 7500
+        highpass = 65
     elif f0_median < 210:
         voice_type = "tenor / mezzo-soprano"
-        highpass, lowpass = 75, 8000
+        highpass = 75
     else:
         voice_type = "soprano / high voice"
-        highpass, lowpass = 90, 9000
+        highpass = 90
 
     print(f"   Voice type: {voice_type}")
 
@@ -628,17 +648,25 @@ def analyse_voice(wav_file, fast=True, f0_engine="auto", use_praat=True,
     speed = 1.0
     if praat_tempo is not None:
         hint = ("fast" if praat_tempo > 5.5 else "slow" if praat_tempo < 3.0 else "normal")
-        sp = float(np.clip(meditation_pace / praat_tempo, 0.80, 1.0)) if meditation_pace else 1.0
-        if meditation_pace:
-            speed = round(sp, 2)
-            print(f"   [*] Syllable rate {praat_tempo:.2f}/s ({hint}) -> speed "
-                  f"{speed} for a {meditation_pace:.1f}/s meditation pace (EMITTED; "
-                  f"target is an editorial choice, the ratio is measured)")
+        target = meditation_pace or 3.5
+        sp, reached, needed = pace_speed(praat_tempo, target)
+        if needed < PACE_SPEED_FLOOR:
+            outcome = (f"gives {reached:.1f}/s, not {target:.1f}/s: that would need "
+                       f"speed {needed:.2f}, and stretching below {PACE_SPEED_FLOOR} "
+                       f"smears the voice -- slow the pace with pauses in the text, "
+                       f"or a slower reference")
+        elif needed > 1.0:
+            outcome = f"keeps {reached:.1f}/s: already at or below {target:.1f}/s"
         else:
-            sugg = round(float(np.clip(3.5 / praat_tempo, 0.80, 1.0)), 2)
-            print(f"   [*] Syllable rate {praat_tempo:.2f}/s ({hint}) -> speed {sugg} "
-                  f"would give a 3.5/s meditation pace (not emitted; "
-                  f"--meditation-pace to apply)")
+            outcome = f"gives a {target:.1f}/s meditation pace"
+        if meditation_pace:
+            speed = sp
+            print(f"   [*] Syllable rate {praat_tempo:.2f}/s ({hint}) -> speed "
+                  f"{speed} {outcome} (EMITTED; target is an editorial choice, "
+                  f"the ratio is measured)")
+        else:
+            print(f"   [*] Syllable rate {praat_tempo:.2f}/s ({hint}) -> speed {sp} "
+                  f"{outcome} (not emitted; --meditation-pace to apply)")
 
     # -- 9. XTTS params ----------------------------------------------------
     # Monotone (small pitch spread) -> lower temp; expressive -> higher temp.
@@ -788,13 +816,14 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
                   p['reverb'], p['noise_gate'], p['pan'], p['limiter']]
     audio_str = f"{N}, {lang}, " + ', '.join(fmt(v) for v in audio_vals)
 
-    _audio_note = ("""#    speed=1.0, eq_*/vol=0 (fitted by voice_comparator.py). hp/lp are safe
-  #    rumble/hiss guards. NR/comp/de-ess carry the MEASURED SUGGESTIONS
+    _audio_note = ("""#    speed=1.0, eq_*/vol=0 (fitted by voice_comparator.py). hp is a safe
+  #    rumble guard; lp is off (at 24 kHz, a low-pass tilts the whole treble).
+  #    NR/comp/de-ess carry the MEASURED SUGGESTIONS
   #    (--emit-suggestions): unvalidated heuristics — verify them with the
   #    comparator's --screen-audio and a blind listening test before trusting."""
         if (p['noise_reduction'] or p['compression'] or p['deesser'])
         else """#    Neutral by design: speed=1.0, eq_*/vol=0 (fitted by voice_comparator.py),
-  #    NR/comp/de-ess=0. Only hp/lp are set (safe rumble/hiss guards). Measured
+  #    NR/comp/de-ess=0, lp off. Only hp is set (a safe rumble guard). Measured
   #    suggestions for these are printed above; --emit-suggestions puts them in.""")
 
     print(f"\n{'='*62}")

@@ -131,7 +131,7 @@ def main():
                         "picked 6 s on a Paris-French voice and the clone came "
                         "out Canadian. Short values are only for references "
                         "too short to supply more.")
-    p.add_argument('--cond-budget', type=int, default=24)
+    p.add_argument('--cond-budget', type=int, default=34)
     p.add_argument('--gpt-chunks', default='4 6 8 10')
     p.add_argument('--max-ref-lens', default='')
     p.add_argument('--max-ref-len', type=int, default=30)
@@ -304,6 +304,16 @@ def main():
             cmd += ['--adopt-alpha', str(args.adopt_alpha)]
         if args.device:
             cmd += ['--device', args.device]
+        # Named before the search, so that the unseen renders the optimiser
+        # keeps sit next to the clone they belong to.
+        base, _ = os.path.splitext(ref)
+        clone_out = base + '_pipeline_clone.wav'
+        if args.keep_preset_history:
+            # The clone is what gets listened to, and comparing two runs by ear
+            # is the only way to judge them -- overwriting it destroys the very
+            # thing the comparison needs.
+            clone_out = _free_name(clone_out)
+        cmd += ['--holdout-wav-prefix', os.path.splitext(clone_out)[0] + '_holdout']
         with tempfile.TemporaryDirectory(prefix='xtts_result_') as result_dir:
             result_path = os.path.join(result_dir, 'winner.json')
             cmd += ['--result-json', result_path]
@@ -325,18 +335,19 @@ def main():
                 # Stages the budget cut short: the recap repeats them, since
                 # the optimiser's own warning scrolls away in a long run.
                 _cut = dict(result.get('truncated_stages') or {})
+                # Same for the unseen sentences: which ones failed, and where
+                # their renders are.
+                _unseen = list(result.get('holdout_detail') or [])
+                _alerts = list(result.get('holdout_alerts') or [])
+                # And what the confirmation (C6) found, when it ran.
+                _confirm = result.get('conditioning_confirmation')
+                if not isinstance(_confirm, dict):
+                    _confirm = None
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 sys.exit(f"[ERR] Cannot read optimiser winner: {exc}")
         print(f"\n[pipeline] winner: {xtts_win}")
 
         # ── 4. Closed-loop tone fit ───────────────────────────────────────────
-        base, _ = os.path.splitext(ref)
-        clone_out = base + '_pipeline_clone.wav'
-        if args.keep_preset_history:
-            # The clone is what gets listened to, and comparing two runs by ear
-            # is the only way to judge them -- overwriting it destroys the very
-            # thing the comparison needs.
-            clone_out = _free_name(clone_out)
         cmd = [py, S('voice_comparator.py'), work, lang,
                '--clone-refs', *clone_refs,
                '--xtts-block', xtts_win, '--audio-block', audio_block,
@@ -422,7 +433,8 @@ def main():
                             audio=set_lang(renumber(audio_fit, n), lang),
                             scores=_sc, acoustics=_acoustics, references=clone_refs,
                             cut=_cut, weighting=args.eq_weighting[0],
-                            alternatives=alternatives))
+                            alternatives=alternatives, unseen=_unseen, alerts=_alerts,
+                            confirmation=_confirm))
 
     # ── Final recap ───────────────────────────────────────────────────────────
     print(f"\n\n{'='*70}\n  [*] PIPELINE COMPLETE — READY TO PASTE\n{'='*70}")
@@ -434,7 +446,24 @@ def main():
         if r.get('cut'):
             print(f"  # [!] Optimiser stages cut short by the budget: "
                   f"{', '.join(r['cut'])} -- raise --budget / --cond-budget")
+        c = r.get('confirmation')
+        if c and c.get('finalists'):
+            best = max(f['mean'] for f in c['finalists']) - c['base_mean']
+            verdict = (f"adopted {c.get('winner')}" if c.get('adopted')
+                       else f"kept the base {c.get('base')}")
+            print(f"  # Conditioning confirmation on seeds {' '.join(str(x) for x in c['seeds'])}: "
+                  f"{verdict} (best candidate {best:+.3f} over the base, bar {c['bar']:.3f})")
+            if not c.get('adopted') and c.get('screening_winner') not in (None, c.get('base')):
+                print(f"  # The screening's {c['screening_winner']} won on one draw only: "
+                      f"not confirmed")
         print(f"  # Listen before generating: {r['clone']}")
+        kept = [u.get('wav') for u in r.get('unseen') or [] if u.get('wav')]
+        if kept:
+            print("  # Unseen sentences of the hold-out (raw XTTS, as scored): "
+                  + '  '.join(kept))
+        for alert in r.get('alerts') or []:
+            print(f"  # [!] Unseen sentence {alert.get('sentence')}: {alert.get('reason')}"
+                  f" -- listen to it before generating")
         for a in r.get('alternatives') or []:
             # Commented out: pasting the recap must give one [] per voice.
             print(f"  # Same clone, tone fit with EQ weighting '{a['weighting']}' instead "

@@ -32,8 +32,77 @@ def _normalise(s):
     return s.split()
 
 
-def word_error_rate(ref_text, hyp_text):
-    """Levenshtein word error rate, clipped to [0,1]. 0 = perfect."""
+def _french_cardinal(n):
+    """Standard French cardinals, 0..999999, for ASR spelling equivalence.
+
+    This is deliberately not a pronunciation or accent judgement. Dates,
+    signed/decimal numbers, ordinals and digit-by-digit identifiers are left
+    alone by _number_equivalents below.
+    """
+    small = ('zéro', 'un', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept',
+             'huit', 'neuf', 'dix', 'onze', 'douze', 'treize', 'quatorze',
+             'quinze', 'seize')
+    if n < 17:
+        return small[n]
+    if n < 20:
+        return 'dix-' + small[n - 10]
+    if n < 70:
+        tens = ('', '', 'vingt', 'trente', 'quarante', 'cinquante', 'soixante')[n // 10]
+        unit = n % 10
+        return tens + (' et un' if unit == 1 else '-' + small[unit] if unit else '')
+    if n < 80:
+        return 'soixante' + (' et ' if n == 71 else '-') + _french_cardinal(n - 60)
+    if n == 80:
+        return 'quatre-vingts'
+    if n < 100:
+        return 'quatre-vingt-' + _french_cardinal(n - 80)
+    if n < 1000:
+        hundreds, rest = divmod(n, 100)
+        head = 'cent' if hundreds == 1 else small[hundreds] + ' cent'
+        return head + (' ' + _french_cardinal(rest) if rest else 's' if hundreds > 1 else '')
+    thousands, rest = divmod(n, 1000)
+    head = 'mille' if thousands == 1 else _french_cardinal(thousands) + ' mille'
+    # "quatre-vingt mille" / "deux cent mille": no plural before mille.
+    if thousands != 1:
+        head = re.sub(r'(vingt|cent)s mille$', r'\1 mille', head)
+    return head + (' ' + _french_cardinal(rest) if rest else '')
+
+
+def _number_equivalents(ref_text, hyp_text, lang):
+    """Match written-out French integers ONLY when the pair contains digits.
+
+    The digit is an explicit anchor: ordinary words are never converted on
+    their own. Keep unsupported numeric formats distinct instead of guessing
+    how the speaker should have read a date, a decimal or a phone number.
+    """
+    if (lang or '').lower().split('-')[0] != 'fr':
+        return ref_text, hyp_text
+    import unicodedata
+    texts = [unicodedata.normalize('NFC', t).lower() for t in (ref_text, hyp_text)]
+    protected = re.compile(r'(?<!\w)(?:[+-]\d+(?:[.,]\d+)?|'
+                           r'\d+(?:[.,:/-]\d+)+|0\d+|'
+                           r'\d{1,3}(?:[ \u00a0\u202f]\d{3})+)(?!\w)')
+    numbers = set()
+    for text in texts:
+        plain = protected.sub(' ', text)
+        numbers.update(int(x) for x in re.findall(r"(?<![\w'])\d{1,6}(?!\w)", plain))
+    spellings = sorted(((_french_cardinal(n), n) for n in numbers),
+                       key=lambda pair: len(pair[0]), reverse=True)
+    for spelling, n in spellings:
+        words = re.split(r'[ -]+', spelling)
+        pattern = r"(?<![\w'])" + r'[\s\u00a0\u202f‐‑–—-]+'.join(map(re.escape, words)) + r'(?!\w)'
+        texts = [re.sub(pattern, str(n), t) for t in texts]
+    return tuple(texts)
+
+
+def word_error_rate(ref_text, hyp_text, lang=None):
+    """Levenshtein WER, clipped to [0,1]; optional FR cardinal equivalence.
+
+    With lang=None this preserves the historical spelling-sensitive metric.
+    With lang='fr', 48 and quarante-huit denote the same word sequence. Extra
+    words, missing words and different numerical values still count.
+    """
+    ref_text, hyp_text = _number_equivalents(ref_text, hyp_text, lang)
     r = _normalise(ref_text); h = _normalise(hyp_text)
     if not r:
         return 0.0 if not h else 1.0
@@ -86,7 +155,8 @@ class PronScorer:
         else:
             avg_logprob = -2.0
 
-        wer = word_error_rate(target_text, text) if target_text is not None else None
+        wer_raw = word_error_rate(target_text, text) if target_text is not None else None
+        wer = word_error_rate(target_text, text, lang=lang) if target_text is not None else None
 
         # ── Combine into [0,1] (higher = easier for this ASR model) ──────────────
         lp_norm = float(np.clip((avg_logprob + 1.0) / 0.9, 0.0, 1.0))  # -1.0→0, -0.1→1
@@ -104,7 +174,7 @@ class PronScorer:
 
         return dict(score=float(np.clip(score, 0.0, 1.0)),
                     detected=detected, lang_prob=lang_prob,
-                    avg_logprob=avg_logprob, wer=wer, text=text)
+                    avg_logprob=avg_logprob, wer=wer, wer_raw=wer_raw, text=text)
 
 
 __all__ = ['PronScorer', 'word_error_rate']

@@ -5,6 +5,7 @@ No XTTS, GPU, Whisper or ECAPA models are loaded by these tests.
 """
 import contextlib
 import importlib
+import importlib.util
 import io
 import json
 from pathlib import Path
@@ -108,6 +109,16 @@ class SpectrumTests(unittest.TestCase):
         self.assertGreater(lp,0)
         self.assertGreater(sum(grid>=6000),10)
 
+    def test_lowpass_is_switched_off_not_opened_when_highs_are_missing(self):
+        # 3.7 opened it by 1000 Hz (9000 -> 10000), which still takes 4.1 dB
+        # at 8 kHz on a 24 kHz render: eq_high then spent its range on it.
+        grid=np.geomspace(80,8000,256); ref=np.zeros_like(grid); clone=ref.copy()
+        clone[grid>=6000]=-5
+        self.assertEqual(ltas.derive_hp_lp(grid,ref,clone,cur_hp=90,cur_lp=9000),(90,0.))
+        self.assertEqual(ltas.derive_hp_lp(grid,ref,clone,cur_hp=90,cur_lp=0),(90,0))
+        clone[grid>=6000]=5      # too much treble: a lower low-pass, as before
+        self.assertEqual(ltas.derive_hp_lp(grid,ref,clone,cur_hp=90,cur_lp=9000),(90,8000.))
+
     @unittest.skipUnless(__import__('shutil').which('ffmpeg'),'ffmpeg not installed')
     def test_bell_response_matches_actual_ffmpeg(self):
         sr=24000; t=np.arange(sr*2)/sr
@@ -120,6 +131,47 @@ class SpectrumTests(unittest.TestCase):
             measured=20*np.log10(np.sqrt(np.mean(out[sr:]**2))/np.sqrt(np.mean(audio[sr:]**2)))
             expected=ltas.rbj_peaking_db(np.array([freq]),sr,120,160,4)[0]
             self.assertAlmostEqual(measured,expected,places=2)
+
+
+class FilterModelTests(unittest.TestCase):
+    """pydub's first-order filters, which the generator applies for hp/lp."""
+
+    def test_lowpass_is_a_treble_tilt_at_the_render_rate(self):
+        db=ltas.rc_lowpass_db(np.array([4000.,6000.,8000.]),9000,24000)
+        np.testing.assert_allclose(db,[-2.1,-3.4,-4.5],atol=.06)
+        # The analogue one-pole formula ltas_match had (unused) put 8 kHz at -2.5 dB.
+        self.assertLess(db[-1],-2.5-1.5)
+        self.assertLess(ltas.rc_lowpass_db(np.array([8000.]),16000,24000)[0],-2.7)
+        np.testing.assert_array_equal(ltas.rc_lowpass_db(np.array([100.,8000.]),0,24000),[0,0])
+        np.testing.assert_allclose(ltas.rc_highpass_db(np.array([90.,45.,1000.]),90,24000),
+                                   [-3.1,-7.0,-.14],atol=.06)
+
+    def test_filter_change_is_the_difference_of_the_two_settings(self):
+        f=np.geomspace(80,8000,64)
+        same=ltas.filter_change_db(f,24000,dict(hp=90,lp=9000),dict(hp=90,lp=9000))
+        np.testing.assert_array_equal(same,np.zeros_like(f))
+        off=ltas.filter_change_db(f,24000,dict(hp=90,lp=9000),dict(hp=90,lp=0))
+        np.testing.assert_allclose(off,-ltas.rc_lowpass_db(f,9000,24000))
+        both=ltas.filter_change_db(f,24000,dict(hp=0,lp=9000),dict(hp=60,lp=0))
+        np.testing.assert_allclose(both,ltas.rc_highpass_db(f,60,24000)-ltas.rc_lowpass_db(f,9000,24000))
+
+    @unittest.skipUnless(importlib.util.find_spec('pydub') is not None and importlib.util.find_spec('audioop') is not None,
+                         'pydub (with audioop) not installed')
+    def test_models_match_pydub_through_a_real_render(self):
+        from pydub import AudioSegment
+        from scipy.signal import welch
+        sr=24000
+        x=(np.random.default_rng(1).standard_normal(sr*20)*3000).astype(np.int16)
+        seg=AudioSegment(x.tobytes(),frame_rate=sr,sample_width=2,channels=1)
+        f=np.geomspace(80,8000,40)
+        fx,px=welch(x.astype(float),sr,nperseg=8192)
+        for kind,fc in (('lp',6000),('lp',9000),('lp',16000),('hp',55),('hp',150)):
+            y=seg.low_pass_filter(fc) if kind=='lp' else seg.high_pass_filter(fc)
+            fy,py=welch(np.array(y.get_array_of_samples(),dtype=float),sr,nperseg=8192)
+            measured=10*np.log10(np.interp(f,fy,py)/np.interp(f,fx,px))
+            model=(ltas.rc_lowpass_db if kind=='lp' else ltas.rc_highpass_db)(f,fc,sr)
+            with self.subTest(kind=kind,fc=fc):
+                np.testing.assert_allclose(measured,model,atol=.05)
 
 
 class EncoderTests(unittest.TestCase):

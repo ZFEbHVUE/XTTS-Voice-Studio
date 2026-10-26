@@ -103,6 +103,9 @@ class PlanTests(unittest.TestCase):
     def test_conditioning_plan_runs_every_stage_whatever_wins(self):
         # --adopt-alpha 1 lets every gain win, so the noise walks the search
         # down a different path on each trial: the plan must cover all of them.
+        # It leaves C6 nothing to confirm (the incumbent is always the best
+        # draw so far), so the noise-aware rule runs too: there the finalists
+        # and a replaced base fill the confirmation.
         configs = {
             'pipeline defaults': PIPELINE,
             'reference lengths 20 30 45': dict(PIPELINE, ref_lengths='20 30 45'),
@@ -121,30 +124,42 @@ class PlanTests(unittest.TestCase):
             'normalised block': dict(PIPELINE, prior=30, norm=1),
             'three references': dict(PIPELINE, ref_lengths='10 20', n_refs=3),
         }
+        confirmed = 0
         for name, cfg in configs.items():
             plan = plan_for(cfg)
-            for trial in range(10):
-                with self.subTest(config=name, trial=trial):
-                    result, log = run_optimizer(cfg, plan, trial)
-                    used = int(re.search(r'Evaluations: conditioning (\d+)/', log).group(1))
-                    self.assertLessEqual(used, plan)
-                    self.assertEqual(int(re.search(r'Conditioning plan: up to (\d+)', log).group(1)),
-                                     plan)
-                    self.assertFalse([k for k in result['truncated_stages'] if k.startswith('C')])
-                    self.assertNotIn('C5 used the remaining budget', log)
-                    self.assertNotIn('Conditioning noise not measured', log)
+            for alpha in ('1', '0.05'):
+                for trial in range(10):
+                    with self.subTest(config=name, alpha=alpha, trial=trial):
+                        result, log = run_optimizer(dict(cfg, alpha=alpha), plan, trial)
+                        used = int(re.search(r'Evaluations: conditioning (\d+)/', log).group(1))
+                        self.assertLessEqual(used, plan)
+                        self.assertEqual(int(re.search(r'Conditioning plan: up to (\d+)',
+                                                       log).group(1)), plan)
+                        self.assertFalse([k for k in result['truncated_stages']
+                                          if k.startswith('C')])
+                        self.assertNotIn('C5 stops', log)
+                        self.assertNotIn('C6 confirmation: cut', log)
+                        self.assertNotIn('Conditioning noise not measured', log)
+                        confirmed += bool(result['conditioning_confirmation'])
+        self.assertGreater(confirmed, 50)      # C6 did run, in most noise-aware trials
 
     def test_plan_is_tight_for_the_pipeline(self):
-        self.assertEqual(plan_for(PIPELINE), 21)
+        self.assertEqual(plan_for(PIPELINE), 34)
         self.assertEqual(plan_for(dict(PIPELINE, ref_lengths='20 30 45')), 45)
-        _result, log = run_optimizer(dict(PIPELINE, alpha='0.05'), 21)
-        # Everything the schedule can ask for, nothing more: the 2 left are
-        # the reserve that lets C2b run.
-        self.assertIn('Evaluations: conditioning 19/21', log)
+        _result, log = run_optimizer(dict(PIPELINE, alpha='0.05'), 34)
+        # 20 screening renders (the base on 5 seeds, C1 to C5), then 8 for
+        # C6's 2 candidates on the 4 probe seeds: the base's renders there are
+        # the probe's own.
+        self.assertIn('Evaluations: conditioning 28/34', log)
+        # Everything the schedule can ask for, nothing more: 3 candidates fill
+        # C6 (12 renders), and the 2 left are the reserve that lets C2b run.
+        result, log = run_optimizer(dict(PIPELINE, alpha='0.05'), 34, trial=2)
+        self.assertEqual(len(result['conditioning_confirmation']['finalists']), 3)
+        self.assertIn('Evaluations: conditioning 32/34', log)
 
     def test_header_warns_when_the_conditioning_budget_is_short(self):
         _result, log = run_optimizer(dict(PIPELINE, alpha='0.05'), 12)
-        self.assertIn('--cond-budget 21 runs them all', log)
+        self.assertIn('--cond-budget 34 runs them all', log)
 
     def test_sampling_budget_is_the_optimiser_plan_in_the_longest_case(self):
         for seeds, beams, want in (('0 42 100 180 200', False, 60),
@@ -156,11 +171,11 @@ class PlanTests(unittest.TestCase):
                 self.assertEqual(need, want)
                 extra = ('--probe-beams', '--beam-width', '3') if beams else ()
                 cfg = dict(PIPELINE, alpha='0.05', extra=extra)
-                result, log = run_optimizer(cfg, 21, budget=need, seeds=seeds)
+                result, log = run_optimizer(cfg, plan_for(PIPELINE), budget=need, seeds=seeds)
                 self.assertIn(f'Sampling plan: up to {need} generations', log)
                 self.assertEqual(result['truncated_stages'], {})
         # A starting temperature on the S2 grid needs 6 fewer.
-        _r, log = run_optimizer(dict(PIPELINE, alpha='0.05', temp=0.65), 21)
+        _r, log = run_optimizer(dict(PIPELINE, alpha='0.05', temp=0.65), plan_for(PIPELINE))
         self.assertIn('Sampling plan: up to 54 generations', log)
 
     def test_the_pipeline_still_hands_the_optimiser_what_the_plan_assumes(self):
@@ -183,6 +198,10 @@ class PlanTests(unittest.TestCase):
         self.assertIn('if cond_evals[0] < args.cond_budget - C2B_RESERVE:', source)
         self.assertIn('(1 + NOISE_PROBES + NOISE_PROBE_MARGIN) * len(cond_probe_texts)', source)
         self.assertIn('[:NOISE_PROBES]', source)
+        self.assertIn('if not free and new >= C5_SCREEN:', source)
+        self.assertIn('finalists = finalists[:CONFIRM_FINALISTS]', source)
+        self.assertIn('c6_reserve = ((CONFIRM_FINALISTS + (0 if probed else 1)) * len(probe_seeds) '
+                      '* n_txt', source)
         self.assertIn('ap.add_argument("--keep-seeds", type=int, default=3)', source)
         self.assertIn('ap.add_argument("--cond-probe-texts", type=int, default=1,', source)
 
@@ -394,7 +413,7 @@ class AutoTabTests(unittest.TestCase):
             self.assertIn('--recurate', cmd)
             self.assertTrue(any('Budget 60 is below the whole sampling plan (68)' in m
                                 for m in self.logs))
-            self.assertTrue(any('Conditioning budget 24 is below' in m for m in self.logs))
+            self.assertTrue(any('Conditioning budget 34 is below' in m for m in self.logs))
             checks['Curate reference'].set(False)
             self.run_pipeline()
             self.assertNotIn('--recurate', self.commands[-1])
@@ -414,7 +433,7 @@ class AutoTabTests(unittest.TestCase):
             self.run_pipeline()
             cmd = self.commands[-1]
             for option, value in (('--seeds', '0 42 100 180 200'), ('--budget', '60'),
-                                  ('--cond-budget', '24'), ('--gpt-chunks', '4 6 8 10'),
+                                  ('--cond-budget', '34'), ('--gpt-chunks', '4 6 8 10'),
                                   ('--max-ref-len', '30'), ('--keep-seconds', '45')):
                 self.assertEqual(cmd[cmd.index(option) + 1], value)
             self.assertNotIn('--gpt-cond-lens', cmd)       # the pipeline's '20 30' applies

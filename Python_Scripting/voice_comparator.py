@@ -89,6 +89,27 @@ def parse_audio_block(block):
     return out
 
 
+def block_language(block):
+    """The language a [] block names (upper case), or None when it names none.
+
+    parse_audio_block fills in FR for a block without one, so its 'lang' cannot
+    tell "this block is French" from "this block says nothing"."""
+    parts = [part.strip() for part in str(block).strip().strip('[]').split(',')]
+    return parts[1].upper() if len(parts) > 1 and parts[1].upper() in LANGS else None
+
+
+def resolve_language(asked, block):
+    """(language, error): the command's or the block's, which must agree when
+    both name one; FR when neither does. A block without a language used to
+    impose FR even on a command that asked for another."""
+    named = block_language(block) if block else None
+    asked = asked.upper() if asked else None
+    if asked and named and asked != named:
+        return None, (f'Language mismatch: the command asks for {asked}, '
+                      f'the [] block for {named}')
+    return asked or named or 'FR', None
+
+
 def fmt(v):
     f = float(v)
     if f == int(f):
@@ -366,13 +387,40 @@ def transcript_excerpt(segments, limit=240):
     return ' '.join(parts), first, last
 
 
+def _filter_moves(held, filters):
+    """'low-pass 9000 Hz -> off' for each filter that changes, '' if none."""
+    def shown(value):
+        return f'{float(value):.0f} Hz' if float(value) else 'off'
+    return ', '.join(f'{name} {shown(held[key])} -> {shown(filters[key])}'
+                     for key, name in (('hp', 'high-pass'), ('lp', 'low-pass'))
+                     if abs(float(filters[key]) - float(held[key])) > 1e-9)
+
+
 def fit_rendered_tone(reference, reference_sr, render_sr, initial, render,
                       iterations=3, eq_limit=4., weighting='a', target_dbfs=None,
                       convergence=.5):
     """Keep only corrections that improve the spectrum AFTER the actual chain.
 
     render(config) returns mono samples resampled to reference_sr. Digital EQ
-    responses must use render_sr, even when analysis runs at reference_sr.
+    and filter responses must use render_sr, even when analysis runs at
+    reference_sr.
+
+    The first pass also settles hp/lp: what ltas_match.derive_hp_lp proposes
+    and, while a low-pass is on, the low-pass off. pydub's first-order low-pass
+    tilts the whole upper band of a 24 kHz render (lp 9000: -2.1 dB at 4 kHz,
+    -4.5 dB at 8 kHz), and with it on, eq_high spent its bound giving back what
+    the filter took. For each setting the EQ is fitted on the curve those
+    filters will give (their exact responses), so it does not boost again what
+    a filter change gives back, and the shape error it leaves is predicted.
+    The low-pass off goes first when its prediction is better, the block's own
+    filters last; the first render that improves the measured error is kept.
+
+    Spectra are compared smoothed (ltas_match.grid_db: bands of max(250 Hz,
+    1/3 octave)), so the harmonic comb of the voice, which follows the melody
+    of the sentence, is not taken for a tone to correct. The EQ is fitted on
+    the render's own PSD (ltas_match.fit_eq_psd): the bells and filters act on
+    it bin by bin before the smoothing, as they do on the audio, so the
+    prediction holds for every linear stage of the chain.
     """
     import ltas_match as L
     if not np.isfinite(eq_limit) or eq_limit <= 0:
@@ -382,41 +430,94 @@ def fit_rendered_tone(reference, reference_sr, render_sr, initial, render,
     keys=('eq_low','eq_mid','eq_high')
     current=dict(initial)
     current.update({key:float(np.clip(current.get(key,0),-eq_limit,eq_limit)) for key in keys})
-    current.setdefault('vol',0)
+    for key in ('vol','hp','lp'):
+        current.setdefault(key,0)
     def measure(config):
         audio=render(config)
-        _,db=L.compute_ltas(audio,reference_sr,fmax=fmax)
-        return audio,db,L.spectral_shape_error(grid,ref_db,db,weighting)
-    audio,curve,error=measure(current)
+        spectrum=L.ltas_psd(audio,reference_sr)
+        db=L.grid_db(*spectrum,grid)
+        db=db-db.max()
+        return audio,spectrum,db,L.spectral_shape_error(grid,ref_db,db,weighting)
+    def level(samples):
+        return (L.level_to_target_db(samples,target_dbfs) if target_dbfs is not None
+                else L.level_match_db(reference,samples))
+    def propose(spectrum,held,filters):
+        # The EQ fitted on the render's PSD with these filters in place of the
+        # held ones, and the shape error the pair will leave.
+        freqs,psd=spectrum
+        shift=np.where(freqs<render_sr/2,L.filter_change_db(freqs,render_sr,held,filters),0.)
+        gains,model=L.fit_eq_psd(grid,ref_db,freqs,psd,fs=render_sr,weighting=weighting,
+                                 limit=eq_limit,start=[current[key] for key in keys],extra_db=shift)
+        gains={key:round(float(np.clip(gains[key],-eq_limit,eq_limit)),1) for key in keys}
+        return dict(filters=dict(filters),gains=gains,
+                    predicted=L.spectral_shape_error(grid,ref_db,model,weighting))
+    audio,spectrum,curve,error=measure(current)
     history=[]
     for index in range(max(1,iterations)):
-        fit=L.fit_eq_ls(grid,ref_db,curve,fs=render_sr,weighting=weighting,
-                        g_bounds=(-eq_limit,eq_limit),cur_hp=current.get('hp',0),cur_lp=current.get('lp',0))
-        candidate=dict(current)
-        candidate.update({key:round(float(np.clip(current.get(key,0)+fit[key],-eq_limit,eq_limit)),1) for key in keys})
-        if index==0:
-            candidate.update(hp=fit['hp'],lp=fit['lp'])
-        correction=(L.level_to_target_db(audio,target_dbfs) if target_dbfs is not None else L.level_match_db(reference,audio))
-        candidate['vol']=float(np.clip(current['vol']+correction,-18,18))
-        trial,trial_curve,trial_error=measure(candidate)
-        # Re-match level after the EQ change; one more render, no XTTS generation.
-        level_delta=(L.level_to_target_db(trial,target_dbfs) if target_dbfs is not None else L.level_match_db(reference,trial))
-        if level_delta:
-            candidate['vol']=float(np.clip(candidate['vol']+level_delta,-18,18))
-            trial,trial_curve,trial_error=measure(candidate)
-        accepted=trial_error < error-.01
-        same_shape=abs(trial_error-error)<=.01 and all(abs(candidate.get(k,0)-current.get(k,0))<1e-9 for k in (*keys,'hp','lp'))
-        history.append(dict(pass_number=index+1,before=error,after=trial_error,accepted=accepted or same_shape,config=dict(candidate)))
-        print(f'  pass {index+1}: rendered shape error {error:.2f} -> {trial_error:.2f} dB; '
-              f"EQ=({candidate['eq_low']:+.1f}/{candidate['eq_mid']:+.1f}/{candidate['eq_high']:+.1f}), "
-              f"volume={candidate['vol']:+.1f} dB; " + ('kept' if accepted or same_shape else 'rejected'))
-        if not accepted and not same_shape:
+        held={key:current[key] for key in ('hp','lp')}
+        if index:
+            options=[propose(spectrum,held,held)]      # filters frozen after pass 1
+        else:
+            hp,lp=L.derive_hp_lp(grid,ref_db,curve,held['hp'],held['lp'])
+            derived=dict(hp=hp,lp=lp)
+            options=[propose(spectrum,held,derived)]
+            if _filter_moves(held,derived):
+                options.append(propose(spectrum,held,held))
+            if float(held['lp']) and float(lp):
+                off=propose(spectrum,held,dict(derived,lp=0))
+                if off['predicted']<options[0]['predicted']-.01:
+                    options.insert(0,off)
+        for attempt,option in enumerate(options):
+            candidate=dict(current)
+            candidate.update(option['gains'])
+            candidate.update(option['filters'])
+            candidate['vol']=float(np.clip(current['vol']+level(audio),-18,18))
+            trial,trial_spectrum,trial_curve,trial_error=measure(candidate)
+            # Re-match level after the EQ change; one more render, no XTTS generation.
+            level_delta=level(trial)
+            if level_delta:
+                candidate['vol']=float(np.clip(candidate['vol']+level_delta,-18,18))
+                trial,trial_spectrum,trial_curve,trial_error=measure(candidate)
+            moves=_filter_moves(held,option['filters'])
+            accepted=trial_error < error-.01
+            same_shape=(abs(trial_error-error)<=.01 and not moves
+                        and all(abs(candidate[k]-current[k])<1e-9 for k in keys))
+            kept=accepted or same_shape
+            history.append(dict(pass_number=index+1,before=error,after=trial_error,
+                                predicted=option['predicted'],accepted=kept,config=dict(candidate)))
+            note=moves or ('filters unchanged' if attempt else '')
+            print(f'  pass {index+1}: rendered shape error {error:.2f} -> {trial_error:.2f} dB '
+                  f"(predicted {option['predicted']:.2f}); "
+                  f"EQ=({candidate['eq_low']:+.1f}/{candidate['eq_mid']:+.1f}/{candidate['eq_high']:+.1f}), "
+                  f"volume={candidate['vol']:+.1f} dB; " + (f'{note}; ' if note else '')
+                  + ('kept' if kept else 'rejected'))
+            if kept:
+                break
+        if not kept:
             break
-        step=max(abs(candidate.get(k,0)-current.get(k,0)) for k in (*keys,'vol'))
-        current,audio,curve,error=candidate,trial,trial_curve,trial_error
-        if step<convergence or same_shape:
+        step=max(abs(candidate[k]-current[k]) for k in (*keys,'vol'))
+        current,audio,spectrum,curve,error=candidate,trial,trial_spectrum,trial_curve,trial_error
+        # A filter change in pass 1 earns pass 2 even when the EQ barely moved.
+        if (step<convergence and not moves) or same_shape:
             break
     return current,history
+
+
+def identity_axes(opt, eq_limit, freeze_vol=False):
+    """Bounded axes of the identity optimiser (--optimise-audio) for block `opt`.
+
+    A filter that is off stays off: clipped into its bounds, lp 0 started the
+    search at lp 6000, a treble cut nobody asked for. With --target-dbfs the
+    level is a production target the tone fit has met, not a free axis: a
+    vol traded for a few thousandths of ECAPA cosine broke it.
+    """
+    axes = [('vol', -18, 18), ('eq_low', -eq_limit, eq_limit), ('eq_mid', -eq_limit, eq_limit),
+            ('eq_high', -eq_limit, eq_limit), ('hp', 40, 150), ('lp', 6000, 16000),
+            ('NR', 0, 0.5), ('comp', 0, 0.6), ('de-ess', 0, 0.5)]
+    held = [key for key in ('hp', 'lp') if not float(opt.get(key, 0) or 0)]
+    if freeze_vol:
+        held.append('vol')
+    return [axis for axis in axes if axis[0] not in held], held
 
 
 def main():
@@ -506,9 +607,9 @@ def main():
 
     # Separate trailing lang from refs
     refs = list(args.voice_refs)
-    lang = 'FR'
+    asked = None
     if refs and refs[-1].upper() in LANGS:
-        lang = refs[-1].upper(); refs = refs[:-1]
+        asked = refs[-1].upper(); refs = refs[:-1]
     refs = args.clone_refs or list(dict.fromkeys([args.reference] + refs))
     for ref in [args.reference] + refs:
         if not os.path.isfile(ref):
@@ -525,7 +626,10 @@ def main():
     if not np.isfinite(args.eq_limit) or args.eq_limit<=0:
         p.error('eq-limit must be finite and positive')
     audio = parse_audio_block(args.audio_block)
-    lang  = audio.get('lang', lang)
+    lang, mismatch = resolve_language(asked, args.audio_block)
+    if mismatch:
+        p.error(mismatch)
+    audio['lang'] = lang
     if args.raw_clone and not os.path.isfile(args.raw_clone):
         p.error(f'Raw clone not found: {args.raw_clone}')
     if args.reference_interval is not None:
@@ -671,6 +775,7 @@ def main():
         # the reference, so they get the same treatment as the EQ: propose a value,
         # render, re-measure, and KEEP IT ONLY IF THE GAP SHRINKS. NR/reverb/gate/pan
         # stay at zero on purpose (no measurable target; the gate chops speech).
+        left_at_zero = []     # read by the identity search, also without this fit
         if args.fit_dynamics:
             print(f"\n{'-'*64}\n  Measured de-ess / compression fit\n{'-'*64}")
             ref_sib, ref_crest = L.sibilance_db(ref_y, ref_sr), L.crest_db(ref_y)
@@ -678,7 +783,6 @@ def main():
             cy, _ = load_mono(cand, target_sr=ref_sr)
             sib_gap = L.sibilance_db(cy, ref_sr) - ref_sib
             crest_gap = L.crest_db(cy) - ref_crest
-            left_at_zero = []
             print(f"  reference: sibilance {ref_sib:+.1f} dB   crest {ref_crest:.1f} dB")
             print(f"  clone gap: sibilance {sib_gap:+.1f} dB   crest {crest_gap:+.1f} dB")
 
@@ -745,7 +849,7 @@ def main():
                           ('EQ off (keep vol/filters)', dict(opt, eq_low=0, eq_mid=0, eq_high=0)),
                           ('brighter (eq_high +2)', dict(opt, eq_high=opt['eq_high'] + 2)),
                           ('darker (eq_high -2)',   dict(opt, eq_high=opt['eq_high'] - 2)),
-                          ('full band (lp 16k)',    dict(opt, lp=16000)),
+                          *([('low-pass off', dict(opt, lp=0))] if opt.get('lp') else []),
                           ('narrow band (lp 8k)',   dict(opt, lp=8000)),
                           ('NR 0.2',                dict(opt, NR=0.2)),
                           ('comp 0.3',              dict(opt, comp=0.3)),
@@ -818,7 +922,7 @@ def main():
                         ('eq_mid', [-6, -3, 0, 3, 6]),
                         ('eq_high',[-6, -3, 0, 3, 6]),
                         ('hp',     [40, 65, 95, 150]),
-                        ('lp',     [6000, 8000, 11000, 16000]),
+                        ('lp',     [0, 6000, 8000, 11000, 16000]),     # 0 = off
                         ('NR',     [0, 0.15, 0.3, 0.5]),
                         ('comp',   [0, 0.2, 0.4, 0.6]),
                         ('de-ess', [0, 0.15, 0.3, 0.5])]
@@ -837,7 +941,8 @@ def main():
                 for axis, swing, bestv, besti, delta in rows:
                     verdict = ('MATTERS' if swing > 3 * noise_s else
                                'marginal' if swing > noise_s else 'INERT')
-                    print(f"  {axis:>8}{swing:>9.4f}{str(bestv):>12}{besti:>10.4f}"
+                    shown = 'off' if axis == 'lp' and not bestv else str(bestv)
+                    print(f"  {axis:>8}{swing:>9.4f}{shown:>12}{besti:>10.4f}"
                           f"{delta:>+9.4f}   {verdict}")
                 live = [r[0] for r in rows if r[1] > 3 * noise_s]
                 dead = [r[0] for r in rows if r[1] <= noise_s]
@@ -874,9 +979,11 @@ def main():
 
                 # Bounds kept musically sane: outside these the result stops being
                 # a listenable voice regardless of what the metric says.
-                AXES = [('vol', -18, 18), ('eq_low', -args.eq_limit, args.eq_limit), ('eq_mid', -args.eq_limit, args.eq_limit),
-                        ('eq_high', -args.eq_limit, args.eq_limit), ('hp', 40, 150), ('lp', 6000, 16000),
-                        ('NR', 0, 0.5), ('comp', 0, 0.6), ('de-ess', 0, 0.5)]
+                AXES, held = identity_axes(opt, args.eq_limit,
+                                           freeze_vol=args.target_dbfs is not None)
+                if held:
+                    print("  held fixed: " + ", ".join(
+                        'vol (--target-dbfs)' if key == 'vol' else f'{key} (off)' for key in held))
                 bounds = [(lo, hi) for _, lo, hi in AXES]
                 lower = _np.array([lo for _, lo, _ in AXES], dtype=float)
                 upper = _np.array([hi for _, _, hi in AXES], dtype=float)
@@ -920,8 +1027,8 @@ def main():
                     # the complete identity search (baseline + DE + local polish).
                     total_budget = max(64, int(args.optimise_budget))
 
-                    # A smaller Sobol population is still broad enough for these 9 bounded axes
-                    # while leaving useful room for local polish.  scipy rounds 6*9=54 -> 64.
+                    # A smaller Sobol population is still broad enough for these (up to 9) bounded
+                    # axes while leaving useful room for local polish.  scipy rounds 6*9=54 -> 64.
                     de_popsize = 6
                     n_free = sum(1 for lo, hi in bounds if hi > lo)
                     requested_pop = max(1, de_popsize * n_free)
@@ -1178,8 +1285,8 @@ def main():
                 print(f"  Identity: {_fit_id:.4f} on the fitted sentence, "
                       f"{_unseen_id:.4f} on UNSEEN text ({_unseen_id - _fit_id:+.4f})")
                 if _fit_id - _unseen_id > 0.05:
-                    print(f"  ^ the fitted figure is optimistic; {_unseen_id:.4f} is what "
-                          f"your generated meditation will resemble.")
+                    print("  ^ Identity drops on this unseen sentence. Compare several unseen "
+                          "renders by ear; one ECAPA score does not predict an entire meditation.")
             except Exception as _e:
                 print(f"  [!] Unseen-text identity check skipped ({_e})")
 

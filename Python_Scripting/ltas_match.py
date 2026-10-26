@@ -11,8 +11,11 @@ The peaking responses modelled here are the EXACT responses FFmpeg applies:
   low  : f0=120  Hz, BW=160  Hz  (Q = f0/BW = 0.75)
   mid  : f0=1500 Hz, BW=2000 Hz  (Q = 0.75)
   high : f0=5000 Hz, BW=3000 Hz  (Q = 1.667)
-hp/lp are pydub one-pole (-6 dB/oct) filters, derived from the LTAS roll-off,
-not folded into the peaking LS (different parameter nature).
+hp/lp are pydub's first-order RC recursions, set from the LTAS at the spectral
+extremes, not by the peaking LS. At the 24 kHz of an XTTS render the low-pass is
+a gentle treble tilt, not a cut above lp: lp 9000 takes 2.1 dB at 4 kHz and
+4.5 dB at 8 kHz (measured through pydub). rc_lowpass_db / rc_highpass_db model
+them exactly, so the EQ can be fitted on the curve a filter change will give.
 
 Public API:
   compute_ltas(y, sr)                 -> (f_grid, ltas_db)
@@ -42,6 +45,20 @@ EQ_BANDS = [
 FIT_FMIN = 80.0      # speech band for the fit
 FIT_FMAX = 8000.0
 N_GRID   = 256       # log-spaced points
+
+# Spectra are compared as mean power over bands max(250 Hz, 1/3 octave) wide,
+# not point by point. Below ~1.1 kHz a voice's long-term spectrum is a comb:
+# peaks at the harmonics of F0, hollows between them, almost nothing below F0,
+# and where the teeth fall depends on the melody of the sentence, which a clone
+# never repeats. Compared point by point, the teeth made most of the error
+# (78 % of it from 180 Hz to 1 kHz on a synthetic 204 Hz voice), no EQ bell
+# could reduce it, and the
+# least squares in dB, pulled by the hollows, boosted eq_low on a clone that
+# already had too much fundamental. 250 Hz spans one harmonic spacing up to
+# that F0; above 1.1 kHz, where the harmonics merge, a third of an octave.
+SMOOTH_FLOOR_HZ = 250.0
+SMOOTH_OCTAVES  = 1.0 / 3.0
+SMOOTH_LOWEST_HZ = 20.0  # bands never reach below it (DC, rumble)
 
 
 # ── Exact filter magnitude responses (dB) ─────────────────────────────────────
@@ -74,20 +91,44 @@ def rbj_peaking_db(freqs, fs, f0, bw_hz, gain_db):
     return 20.0 * np.log10(np.abs(H) + 1e-12)
 
 
-def onepole_hp_db(freqs, fc):
-    """One-pole high-pass magnitude (dB). 0 = bypass."""
-    if fc <= 0:
+def rc_lowpass_db(freqs, fc, fs):
+    """pydub's low_pass_filter, which the generator applies for lp (dB, 0 = off).
+
+    A first-order RC recursion, y[n] = y[n-1] + a (x[n] - y[n-1]) with
+    a = 1 / (1 + fs / (2 pi fc)). The analogue one-pole formula this module
+    had (and nothing used) put lp 9000 at -1.6 dB at 6 kHz on a 24 kHz
+    render, where pydub takes -3.4 dB, and at -2.5 dB at 8 kHz, where it
+    takes -4.5 dB.
+    """
+    freqs = np.asarray(freqs, dtype=float)
+    if not fc or fc <= 0:
         return np.zeros_like(freqs)
-    r = fc / np.maximum(freqs, 1e-6)
-    return 20.0 * np.log10(1.0 / np.sqrt(1.0 + r * r) + 1e-12)
+    a = 1.0 / (1.0 + fs / (2.0 * np.pi * fc))
+    w = 2.0 * np.pi * freqs / fs
+    mag2 = a * a / (1.0 - 2.0 * (1.0 - a) * np.cos(w) + (1.0 - a) ** 2)
+    return 10.0 * np.log10(mag2 + 1e-24)
 
 
-def onepole_lp_db(freqs, fc):
-    """One-pole low-pass magnitude (dB). 0 = bypass."""
-    if fc <= 0:
+def rc_highpass_db(freqs, fc, fs):
+    """pydub's high_pass_filter, which the generator applies for hp (dB, 0 = off).
+
+    y[n] = a (y[n-1] + x[n] - x[n-1]) with a = 1 / (1 + 2 pi fc / fs).
+    """
+    freqs = np.asarray(freqs, dtype=float)
+    if not fc or fc <= 0:
         return np.zeros_like(freqs)
-    r = freqs / fc
-    return 20.0 * np.log10(1.0 / np.sqrt(1.0 + r * r) + 1e-12)
+    a = 1.0 / (1.0 + 2.0 * np.pi * fc / fs)
+    w = 2.0 * np.pi * freqs / fs
+    mag2 = a * a * (2.0 - 2.0 * np.cos(w)) / (1.0 - 2.0 * a * np.cos(w) + a * a)
+    return 10.0 * np.log10(mag2 + 1e-24)
+
+
+def filter_change_db(freqs, fs, old, new):
+    """What changing hp/lp from `old` to `new` (dicts) does to a spectrum, dB."""
+    return (rc_highpass_db(freqs, float(new.get('hp', 0) or 0), fs)
+            - rc_highpass_db(freqs, float(old.get('hp', 0) or 0), fs)
+            + rc_lowpass_db(freqs, float(new.get('lp', 0) or 0), fs)
+            - rc_lowpass_db(freqs, float(old.get('lp', 0) or 0), fs))
 
 
 def eq_peaking_db(freqs, fs, gains):
@@ -100,28 +141,58 @@ def eq_peaking_db(freqs, fs, gains):
 
 # ── LTAS ──────────────────────────────────────────────────────────────────────
 
-def compute_ltas(y, sr, fmin=FIT_FMIN, fmax=FIT_FMAX, n_grid=N_GRID):
+def ltas_psd(y, sr):
+    """Welch power spectral density of the whole signal: (freqs, psd)."""
+    y = mono_audio(y, sr)
+    nper = min(4096, len(y))
+    if nper < 256:
+        nper = len(y)
+    freqs, psd = welch(y, sr, nperseg=nper, noverlap=nper // 2)
+    return freqs, np.maximum(psd, 1e-20)
+
+
+def smoothing_widths(f_grid, floor_hz=SMOOTH_FLOOR_HZ):
+    """Width (Hz) of the band read at each grid frequency."""
+    f_grid = np.asarray(f_grid, float)
+    third = f_grid * (2.0 ** (SMOOTH_OCTAVES / 2) - 2.0 ** (-SMOOTH_OCTAVES / 2))
+    return np.maximum(floor_hz, third)
+
+
+def grid_db(freqs, psd, f_grid, floor_hz=SMOOTH_FLOOR_HZ):
+    """dB at each grid frequency: mean power over the band smoothing_widths
+    gives (not normalised). floor_hz=0 reads the PSD point by point, as
+    before 3.7.2."""
+    freqs, psd, f_grid = (np.asarray(x, float) for x in (freqs, psd, f_grid))
+    if not floor_hz:
+        return np.interp(f_grid, freqs, 10.0 * np.log10(psd))
+    df = freqs[1] - freqs[0]
+    edges = np.concatenate([freqs - df / 2, [freqs[-1] + df / 2]])
+    cum = np.concatenate([[0.0], np.cumsum(psd) * df])
+    half = smoothing_widths(f_grid, floor_hz) / 2
+    lo = np.maximum(f_grid - half, max(SMOOTH_LOWEST_HZ, edges[0]))
+    hi = np.minimum(f_grid + half, edges[-1])
+    power = (np.interp(hi, edges, cum) - np.interp(lo, edges, cum)) / np.maximum(hi - lo, 1e-9)
+    return 10.0 * np.log10(np.maximum(power, 1e-20))
+
+
+def compute_ltas(y, sr, fmin=FIT_FMIN, fmax=FIT_FMAX, n_grid=N_GRID,
+                 floor_hz=SMOOTH_FLOOR_HZ):
     """Long-term average spectrum on a log-frequency grid, in dB.
 
     Returns (f_grid, ltas_db). The dB curve is *relative* (peak-normalised),
     so only its shape matters — absolute level is handled separately by `vol`.
+    Each point is the mean power of a band around it (grid_db), unless
+    floor_hz=0.
     """
     y = mono_audio(y, sr)
     if not (np.isfinite(fmin) and np.isfinite(fmax) and 0 < fmin < min(fmax, sr / 2 - 1)):
         raise ValueError("Invalid LTAS frequency interval for this sample rate")
     if not isinstance(n_grid, (int, np.integer)) or n_grid < 4:
         raise ValueError("LTAS requires at least four grid points")
-    nper = min(4096, len(y))
-    if nper < 256:
-        nper = len(y)
-    freqs, psd = welch(y, sr, nperseg=nper, noverlap=nper // 2)
-    psd = np.maximum(psd, 1e-20)
-    ltas_db = 10.0 * np.log10(psd)
-
+    freqs, psd = ltas_psd(y, sr)
     f_grid = np.logspace(np.log10(fmin), np.log10(min(fmax, sr / 2 - 1)), n_grid)
-    grid_db = np.interp(f_grid, freqs, ltas_db)
-    grid_db = grid_db - grid_db.max()          # peak-normalise (shape only)
-    return f_grid, grid_db
+    db = grid_db(freqs, psd, f_grid, floor_hz)
+    return f_grid, db - db.max()               # peak-normalise (shape only)
 
 
 # ── Roll-off based hp / lp ────────────────────────────────────────────────────
@@ -129,10 +200,17 @@ def compute_ltas(y, sr, fmin=FIT_FMIN, fmax=FIT_FMAX, n_grid=N_GRID):
 def derive_hp_lp(f_grid, ref_db, clone_db, cur_hp=0, cur_lp=0):
     """Set hp/lp from excess energy at the spectral extremes of the clone.
 
-    hp/lp are SAFETY guards (rumble / hiss), not tone controls — the EQ fits the
+    The high-pass is a rumble guard, not a tone control — the EQ fits the
     tone. So hp is never allowed below 40 Hz: lowering it to compensate a
     low-end deficit is the EQ's job, and an unbounded loop walked it down 30 Hz
     per pass (95 -> 65 -> 35 -> 5 Hz = no filter at all, DC and rumble through).
+
+    The low-pass is no guard at all on a 24 kHz render: pydub's first-order
+    filter tilts the whole upper band (rc_lowpass_db), and even lp 12000 takes
+    3.5 dB at 8 kHz. When the clone LACKS highs it is switched off. It was
+    opened by 1000 Hz, and lp 10000 still takes 1.8 dB at 4 kHz and 4.1 dB at
+    8 kHz: eq_high then spent its whole bound giving that back. A clone with
+    excess highs still gets a lower one, the treble cut it then needs.
     """
     HP_MIN, HP_MAX = 40.0, 150.0
     hp, lp = cur_hp, cur_lp
@@ -149,7 +227,7 @@ def derive_hp_lp(f_grid, ref_db, clone_db, cur_hp=0, cur_lp=0):
         if excess_high > 3:
             lp = float(np.clip((cur_lp or 11000) - 1000, 6000, 12000))
         elif excess_high < -3 and cur_lp > 0:
-            lp = float(np.clip(cur_lp + 1000, 6000, 12000))
+            lp = 0.0
     return hp, lp
 
 
@@ -263,7 +341,50 @@ def fit_eq_ls(f_grid, ref_db, clone_db, fs=24000, weighting='a',
     )
 
 
-__all__ = ['compute_ltas', 'fit_eq_ls', 'level_match_db', 'eq_peaking_db', 'rbj_peaking_db']
+def fit_eq_psd(f_grid, ref_db, freqs, psd, fs, weighting='a', limit=4.0,
+               start=(0.0, 0.0, 0.0), extra_db=None, floor_hz=SMOOTH_FLOOR_HZ):
+    """EQ gains (absolute, within +/-limit) that bring a render to ref_db.
+
+    (freqs, psd) is the render's PSD, taken with the gains `start`; extra_db,
+    per PSD bin, is a filter change applied on top. The bells and the filters
+    are linear, so their effect is exact bin by bin: the model takes `start`
+    out, puts the candidate gains in, and smooths the result onto the grid
+    like the measurement (grid_db). Fitting the cumulative gains under their
+    own bounds keeps a band that sits at its bound there, instead of fitting
+    a step it cannot take and clipping it afterwards, which left the other
+    bands fitted for a move that never happened.
+
+    Returns ({eq_low, eq_mid, eq_high}, the curve those rounded gains give).
+    """
+    f_grid, ref_db, freqs, psd = (np.asarray(x, float) for x in (f_grid, ref_db, freqs, psd))
+    if not np.isfinite(limit) or limit <= 0:
+        raise ValueError("Invalid EQ gain bound")
+    inside = freqs < fs / 2           # the chain runs at fs: nothing above its Nyquist
+
+    def bells(gains):
+        out = np.zeros_like(freqs)
+        out[inside] = eq_peaking_db(freqs[inside], fs, gains)
+        return out
+    start = np.clip(np.asarray(start, float), -limit, limit)
+    shift = np.zeros_like(freqs) if extra_db is None else np.asarray(extra_db, float)
+    base = psd * 10.0 ** ((shift - bells(start)) / 10.0)
+    w = spectrum_weights(f_grid, ref_db, weighting)
+    sw = np.sqrt(w)
+
+    def model(gains):
+        return grid_db(freqs, base * 10.0 ** (bells(gains) / 10.0), f_grid, floor_hz)
+
+    def residual(p):
+        return sw * (model(p[1:]) + p[0] - ref_db)
+    c0 = float(np.average(ref_db - model(start), weights=w))
+    sol = least_squares(residual, np.concatenate([[c0], start]), method='trf',
+                        bounds=([-300.0] + [-limit] * 3, [300.0] + [limit] * 3))
+    gains = [float(np.clip(round(float(g), 1), -limit, limit)) for g in sol.x[1:]]
+    return dict(zip(('eq_low', 'eq_mid', 'eq_high'), gains)), model(gains)
+
+
+__all__ = ['compute_ltas', 'fit_eq_ls', 'fit_eq_psd', 'level_match_db', 'eq_peaking_db',
+           'rbj_peaking_db', 'ltas_psd', 'grid_db']
 
 
 # ── Dynamics / sibilance measurements (closed-loop comp & de-ess fitting) ─────

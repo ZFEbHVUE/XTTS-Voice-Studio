@@ -482,6 +482,7 @@ def run_cmd(cmd, console, btn, stop_btn=None, line_callback=None):
     import time as _t, re as _re
     proc_holder = [None]
     timer_on = [False]
+    stopped = [False]
 
     def _setinfo(s):
         if _root and hasattr(btn, '_info_var'):
@@ -527,8 +528,11 @@ def run_cmd(cmd, console, btn, stop_btn=None, line_callback=None):
                     if line_callback:
                         _root.after(0, lambda t=txt: line_callback(t))
             proc.wait()
+            # Stop kills the child (SIGKILL: code -9 on Linux, 1 on Windows),
+            # which used to be reported as an error.
             if proc.returncode == 0:   log(console, "\n[OK] Done.")
-            elif proc.returncode==-15: log(console, "\n[STOP] Stopped.")
+            elif stopped[0] or proc.returncode == -15:
+                log(console, "\n[STOP] Stopped.")
             else:                      log(console, f"\n[ERR] Error (code {proc.returncode})")
         except Exception as e:
             log(console, f"\n[ERR] {e}")
@@ -546,6 +550,7 @@ def run_cmd(cmd, console, btn, stop_btn=None, line_callback=None):
 
     def stop():
         if proc_holder[0]:
+            stopped[0] = True
             import signal as _sig, os as _os
             try:
                 # Kill only the child process and its children, NOT the GUI process
@@ -1728,7 +1733,7 @@ def tab_auto(nb):
     # The auto buttons and the budget check read the fields the same way, or
     # an emptied field would get a budget computed for another search.
     FALLBACK = {'seeds': '0 42 100 180 200', 'budget': '60', 'keep': '45',
-                'cond': '24', 'chunks': '4 6 8 10', 'maxref': '30', 'gcl': '20 30'}
+                'cond': '34', 'chunks': '4 6 8 10', 'maxref': '30', 'gcl': '20 30'}
 
     def _field(var, key):
         return var.get().strip() or FALLBACK[key]
@@ -1947,10 +1952,20 @@ def tab_auto(nb):
              fg='gray', font=("Arial", 8), justify='left', wraplength=560,
              anchor='w').grid(row=6, column=0, columnspan=3, sticky='w', padx=8)
 
-    v_a_cond = tk.StringVar(value='24')
+    v_a_cond = tk.StringVar(value='34')
     v_a_chunks = tk.StringVar(value='4 6 8 10')
     v_a_maxref = tk.StringVar(value='30')
     v_a_mrls = tk.StringVar(value='')
+    # Sentence files for the search and the hold-out: sentences from the real
+    # script make both speak like the production text.
+    v_a_probe_file = tk.StringVar(value='')
+    v_a_hold_file = tk.StringVar(value='')
+    # Set while 'auto all' chains the autos: each one's "then press auto
+    # next to ..." hint is noise when the next one runs by itself.
+    _chain = [False]
+
+    def _then(hint):
+        return '' if _chain[0] else ' ' + hint
 
     def _voice_seconds(quiet=False):
         """(path, seconds, what) of the audio each voice will hand XTTS."""
@@ -2024,8 +2039,8 @@ def tab_auto(nb):
         log(console, f"[*] Reference lengths to test set to {values}: none longer than the "
                      f"shortest audio XTTS gets ({shortest:.1f}s), which a longer value would "
                      f"only read again. Each one is judged on one sentence and one seed, so "
-                     f"only a large effect can win. Then press auto next to Conditioning "
-                     f"budget.")
+                     f"only a large effect can win."
+                     f"{_then('Then press auto next to Conditioning budget.')}")
 
     def _auto_gcl():
         """gcl s: GPT lengths up to what XTTS reads of the shortest file."""
@@ -2041,8 +2056,8 @@ def tab_auto(nb):
         start = (f"from {SP.GCL_FLOOR} s, the floor kept for the accent" if values[0] >= SP.GCL_FLOOR
                  else f"from {values[0]} s, the file being shorter than {SP.GCL_FLOOR} s")
         log(console, f"[*] gcl s set to {text}: {start}, up to the {values[-1]} s XTTS reads "
-                     f"of the shortest file; none is ignored or reads the same audio twice. "
-                     f"Then press auto next to Chunk lengths and Conditioning budget.")
+                     f"of the shortest file; none is ignored or reads the same audio twice."
+                     f"{_then('Then press auto next to Chunk lengths and Conditioning budget.')}")
 
     def _auto_chunks():
         """Chunk lengths that fit every usable gpt_cond_len."""
@@ -2053,8 +2068,8 @@ def tab_auto(nb):
                                                        max_ref)))
         v_a_chunks.set(values)
         log(console, f"[*] Chunk lengths set to {values}: each one fits the shortest usable "
-                     f"gcl s, so it can pair with every gpt_cond_len. Then press auto next "
-                     f"to Conditioning budget.")
+                     f"gcl s, so it can pair with every gpt_cond_len."
+                     f"{_then('Then press auto next to Conditioning budget.')}")
 
     def _cond_need(secs):
         max_ref = _int_field(v_a_maxref, 'maxref', "Max reference s")
@@ -2082,6 +2097,34 @@ def tab_auto(nb):
                      f"in full for every voice, whichever candidates win; a larger budget "
                      f"is never used.")
 
+    def _auto_all():
+        """Every auto, in the order they depend on each other.
+
+        The curated length decides the audio XTTS reads (Max reference s),
+        which bounds the reference lengths and gcl s, which bound the chunks,
+        which size the conditioning budget. Pressed one by one in another
+        order, the conditioning budget was computed before the fields it
+        counts (21 instead of 53 on a real run). An empty Reference lengths
+        stays empty: it is optional, and empty skips that stage.
+        """
+        if not _voice_seconds():
+            return
+        steps = ([_auto_keep] if v_a_curate.get() else []) + [_auto_maxref]
+        if v_a_mrls.get().strip():
+            steps.append(_auto_reflens)
+        steps += [_auto_gcl, _auto_chunks, _auto_cond, _auto_budget]
+        _chain[0] = True
+        try:
+            for step in steps:
+                step()
+        finally:
+            _chain[0] = False
+        log(console, "[*] auto all: " + " -> ".join(
+            {_auto_keep: 'Keep s', _auto_maxref: 'Max reference s',
+             _auto_reflens: 'Reference lengths', _auto_gcl: 'gcl s',
+             _auto_chunks: 'Chunk lengths', _auto_cond: 'Conditioning budget',
+             _auto_budget: 'Budget'}[st] for st in steps) + ", in that order.")
+
     extra = tk.Frame(f)
     extra.grid(row=7, column=0, columnspan=3, sticky='w', padx=6, pady=4)
     for i, (label, var, name, command) in enumerate((
@@ -2095,12 +2138,36 @@ def tab_auto(nb):
         tk.Entry(extra, textvariable=var, width=24).grid(row=i, column=1, sticky='w', padx=4)
         tk.Button(extra, text="auto", width=4, command=command, name=name).grid(
             row=i, column=2, sticky='w')
+    tk.Label(extra, text="every auto, Keep s and Budget included, in the order they "
+                         "depend on each other", fg='grey', font=("Arial", 8)).grid(
+        row=5, column=1, sticky='e', padx=4, pady=(4, 0))
+    tk.Button(extra, text="auto all", width=8, command=_auto_all, name='auto_all').grid(
+        row=5, column=2, sticky='w', pady=(4, 0))
+
+    sent = tk.Frame(f)
+    sent.grid(row=8, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
+    for i, (label, var) in enumerate((("Search sentences file", v_a_probe_file),
+                                      ("Unseen sentences file", v_a_hold_file))):
+        tk.Label(sent, text=label).grid(row=i, column=0, sticky='w')
+        tk.Entry(sent, textvariable=var, width=46).grid(row=i, column=1, sticky='w', padx=4)
+        tk.Button(sent, text="Browse", width=8,
+                  command=lambda v=var: browse_file(v, [("Text", "*.txt"), ("All", "*.*")])
+                  ).grid(row=i, column=2, sticky='w')
+    tk.Label(sent, text="Optional, one sentence per line (# lines skipped); the first two "
+                        "of each file are used. Empty = the built-in sentences. Lines from "
+                        "your own script make the search and the hold-out speak like it.",
+             fg='grey', font=("Arial", 8), justify='left', wraplength=560).grid(
+        row=2, column=0, columnspan=3, sticky='w')
     console = add_console(foot, 0)
 
     def _check_budgets():
         """Warn before the long run when a budget would cut its own plan."""
         try:
             seeds = SP.parse_ints(_field(v_a_seeds, 'seeds'))
+            odd = SP.joined_seeds(seeds)
+            if odd:
+                log(console, f"[!] Seed {' '.join(map(str, odd))} is far above the others: "
+                             f"a missing space? It runs as one seed.")
             need = SP.pipeline_sampling_budget(seeds, v_a_beams.get())
             have = int(_field(v_a_budget, 'budget'))
             if have < need:
@@ -2176,6 +2243,13 @@ def tab_auto(nb):
                 cmd += ['--preset-name', pn or '-']
         if v_a_hist.get():
             cmd += ['--keep-preset-history']
+        for option, var in (('--probe-text-file', v_a_probe_file),
+                            ('--holdout-text-file', v_a_hold_file)):
+            path = var.get().strip()
+            if path:
+                if not os.path.isfile(path):
+                    log(console, f"[ERR] Sentence file not found: {path}"); return
+                cmd += [option, path]
         _check_budgets()
         run_cmd(cmd, console, btn, stop_btn)
 
@@ -2457,6 +2531,7 @@ def tab_analyser(nb):
         # Run commands sequentially in a thread
         import subprocess, threading
         proc_holder = [None]
+        stopped = [False]
 
         def _run_all():
             import time as _t2
@@ -2471,6 +2546,7 @@ def tab_analyser(nb):
                 if ta[0] and _root: _root.after(1000, _tick2)
             if _root: _root.after(1000, _tick2)
             summary_lines = []
+            completed = True
             try:
                 for cmd in cmds:
                     log(console, "\n> " + " ".join(str(c) for c in cmd))
@@ -2484,7 +2560,10 @@ def tab_analyser(nb):
                         voice_lines.append(line.rstrip())
                     proc.wait()
                     if proc.returncode != 0:
-                        log(console, f"[ERR] code {proc.returncode}")
+                        # Stop terminates the child (code -15): not an error.
+                        log(console, "\n[STOP] Stopped." if stopped[0]
+                            else f"[ERR] code {proc.returncode}")
+                        completed = False
                         break
                     # Extract bracket blocks from output
                     block = []
@@ -2510,7 +2589,8 @@ def tab_analyser(nb):
                         log(console, "\n" + block)
                     log(console, "")
 
-                log(console, "\n[OK] Analysis complete.")
+                if completed:
+                    log(console, "\n[OK] Analysis complete.")
             except Exception as e:
                 log(console, f"\n[ERR] {e}")
             finally:
@@ -2529,8 +2609,9 @@ def tab_analyser(nb):
         if stop_btn:
             def stop():
                 if proc_holder[0]:
+                    stopped[0] = True
                     proc_holder[0].terminate()
-                    log(console, "\nStop demandé...")
+                    log(console, "\n[STOP] Stop requested...")
             stop_btn._stop_fn = stop
 
         threading.Thread(target=_run_all, daemon=True).start()
@@ -3401,7 +3482,7 @@ def tab_optimize(nb):
     v_opt_wid    = tk.StringVar(value='0.4')
     v_opt_maxref = tk.StringVar(value='30')
     v_opt_model  = tk.StringVar(value='small')
-    v_opt_cond = tk.StringVar(value='24')
+    v_opt_cond = tk.StringVar(value='34')
     v_opt_probes = tk.StringVar(value='2')
     v_opt_gcl = tk.StringVar(value='20 30')
     v_opt_chunks = tk.StringVar(value='4 6 8 10')
@@ -3487,7 +3568,7 @@ def tab_optimize(nb):
         HANDOFF['opt_xtts'] = ''
         HANDOFF['opt_refs'] = []
         cmd += ['--budget', v_opt_budget.get().strip() or '60']
-        cmd += ['--cond-budget', v_opt_cond.get().strip() or '24']
+        cmd += ['--cond-budget', v_opt_cond.get().strip() or '34']
         cmd += ['--probe-texts', v_opt_probes.get().strip() or '2']
         cmd += ['--gpt-cond-lens', v_opt_gcl.get().strip() or '20 30']
         cmd += ['--gpt-chunks', v_opt_chunks.get().strip() or '4 6 8 10']
@@ -3780,9 +3861,9 @@ def tab_comparator(nb):
     frm_iter = tk.Frame(f)
     frm_iter.grid(row=row, column=0, columnspan=2, sticky='w', padx=6, pady=4)
     tk.Label(frm_iter, text="Iterations", width=10, anchor='w').pack(side='left')
-    v_cmp_iter = tk.StringVar(value='1')
+    v_cmp_iter = tk.StringVar(value='3')    # the script's and the pipeline's default
     tk.Spinbox(frm_iter, from_=1, to=20, textvariable=v_cmp_iter, width=4).pack(side='left', padx=4)
-    tk.Label(frm_iter, text="  Stop if score delta  <", anchor='w').pack(side='left', padx=(12,2))
+    tk.Label(frm_iter, text="  Stop if EQ/volume change <", anchor='w').pack(side='left', padx=(12,2))
     v_cmp_conv = tk.StringVar(value='0.5')
     tk.Entry(frm_iter, textvariable=v_cmp_conv, width=5).pack(side='left')
     tk.Label(frm_iter, text="or [] unchanged", fg='gray', font=('Arial',8)).pack(side='left', padx=6)

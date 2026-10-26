@@ -1,5 +1,6 @@
 """Regressions derived from the supplied log, with real DSP and model stubs."""
 import contextlib
+import importlib.util
 import io
 from pathlib import Path
 import shutil
@@ -11,10 +12,78 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 from scipy.io import wavfile
-from scipy.signal import resample_poly
+from scipy.signal import butter, lfilter, resample_poly, sosfilt
 import ltas_match as ltas
 import voice_comparator as comparator
 import xtts_settings as settings
+from test_render_search_regressions import AudioSegment, CHAIN, generator_namespace, needs_audio
+
+
+def shaped_noise(sr, seconds, seed, tilt_db=0.):
+    """Noise with a speech-like long-term spectrum (rising to 150 Hz, -6 dB per
+    octave above 600 Hz, a sibilance bump at 6 kHz), tilted by tilt_db from
+    3 to 7 kHz."""
+    n=int(sr*seconds)
+    spectrum=np.fft.rfft(np.random.default_rng(seed).standard_normal(n))
+    f=np.maximum(np.fft.rfftfreq(n,1/sr),1.)
+    db=(-10*np.log10(1+(150/f)**4)-10*np.log10(1+(f/600)**2)
+        +5*np.exp(-.5*(np.log2(f/6000)/.35)**2)
+        +tilt_db*np.clip(np.log2(f/3000)/np.log2(7000/3000),0,1))
+    y=np.fft.irfft(spectrum*10**(db/20),n)
+    return .05*y/np.std(y)
+
+
+def exact_chain(raw, config, fs=24000, artifact=None, ratio=(147, 80)):
+    """hp, lp, EQ and volume as the generator applies them (pydub's RC
+    recursions, FFmpeg's RBJ bells), resampled to the reference's rate
+    (ratio: 44.1 kHz by default, (2, 3) for 16 kHz). `artifact` is added when
+    the low-pass is off: something it hid, which no model of the chain knows
+    about."""
+    y=np.asarray(raw,float)
+    if config.get('hp'):
+        a=1/(1+2*np.pi*config['hp']/fs); y=lfilter([a,-a],[1,-a],y)
+    if config.get('lp'):
+        a=1/(1+fs/(2*np.pi*config['lp'])); y=lfilter([a],[1,a-1],y)
+    for key,f0,bw in ltas.EQ_BANDS:
+        if config.get(key):
+            A=10**(config[key]/40); w0=2*np.pi*f0/fs; alpha=np.sin(w0)*bw/(2*f0); c=np.cos(w0)
+            b=np.array([1+alpha*A,-2*c,1-alpha*A]); den=np.array([1+alpha/A,-2*c,1-alpha/A])
+            y=lfilter(b/den[0],den/den[0],y)
+    if artifact is not None and not config.get('lp'):
+        y=y+artifact
+    return resample_poly(y*10**(config.get('vol',0)/20),*ratio)
+
+
+def harmonic_voice(sr, seconds, f0, phase, h1_db=0., noise_db=-45., seed=0, top=7000.):
+    """A voiced source under four formants: the harmonics of a gliding F0
+    (amplitude 1/k) up to `top` Hz at any rate, syllable gates, a little
+    noise. h1_db raises the fundamental alone, the balance a clone can get
+    wrong."""
+    rng=np.random.default_rng(seed)
+    t=np.arange(int(sr*seconds))/sr
+    pitch=f0*(1+.08*np.sin(2*np.pi*.31*t+phase)+.04*np.sin(2*np.pi*1.13*t+2*phase))
+    angle=2*np.pi*np.cumsum(pitch)/sr
+    def formants(f):
+        f=np.maximum(f,1.)
+        return sum(g*np.exp(-.5*(np.log2(f/fc)/bw)**2) for fc,g,bw in
+                   ((800,12,.35),(1900,9,.3),(2800,6,.25),(3600,3,.25)))
+    y=np.zeros_like(t)
+    top=min(top,sr/2-200)
+    for k in range(1,int(top//(f0*.85))+1):
+        fk=k*pitch
+        amp=10**((formants(fk)+(h1_db if k==1 else 0))/20)/k
+        y+=np.where(fk<top,amp,0)*np.sin(k*angle+rng.uniform(0,2*np.pi))
+    gate=np.convolve((np.sin(2*np.pi*2.7*t+phase)>-.4).astype(float),np.ones(int(.03*sr))/int(.03*sr),'same')
+    y=y*gate/np.std(y*gate)
+    noise=lfilter([1],[1,-.95],rng.standard_normal(len(t)))
+    y=y+10**(noise_db/20)*noise/np.std(noise)
+    return .05*y/np.std(y)
+
+
+def low_share(y, sr):
+    """Share of the energy below 300 Hz, of the energy below 8 kHz."""
+    power=np.abs(np.fft.rfft(y))**2;f=np.fft.rfftfreq(len(y),1/sr)
+    return float(power[f<300].sum()/power[f<8000].sum())
 
 
 class ExcerptTests(unittest.TestCase):
@@ -120,10 +189,11 @@ class ToneTests(unittest.TestCase):
     def test_response_uses_clone_rate_and_cumulative_gains_are_bounded(self):
         reference=self.noise();seen=[]
         def render(config): seen.append(dict(config));return reference.copy()
-        def proposed(*a,**kw):
+        def proposed(grid,*a,**kw):
             self.assertEqual(kw['fs'],24000)
-            return dict(eq_low=4,eq_mid=4,eq_high=4,hp=0,lp=0)
-        with patch.object(ltas,'fit_eq_ls',side_effect=proposed),contextlib.redirect_stdout(io.StringIO()):
+            # Beyond the limit on purpose: the comparator still clips.
+            return dict(eq_low=7,eq_mid=7,eq_high=7),np.zeros(len(grid))
+        with patch.object(ltas,'fit_eq_psd',side_effect=proposed),contextlib.redirect_stdout(io.StringIO()):
             result,history=comparator.fit_rendered_tone(reference,44100,24000,
                 dict(eq_low=3,eq_mid=3,eq_high=3,hp=0,lp=0,vol=0),render,eq_limit=4)
         self.assertTrue(all(abs(config[k])<=4 for config in seen for k in ('eq_low','eq_mid','eq_high')))
@@ -135,8 +205,8 @@ class ToneTests(unittest.TestCase):
         original=self.noise()
         altered=original+np.sin(np.arange(len(original))*.05)*.02
         def render(config): return altered if config.get('eq_high') else original
-        proposal=dict(eq_low=0,eq_mid=0,eq_high=4,hp=0,lp=0)
-        with patch.object(ltas,'fit_eq_ls',return_value=proposal),contextlib.redirect_stdout(io.StringIO()):
+        proposal=dict(eq_low=0,eq_mid=0,eq_high=4),np.zeros(ltas.N_GRID)
+        with patch.object(ltas,'fit_eq_psd',return_value=proposal),contextlib.redirect_stdout(io.StringIO()):
             result,history=comparator.fit_rendered_tone(original,24000,24000,
                 dict(eq_low=0,eq_mid=0,eq_high=0,hp=0,lp=0,vol=0),render)
         self.assertEqual(result['eq_high'],0)
@@ -162,21 +232,48 @@ class ToneTests(unittest.TestCase):
 
 class IntegrationTests(unittest.TestCase):
     def test_joint_search_restores_requested_lengths_after_short_cap_wins(self):
+        # max_ref 20 wins C0 and drops gcl 30 from C1 (one 20 s file cannot
+        # give 30 s of conditioning); chunk 8 then wins C2. C5 rebuilds its
+        # grid from the requested lengths, so gcl 30 comes back with the
+        # longer cap, within C5's nearest new renders.
         from test_clonage_regressions import OptimizerTests
         def score(record):
             cond=record['conditioning']
             combo=(cond['max_ref_len'],cond['gpt_cond_len'],cond['gpt_cond_chunk_len'])
             if combo==(45,30,8): return .99
-            if cond['max_ref_len']==20: return .7
-            return .5
+            return (.7 if cond['max_ref_len']==20 else .5)+(.05 if cond['gpt_cond_chunk_len']==8 else 0)
         result,log,conditions,_=OptimizerTests().run_optimizer([
             '--method','coord','--rounds','0','--gpt-cond-lens','20 30',
-            '--gpt-chunks','4 8','--max-ref-lens','20 30 45','--cond-budget','48',
+            '--gpt-chunks','4 8','--max-ref-lens','20 45','--cond-budget','48',
             '--budget','2','--no-holdout'],score=score)
+        self.assertIn('-> C0 max_ref_len: ADOPTED gcl=20 chunk=4 norm=0 refs=1 max_ref=20',log)
+        self.assertIn('-> C5 joint checks: ADOPTED gcl=30 chunk=8 norm=0 refs=1 max_ref=45',log)
         self.assertEqual((result['params']['max_ref_len'],result['params']['gpt_cond_len'],
                           result['params']['gpt_cond_chunk_len']),(45,30,8))
 
     def test_joint_search_revisits_reference_cap_with_new_gpt_chunk(self):
+        # C0 tried max_ref 45 under chunk 4, where it does nothing; C1 and C2
+        # then move to gcl 20 and chunk 8, under which 45 is the best cap.
+        from test_clonage_regressions import OptimizerTests
+        def score(record):
+            cond=record['conditioning']
+            if (cond['max_ref_len'],cond['gpt_cond_len'],cond['gpt_cond_chunk_len'])==(45,20,8): return .99
+            return .5+(.05 if cond['gpt_cond_len']==20 else 0)+(.1 if cond['gpt_cond_chunk_len']==8 else 0)
+        result,log,conditions,_=OptimizerTests().run_optimizer([
+            '--method','coord','--rounds','0','--gpt-cond-lens','20 30',
+            '--gpt-chunks','4 8','--max-ref-lens','30 45','--cond-budget','40',
+            '--budget','2','--no-holdout'],score=score)
+        self.assertIn('-> C2 gpt_cond_chunk_len: ADOPTED gcl=20 chunk=8',log)
+        self.assertIn('-> C5 joint checks: ADOPTED gcl=20 chunk=8 norm=0 refs=1 max_ref=45',log)
+        self.assertEqual((result['params']['max_ref_len'],result['params']['gpt_cond_len'],
+                          result['params']['gpt_cond_chunk_len']),(45,20,8))
+        self.assertLessEqual(result['generations']['conditioning'],40)
+
+    def test_joint_search_screens_only_the_nearest_combinations(self):
+        # A pure three-way interaction, which no single setting hints at, three
+        # changes away from the incumbent: C5 stops after its 8 new renders
+        # (the price of keeping its budget for the confirmation) and says how
+        # far it got.
         from test_clonage_regressions import OptimizerTests
         def score(record):
             cond=record['conditioning']
@@ -185,10 +282,10 @@ class IntegrationTests(unittest.TestCase):
             '--method','coord','--rounds','0','--gpt-cond-lens','20 30',
             '--gpt-chunks','4 8','--max-ref-lens','30 45','--cond-budget','40',
             '--budget','2','--no-holdout'],score=score)
+        self.assertIn('C5 screened the nearest 14 of 16 combinations (8 new render(s), cap 8)',log)
         self.assertEqual((result['params']['max_ref_len'],result['params']['gpt_cond_len'],
-                          result['params']['gpt_cond_chunk_len']),(45,20,8))
-        self.assertIn('C5',log)
-        self.assertLessEqual(result['generations']['conditioning'],40)
+                          result['params']['gpt_cond_chunk_len']),(30,30,4))
+        self.assertEqual(result['truncated_stages'],{})    # a cap by design, not a cut
 
     def test_full_comparator_pairs_reference_uses_render_rate_and_exports_raw(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,6 +388,314 @@ class IntegrationTests(unittest.TestCase):
                      contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit) as cm:
                     comparator.main()
                 self.assertEqual(cm.exception.code,2)
+
+
+class LowpassFitTests(unittest.TestCase):
+    """3.7.1: pass 1 weighs the low-pass off against the block's own filters
+    with their exact responses, and the render decides."""
+    START=dict(vol=0,eq_low=0,eq_mid=0,eq_high=0,hp=0,lp=9000)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.reference=shaped_noise(44100,4,1)
+        cls.same=shaped_noise(24000,4,2)
+
+    def fit(self,raw,start,reference=None,artifact=None,render=None):
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result,history=comparator.fit_rendered_tone(
+                self.reference if reference is None else reference,44100,24000,start,
+                render or (lambda config:exact_chain(raw,config,artifact=artifact)))
+        return result,history,output.getvalue()
+
+    def test_a_lowpass_that_only_dulls_the_clone_is_switched_off(self):
+        result,history,log=self.fit(self.same,self.START)
+        self.assertEqual(result['lp'],0)
+        # The EQ was fitted on the curve without the filter: no boost to undo it.
+        self.assertLessEqual(abs(result['eq_high']),.5)
+        first=history[0]
+        self.assertTrue(first['accepted'])
+        self.assertLess(first['after'],first['before']-.5)
+        self.assertAlmostEqual(first['predicted'],first['after'],delta=.05)
+        self.assertIn('low-pass 9000 Hz -> off',log)
+
+    def test_a_block_pasted_back_gives_its_boost_back(self):
+        start=dict(self.START,eq_high=4)
+        grid,ref_db=ltas.compute_ltas(self.reference,44100,fmax=8000)
+        _,clone_db=ltas.compute_ltas(exact_chain(self.same,start),44100,fmax=8000)
+        # The bell hides part of the filter's cut: above 6 kHz the clone lacks
+        # less than the 3 dB that makes derive_hp_lp switch the low-pass off ...
+        self.assertEqual(ltas.derive_hp_lp(grid,ref_db,clone_db,0,9000),(0,9000))
+        result,history,log=self.fit(self.same,start)
+        # ... the predicted error switches it off all the same.
+        self.assertEqual(result['lp'],0)
+        self.assertLessEqual(result['eq_high'],1)
+        self.assertLess(history[0]['after'],history[0]['before']-.3)
+
+    def test_when_the_render_disagrees_the_block_filters_are_tried(self):
+        sos=butter(4,[5000,8000],btype='band',fs=24000,output='sos')
+        hiss=sosfilt(sos,np.random.default_rng(7).standard_normal(len(self.same)))
+        result,history,log=self.fit(self.same,self.START,artifact=.03*hiss/np.std(hiss))
+        off,kept=history[0],history[1]
+        self.assertEqual((off['pass_number'],off['config']['lp'],off['accepted']),(1,0,False))
+        self.assertGreater(off['after'],off['predicted']+.5)     # what the model could not know
+        self.assertEqual((kept['pass_number'],kept['config']['lp'],kept['accepted']),(1,9000,True))
+        self.assertLess(kept['after'],kept['before'])
+        self.assertEqual(result['lp'],9000)
+        self.assertIn('filters unchanged; kept',log)
+
+    def test_a_filter_change_the_render_does_not_show_is_not_kept(self):
+        # Every render the same: switching the low-pass off measures nothing,
+        # so the block keeps its own, like any change that does not improve.
+        dull=exact_chain(self.same,dict(lp=9000))
+        zero=dict(eq_low=0,eq_mid=0,eq_high=0),np.zeros(ltas.N_GRID)
+        with patch.object(ltas,'fit_eq_psd',return_value=zero):
+            result,history,_=self.fit(None,self.START,render=lambda config:dull)
+        self.assertEqual([(h['config']['lp'],h['accepted']) for h in history],[(0,False),(9000,True)])
+        self.assertEqual(result['lp'],9000)
+
+    def test_a_bright_clone_keeps_its_lowpass(self):
+        result,history,_=self.fit(shaped_noise(24000,4,2,tilt_db=4),self.START)
+        self.assertEqual(result['lp'],9000)
+        self.assertTrue(all(h['config']['lp']==9000 for h in history))   # off is not even rendered
+
+    def test_a_filter_change_earns_a_second_pass(self):
+        # The clone is the reference behind a low-pass: switching it off is
+        # the whole fit, the EQ does not move, and pass 2 still checks it.
+        reference=exact_chain(self.same,{})
+        result,history,_=self.fit(self.same,self.START,reference=reference)
+        self.assertEqual(result['lp'],0)
+        self.assertEqual([h['pass_number'] for h in history],[1,2])
+        self.assertEqual([history[0]['config'][k] for k in ('eq_low','eq_mid','eq_high')],[0,0,0])
+
+
+@needs_audio
+class RealChainLowpassTests(unittest.TestCase):
+    """The same, through the generator's own render chain (pydub, FFmpeg)."""
+
+    def test_lowpass_off_and_flat_treble_through_the_real_chain(self):
+        chain=generator_namespace(CHAIN)['render_voice_chain']
+        reference,raw=shaped_noise(44100,4,1),shaped_noise(24000,4,2)
+        segment=AudioSegment((np.clip(raw,-1,1)*32767).astype(np.int16).tobytes(),
+                             frame_rate=24000,sample_width=2,channels=1)
+        def render(c):
+            config=dict(speed=1.,volume=float(c['vol']),eq_low=float(c['eq_low']),eq_mid=float(c['eq_mid']),
+                        eq_high=float(c['eq_high']),highpass=float(c['hp']),lowpass=float(c['lp']),
+                        noise_reduction=0,compression=0,deesser=0,reverb=0,noise_gate=0,pan=0,
+                        limiter=1,language='fr')
+            out=chain(segment,config,dict(trim_start=0,trim_end=0,fade_in=0,fade_out=0))
+            return resample_poly(np.array(out.get_array_of_samples(),dtype=float)/32768,147,80)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result,history=comparator.fit_rendered_tone(reference,44100,24000,
+                dict(vol=0,eq_low=0,eq_mid=0,eq_high=0,hp=90,lp=9000),render)
+        self.assertEqual(result['lp'],0)
+        self.assertLessEqual(abs(result['eq_high']),.5)
+        self.assertLess(history[0]['after'],history[0]['before']-.5)
+        self.assertAlmostEqual(history[0]['predicted'],history[0]['after'],delta=.1)
+
+
+class SmoothedSpectrumTests(unittest.TestCase):
+    """3.7.2: spectra compared over bands, and the EQ fitted on the PSD."""
+
+    def test_bands_span_a_harmonic_spacing_then_a_third_of_an_octave(self):
+        widths=ltas.smoothing_widths(np.array([100.,1000.,2000.,8000.]))
+        np.testing.assert_allclose(widths[:2],[250.,250.])
+        np.testing.assert_allclose(widths[2:],np.array([2000.,8000.])*(2**(1/6)-2**(-1/6)))
+
+    def test_flat_stays_flat_and_floor_zero_reads_point_by_point(self):
+        freqs=np.linspace(0,8000,2049);grid=np.geomspace(80,7999,64)
+        np.testing.assert_allclose(ltas.grid_db(freqs,np.ones_like(freqs),grid),0,atol=1e-9)
+        psd=1+np.cos(freqs/20)**2
+        np.testing.assert_allclose(ltas.grid_db(freqs,psd,grid,floor_hz=0),
+                                   np.interp(grid,freqs,10*np.log10(psd)))
+
+    def test_psd_fit_finds_a_bell_and_keeps_a_band_at_its_bound(self):
+        freqs=np.linspace(0,8000,2049);flat=np.ones_like(freqs);grid=np.geomspace(80,7999,256)
+        bells=lambda g:10**(ltas.eq_peaking_db(freqs,24000,g)/10)
+        target=ltas.grid_db(freqs,flat*bells([0,-1.5,3]),grid)
+        gains,curve=ltas.fit_eq_psd(grid,target,freqs,flat,fs=24000,limit=4)
+        self.assertEqual(gains,dict(eq_low=0.,eq_mid=-1.5,eq_high=3.))
+        self.assertLess(ltas.spectral_shape_error(grid,target,curve),.01)
+        # A band asked for -6 dB stays at its -4 dB bound, and the others are
+        # fitted knowing it: better than the step fitted freely and clipped
+        # afterwards (3.7.1), which gave -4/+2/0 here.
+        target=ltas.grid_db(freqs,flat*bells([-6,2,0]),grid)
+        rendered=flat*bells([-4,0,0])
+        gains,curve=ltas.fit_eq_psd(grid,target,freqs,rendered,fs=24000,limit=4,start=[-4,0,0])
+        self.assertEqual(gains['eq_low'],-4.)
+        clipped=ltas.grid_db(freqs,flat*bells([-4,2,0]),grid)
+        self.assertLess(ltas.spectral_shape_error(grid,target,curve),
+                        ltas.spectral_shape_error(grid,target,clipped)-.05)
+
+
+class HarmonicVoiceTests(unittest.TestCase):
+    """3.7.2: below ~1 kHz a voice's spectrum is a comb that follows the melody."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.reference=harmonic_voice(16000,6,204,0.,noise_db=-40,seed=1)
+        cls.clones={h1:harmonic_voice(24000,6,208,1.3,h1_db=h1,noise_db=-55,seed=2) for h1 in (0,4)}
+
+    def render(self,h1,config):
+        return exact_chain(self.clones[h1],config,ratio=(2,3))
+
+    def fit(self,h1):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return comparator.fit_rendered_tone(self.reference,16000,24000,
+                dict(vol=0,eq_low=0,eq_mid=0,eq_high=0,hp=0,lp=0),lambda c:self.render(h1,c))
+
+    def test_point_by_point_the_comb_hides_a_real_difference(self):
+        errors={}
+        for h1 in (0,4):
+            pair=[]
+            for floor in (0,ltas.SMOOTH_FLOOR_HZ):
+                grid,ref_db=ltas.compute_ltas(self.reference,16000,fmax=7999,floor_hz=floor)
+                _,clone_db=ltas.compute_ltas(self.render(h1,{}),16000,fmax=7999,floor_hz=floor)
+                pair.append(ltas.spectral_shape_error(grid,ref_db,clone_db))
+            errors[h1]=pair
+        # Point by point: over 3 dB, with or without 4 dB more fundamental.
+        self.assertGreater(errors[0][0],3)
+        self.assertAlmostEqual(errors[0][0],errors[4][0],delta=.3)
+        # Smoothed: the same voice is close, the stronger fundamental is not.
+        self.assertLess(errors[0][1],.5)
+        self.assertGreater(errors[4][1],errors[0][1]+.5)
+
+    def test_another_intonation_is_not_a_tone_to_correct(self):
+        result,_=self.fit(0)
+        self.assertTrue(all(abs(result[k])<=.5 for k in ('eq_low','eq_mid','eq_high')),result)
+
+    def test_a_too_strong_fundamental_is_cut_not_boosted(self):
+        result,history=self.fit(4)
+        self.assertLessEqual(result['eq_low'],-3)
+        reference=low_share(self.reference,16000)
+        before,after=(low_share(self.render(4,c),16000) for c in ({},result))
+        self.assertLess(abs(after-reference),abs(before-reference)/2)
+        # The bells act on the PSD before the smoothing, as on the audio.
+        self.assertAlmostEqual(history[0]['predicted'],history[0]['after'],delta=.02)
+
+
+@unittest.skipUnless(importlib.util.find_spec('librosa') is not None,'librosa not installed')
+class AnalyserFilterTests(unittest.TestCase):
+    def test_no_lowpass_whatever_the_voice_type(self):
+        # 3.7 wrote 7000 to 9000 Hz by voice type: a treble tilt on every clone.
+        import voice_analyser as analyser
+        sr=24000;t=np.arange(4*sr)/sr
+        seen={}
+        with tempfile.TemporaryDirectory() as tmp:
+            for f0 in (95,140,180,250):
+                phase=2*np.pi*np.cumsum(f0*(1+.03*np.sin(2*np.pi*5*t)))/sr
+                y=sum(.6/k*np.sin(k*phase) for k in range(1,25) if k*f0<sr/2)
+                syllables=np.convolve((np.sin(2*np.pi*3.5*t)>-.3).astype(float),np.ones(240)/240,mode='same')
+                path=Path(tmp)/f'v{f0}.wav'
+                wavfile.write(path,sr,(.2*y*syllables).astype(np.float32))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    params,stats=analyser.analyse_voice(str(path),fast=True,use_praat=False)
+                seen[stats['voice_type'].split(' /')[0]]=(params['highpass'],params['lowpass'])
+        self.assertEqual(seen,{'bass':(55,0),'baritone':(65,0),'tenor':(75,0),'soprano':(90,0)})
+
+
+class ComparatorWordingTests(unittest.TestCase):
+    """From a review of 3.7.1."""
+
+    def test_the_tab_runs_three_passes_and_names_its_threshold(self):
+        source=(Path(__file__).resolve().parent/'xtts_studio.py').read_text(encoding='utf-8')
+        self.assertIn("v_cmp_iter = tk.StringVar(value='3')",source)   # as the script and the pipeline
+        self.assertIn('Stop if EQ/volume change <',source)             # what --conv-threshold is
+        self.assertNotIn('Stop if score delta',source)
+
+    def test_one_unseen_sentence_is_not_sold_as_the_whole_meditation(self):
+        source=Path(comparator.__file__).read_text(encoding='utf-8')
+        self.assertNotIn('your generated meditation will resemble',source)
+        self.assertIn('one ECAPA score does not predict an entire meditation',source)
+
+
+class IdentityAxesTests(unittest.TestCase):
+    def names(self,opt,**kw):
+        axes,held=comparator.identity_axes(opt,4.,**kw)
+        return [axis[0] for axis in axes],held
+
+    def test_a_filter_that_is_off_stays_off(self):
+        # Clipped into 6000-16000, lp 0 started the search at a 6 kHz low-pass.
+        names,held=self.names(dict(hp=90,lp=0))
+        self.assertNotIn('lp',names); self.assertIn('hp',names); self.assertEqual(held,['lp'])
+        self.assertEqual(self.names(dict(hp=0,lp=0))[1],['hp','lp'])
+        names,held=self.names(dict(hp=90,lp=9000))
+        self.assertEqual((len(names),held),(9,[]))
+        axes,_=comparator.identity_axes(dict(hp=90,lp=9000),3.)
+        self.assertIn(('eq_high',-3.,3.),axes); self.assertIn(('lp',6000,16000),axes)
+
+    def test_a_target_level_is_not_a_free_axis(self):
+        names,held=self.names(dict(hp=90,lp=9000),freeze_vol=True)
+        self.assertNotIn('vol',names); self.assertEqual(held,['vol'])
+
+
+class ComparatorStageTests(unittest.TestCase):
+    """The identity stages of main(), with the encoder and the render stubbed:
+    `identity` scores the block rendered last."""
+
+    def run_main(self,block,extra,identity=lambda block:.8):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);reference=root/'reference.wav'
+            tone=np.sin(2*np.pi*200*np.arange(48000)/24000).astype(np.float32)*.02
+            wavfile.write(reference,44100,resample_poly(tone,147,80).astype(np.float32))
+            given=root/'given_raw.wav'
+            wavfile.write(given,24000,tone)
+            def info(path):
+                rate,data=wavfile.read(path)
+                return types.SimpleNamespace(samplerate=rate,duration=len(data)/rate)
+            def read(path,**kwargs):
+                rate,data=wavfile.read(path)
+                return data,rate
+            clone=types.SimpleNamespace(load_xtts=lambda device:(None,None),
+                compute_latents=lambda *a,**kw:(None,None),
+                generate=lambda model,text,lang,lat,path,**kw:wavfile.write(path,24000,tone))
+            last,quiet=[None],[]
+            def post(src,dst,blk,*a):
+                last[0]=dict(blk);shutil.copyfile(src,dst)
+            def quiet_post(src,dst,blk,*a):
+                quiet.append(dict(blk));post(src,dst,blk)
+            class Encoder:
+                def __init__(self,**kw): pass
+                def embed(self,source,sr=None): return np.array([1.,0.])
+                def cosine(self,a,b): return identity(last[0])
+            modules={'xtts_clone':clone,'torch':types.SimpleNamespace(),
+                'soundfile':types.SimpleNamespace(info=info,read=read),
+                'speaker_identity':types.SimpleNamespace(SpeakerEncoder=Encoder)}
+            argv=['voice_comparator.py',str(reference),'FR','--xtts-block',settings.format_block({'seed':0}),
+                '--audio-block',block,'--raw-clone',str(given),'--text','Bonjour Elo.',
+                '--reference-interval','0.5','1.5','--device','cpu','--no-fit-dynamics','--no-identity-check',
+                '--output',str(root/'base.wav'),'--output-optimised',str(root/'fit.wav'),
+                '--output-raw',str(root/'raw.wav'),*extra]
+            out=io.StringIO()
+            with patch.dict(sys.modules,modules),patch.object(sys,'argv',argv), \
+                 patch.object(comparator,'apply_post',side_effect=post), \
+                 patch.object(comparator,'_quiet_post',side_effect=quiet_post), \
+                 contextlib.redirect_stdout(out):
+                comparator.main()
+            return out.getvalue(),quiet
+
+    def test_the_optimiser_leaves_an_off_lowpass_and_a_target_level_alone(self):
+        # A metric that rewards level and a low-pass: free axes would take both.
+        out,quiet=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]',
+            ['--optimise-audio','nelder','--optimise-budget','16','--target-dbfs','-20'],
+            identity=lambda block:.8+.002*float(block.get('vol',0))+1e-5*float(block.get('lp',0)))
+        self.assertIn('held fixed: lp (off), vol (--target-dbfs)',out)
+        self.assertGreater(len(quiet),5)
+        self.assertEqual({(block['lp'],block['vol']) for block in quiet},{(0,quiet[0]['vol'])})
+
+    def test_the_screening_tries_the_lowpass_off(self):
+        out,quiet=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 9000, 0, 0, 0, 0, 0, 0, 1]',['--screen-audio'],
+            identity=lambda block:.8+(.05 if not block.get('lp') else 0))
+        self.assertIn(0,[block['lp'] for block in quiet])
+        self.assertRegex(out,r'lp\s+0\.0500\s+off\s+0\.8500')
+
+    def test_the_identity_search_tries_the_lowpass_off_when_one_is_on(self):
+        # Also the run that stopped on a NameError with --no-fit-dynamics.
+        out,_=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 9000, 0, 0, 0, 0, 0, 0, 1]',['--fit-identity'])
+        self.assertIn('low-pass off',out)
+        self.assertNotIn('Identity search unavailable',out)
+        out,_=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]',['--fit-identity'])
+        self.assertNotIn('low-pass off',out)
 
 
 if __name__=='__main__': unittest.main()

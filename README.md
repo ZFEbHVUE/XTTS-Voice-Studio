@@ -31,6 +31,114 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## What's new
 
+**3.7.2 — the Comparator compares smoothed spectra; a review of 3.7.1 merged**
+
+- Below about 1 kHz a voice's long-term spectrum is a comb: the harmonics of
+  F0 with hollows between them, and where the teeth fall depends on the melody
+  of the sentence, which a clone never repeats. The **Comparator** compared the
+  spectra point by point, so the teeth made most of its error, no EQ could
+  reduce it, and the fit was pulled the wrong way: on a real 16 kHz reference
+  it raised `eq_low` by 1.9 dB on a clone that already had 15 points too much
+  energy below 300 Hz. It now compares the mean power over bands of 250 Hz
+  (one harmonic spacing) or a third of an octave above 1.1 kHz, and fits the
+  EQ on the render's own spectrum with the bells' exact responses, so its
+  prediction holds to 0.02 dB through the real chain. On synthetic voices
+  through that chain, a clone of the same voice with another intonation keeps
+  its energy below 300 Hz at the reference's 27 %, where 3.7.1 took it to 42 %;
+  one with a 4 dB too strong fundamental goes from 45 % to 32 %, where 3.7.1
+  took it to 53 %.
+- From a review of 3.7.1 (ChatGPT): the [Cmp] tab runs 3 passes and names its
+  threshold right (an EQ/volume change, not a score delta); a C6 confirmation
+  cut by the budget keeps the base; French numbers count the same in digits
+  and in words in the WER (« 48 » = « quarante-huit », a different number still
+  counts); the result JSON records how it was scored. Two of its changes are
+  redone: a language mismatch now stops a run only when the command and the
+  `[]` both name a language (and a `[]` without one no longer imposes FR),
+  and a take whose timbre cannot be measured counts with the worst timbre
+  instead of stopping the whole search. 259 tests.
+
+**3.7.1 — the low-pass is a treble tilt; the Comparator can switch it off**
+
+- At the 24 kHz of an XTTS render, the generator's low-pass (pydub, first
+  order) is not a cut above `lp` but a tilt of the whole upper band: lp 9000
+  takes 2.1 dB at 4 kHz and 4.5 dB at 8 kHz, and lp 16000 still 2.8 dB at
+  8 kHz. The **Analyser** wrote 7000 to 9000 Hz by voice type; it now leaves
+  `lp` at 0 (off).
+- The **Comparator**'s first pass weighs the low-pass off against the block's
+  own filters with their exact responses: the EQ is fitted on the curve the
+  filters will give, the error it leaves is predicted, and the render decides,
+  as for any change. It used to open the low-pass by 1000 Hz and let `eq_high`
+  give back the rest, up to its bound. On synthetic voices through the
+  generator's own chain, a clone that only the filter made dull ends at 0.68 dB
+  of shape error instead of 0.96, with `eq_high` at −0.2 instead of +1.9; a
+  block pasted back with `eq_high` +4 lets the boost go (0.68 instead of 1.00);
+  a clone with too much treble keeps its low-pass.
+- `--optimise-audio` holds a filter that is off, and `vol` under
+  `--target-dbfs`; `--screen-audio` and `--fit-identity` try the low-pass off;
+  `--fit-identity` with `--no-fit-dynamics` no longer stops on a NameError.
+  Presets keep their values, and the Comparator proposes the change on its next
+  run. 230 tests.
+
+**3.7 — the conditioning search decides on fresh seeds**
+
+- **C6 confirmation.** The conditioning stages C0 to C5 still screen one render
+  per candidate, but what they adopt now only steers the next stages. Their
+  winner and the best other screened candidates, 3 in all, are rendered again
+  on the noise probe's 4 seeds and compared with the base on those seeds, mean
+  against mean, with a one-sided Student t bar corrected for the number of
+  candidates. The base's renders there are the probe's own and cost nothing. A
+  candidate replaces the analyser's values only beyond that bar; a screening
+  winner that fresh seeds do not confirm is named in the log and the recap.
+- In a simulation of a real run's configuration (52 s reference, four GPT
+  lengths, four reference caps, a spread of 0.03 per render), a real gain of
+  +0.06 on chunk 8 is found in 82 % of the runs instead of 52 %, and on the
+  single pair gcl 20 s / chunk 8, where that run's best draws were, in 51 %
+  instead of 20 %, with 41 renders instead of 89. With no real effect, 3.6.1
+  ended on another GPT setting in 33 % of these runs, 3.7 in 2.5 %. A gain of
+  +0.02 is found in 4 to 11 % of the runs: for that spread, gains that small
+  stay out of reach, and the base is then the honest result.
+- **C5 is capped** at its 8 nearest new combinations (87 single draws on a real
+  run, none adopted), changes of the GPT settings before changes of the
+  reference cap, and it never takes the renders C6 needs: a budget below the
+  plan cuts C5 first. Plans: 34 for the pipeline's default fields (21 before),
+  46 for a 45 s reference with three GPT lengths and three caps (53), 48 for a
+  52 s one with four of each (93). `--cond-budget` defaults to 34 in the
+  optimiser, the pipeline and both tabs.
+- The result JSON gains `conditioning_confirmation`; `--adopt-alpha 1` still
+  reproduces the old "any gain wins", without C6. 213 tests.
+
+**3.6.1 — a seed chosen in the Validator reproduces in the script**
+
+- The **Validator** renders the text exactly as the generator does (final
+  punctuation and pitch marks removed). It rendered the raw text, so the same
+  sentence and seed gave another take in the script.
+- A short **`{}` block** takes the missing fields from its own voice: `{1, 17}`
+  before a sentence changes only its seed. With several voices, `{2, 17}` used to
+  take the settings of the voice in use. Inside **`[parallel]`**, the `{}` written
+  before each `[]` were discarded; they now apply. 189 tests.
+
+**3.6 — timbre on voiced frames, a hold-out that names its failures, EQ headroom**
+
+- The **timbre** term of `both` and `timbre` is measured on the voiced frames
+  only, each weighted by its voicing probability, with Praat's HNR. Averaged
+  over the whole file, it followed the pauses and consonants of each render and
+  carried 86 % of the score's draw-to-draw noise in a real run. On a simulation
+  where seeds only move pauses and breaths around real speech, the adoption bar
+  falls from 0.034 to 0.016, and a 4 dB brightness change goes from 0.3 to 1.2
+  times the bar.
+- The **hold-out** reports each unseen sentence (scores, what Whisper heard,
+  in which language), flags one that failed, and keeps the renders next to the
+  clone (`*_pipeline_clone_holdout1.wav`). In a real run the mean accent of
+  the two unseen sentences fell from 0.946 to 0.495 (most likely one of them
+  failed), and the old report said "no large score drop".
+- A boosting **EQ** no longer clamps peaks that the volume step would have
+  brought back under full scale (on a real fit, the loudest peaks were clamped
+  at −0.1 dBFS, then lowered to −2.1 dBFS).
+- [Auto] tab: **auto all** runs every auto in dependency order; search and
+  unseen **sentence files**; a seed like `160180` is flagged as a missing
+  space; Stop says Stopped. Identical renders are recognised (`= same audio
+  as`), and the analyser's meditation-pace line tells the truth. 182 tests.
+
 **3.5 — priority, tone-fit A/B and production level in the [Auto] tab**
 
 - A **Priority** menu sets w_acc, w_id and Objective together: Resemblance
@@ -309,9 +417,10 @@ Options (the safeguards below them are always on):
 | Target dBFS | `--target-dbfs -20` | Absolute render level, −20 by default in the tab; empty matches each reference |
 | Probe beam/greedy | `--probe-beams` | Test beam-search and greedy decoding on the winner |
 | Re-curate | `--recurate` | Curate again although `<ref>_curated.wav` exists; otherwise it is reused and Keep s does not apply |
-| Conditioning budget | `--cond-budget 24` | Generations for the conditioning search |
+| Conditioning budget | `--cond-budget 34` | Generations for the conditioning search |
 | Chunk lengths, Max reference s, Reference lengths to test | `--gpt-chunks "4 6 8 10"`, `--max-ref-len 30`, `--max-ref-lens "20 30 45"` | Conditioning candidates |
-| Search sentences (CLI only) | `--probe-texts 2` | More sentences, lower noise bar |
+| Search sentences file, Unseen sentences file | `--probe-text-file`, `--holdout-text-file` | One sentence per line, the first two used: search and hold-out on lines of your own script instead of the built-in sentences |
+| Number of search sentences (CLI only) | `--probe-texts 2` | More sentences, lower noise bar (the auto budgets count two) |
 | Adoption risk (CLI only) | `--adopt-alpha 0.05` | Chance per stage of adopting pure noise; `1` = old "any gain wins" |
 
 **auto buttons.** Each one computes its field from the voices on screen and the
@@ -326,14 +435,18 @@ in the console what it set and why:
 | Reference lengths to test | The 20 / 30 / 45 / 60 ladder below the shortest of those files, plus the length that reads all of it: a longer value would read the same audio again |
 | gcl s | The ladder from 20 s (from 10 s for a shorter file) up to what XTTS reads of the shortest file, the last value: none is ignored or reads the same audio twice |
 | Chunk lengths | The 4 / 6 / 8 / 10 ladder up to the shortest usable gcl s, so every chunk pairs with every GPT length |
-| Conditioning budget | Every candidate the conditioning stages can render whichever ones win, plus the noise probe: no stage is cut and C5 tries all its combinations |
+| Conditioning budget | Every candidate the conditioning stages can render whichever ones win, plus the noise probe and the confirmation: no stage is cut, C5 screens its 8 nearest new combinations and C6 confirms 3 candidates |
 
 A budget larger than its plan is never used, so an auto budget is what the full
 search can spend, not a margin; with reference lengths to test, that is more
-than the default 24, and the run takes longer. Press the buttons of the length
-grid from the bottom up: Reference lengths to test and Max reference s, then
-gcl s, Chunk lengths, and Conditioning budget last, since each one depends on
-the fields below it. A Max reference s above 30 also moves the search's
+than the default 34, and the run takes longer. **auto all** runs them all in the
+order they depend on each other — Keep s, Max reference s, Reference lengths to
+test, gcl s, Chunk lengths, Conditioning budget, Budget — and leaves an empty
+Reference lengths empty, since it is optional. Pressed one by one in another
+order, the conditioning budget is computed before the fields it counts (34
+instead of 46 on a real run; the tab warns before the run). Before a run, the
+tab also flags a seed that looks like two typed without a space (`160180` among
+`0 42 … 200`): it would run as one seed. A Max reference s above 30 also moves the search's
 starting point: the analysis sets `gpt_cond_len` to the file's length, and the
 console says so. An empty field counts as the pipeline default, as it does in
 the run.
@@ -350,6 +463,19 @@ python listening_test.py lea_pipeline_clone.wav lea_pipeline_clone_blend.wav --r
 
 No rule says which weighting suits a voice: in this fit, `a` already gives every
 frequency below about 180 Hz the same floor weight, a low voice or not.
+
+**Unseen sentences.** The hold-out renders are kept next to the clone
+(`*_pipeline_clone_holdout1.wav`, `…holdout2.wav`: raw XTTS, as scored), and
+the recap names an unseen sentence that failed:
+
+```
+  # Unseen sentences of the hold-out (raw XTTS, as scored): lea_pipeline_clone_holdout1.wav  lea_pipeline_clone_holdout2.wav
+  # [!] Unseen sentence 2: heard as EN, not FR (accent 0.07) -- listen to it before generating
+```
+
+Listen to it, then render that sentence in the [Val] tab with the winner's `{}`
+and two other seeds: if only the winning seed fails, it is a draw on that text,
+not the voice; if all fail, search on sentences of your own script.
 
 Always applied, no option needed: hold-out validation on unseen sentences,
 worst-case seed ranking, measured draw-to-draw noise with settings adopted only
@@ -644,8 +770,8 @@ combination is rejected before any model loads, never silently adjusted.
 | 5 | `eq_low` | 0 | Low EQ, bell at 120 Hz, width 160 Hz (dB) |
 | 6 | `eq_mid` | 0 | Mid EQ, bell at 1.5 kHz, width 2 kHz (dB) |
 | 7 | `eq_high` | 0 | High EQ, bell at 5 kHz, width 3 kHz (dB) |
-| 8 | `hp` | 0 | Highpass filter (Hz, 0=off) |
-| 9 | `lp` | 0 | Lowpass filter (Hz, 0=off) |
+| 8 | `hp` | 0 | High-pass, first order: −3 dB at `hp`, 6 dB/octave below (Hz, 0=off) |
+| 9 | `lp` | 0 | Low-pass, first order (Hz, 0=off). On a 24 kHz render a treble tilt, not a cut: lp 9000 takes 2.1 dB at 4 kHz and 4.5 dB at 8 kHz |
 | 10 | `NR` | 0 | Noise reduction (0=off) |
 | 11 | `comp` | 0 | Compression (0=off) |
 | 12 | `de-ess` | 0 | De-esser (0=off) |
@@ -665,7 +791,18 @@ then:    speed (rubberband) -> volume -> limiter
 ```
 
 The limiter is last, and it shares one floating-point FFmpeg pass with the
-volume, so a positive `vol` is limited, never clipped. It used to run before the
+volume, so a positive `vol` is limited, never clipped.
+
+**EQ headroom (3.6).** The EQ stage writes 16-bit audio, so a boost that
+reached full scale was limited there, before the volume step: with eq_mid +3.3,
+eq_high +4 and vol −2, the loudest peaks were clamped at −0.1 dBFS and came out
+at −2.1 dBFS, up to 2 dB of peaks taken for nothing. The EQ now lowers the audio
+by the sum of its boosts first, in the same filter graph, and the volume step
+gives it back before the final limiter. Only when nothing after the EQ depends
+on the absolute level and the limiter is on: noise reduction, compression and
+the gate work on thresholds in dBFS, so with one of them on the chain stays as
+it was (the de-esser, reverb, fades and pan are linear). The console says so:
+`[*]  EQ headroom: -7.3 dB before the boost, given back at the volume step`. It used to run before the
 speed change and the volume: pydub applies a gain to the integer samples and
 saturates them, so +6 dB on a sentence peaking at −1 dBFS clipped about 9 % of
 its samples. An EQ boost that reaches full scale is limited too, instead of
@@ -742,7 +879,9 @@ like a plain pause since there is nothing to subtract.
 
 ### Per-voice config persistence
 
-Short blocks inherit the last full config for that voice:
+Short blocks inherit the last full config for that voice — the voice the block
+names, `{}` blocks included since 3.6.1 (`{2, 17}` used to take the settings of
+the voice in use):
 
 ```
 {1, 42, 0, 420, 100, 250, 0.68, 50, 0.85, 5, 1.05, 60, 4, 0}
@@ -754,6 +893,20 @@ Première phrase.
 Deuxième phrase plus lente.
 [pause=2s]
 ```
+
+This is the way to give one sentence another seed — a liaison or a word that
+came out wrong in that take — without touching the rest of the script:
+
+```
+{1, 17}
+La phrase à refaire.
+{1, 42}
+La suite, avec la graine d'avant.
+```
+
+Pick the seed in the [Val] tab with the same sentence, written as it is in the
+script: the Validator renders it the way the generator does, so the take you
+choose there is the one the script will render.
 
 ### Voice presets (`Voice_Presets/`)
 
@@ -851,6 +1004,11 @@ from the second on. In the **[Gen]** tab the `Parallel` button writes the block
 around the current selection, and its `offset` field accepts `1 2 5`, `1,2,5`,
 `1; 2; 5` or `1s 5s 4s` — it always emits the commas the parser needs.
 
+**The `{}` blocks written inside apply to their voice's text** (before 3.6.1
+the `[N, ...]` that follows each one reloaded the settings from outside the
+block and discarded it). They stay local to the block, and a short one takes
+its missing fields from the last `{}` of its voice in the block.
+
 **Punctual sounds work inside the block.** A `[music=N]` cue is scheduled at the
 position it occupies in its own voice's track, plus that voice's offset, plus
 where the block itself sits in the script. Pauses, per-voice levels and every
@@ -890,7 +1048,7 @@ voice_analyser.py --precise ref1.wav ref2.wav ref3.wav FR
 # Voice 1 [FR]  soprano / high voice  214 Hz
 # Analysis: Praat + pyin | seed=0
 {1, 0, 0, 230, 150, 300, 0.62, 50, 0.85, 5, 1, 45, 4, 0}
-[1, FR, 1, 0, 0, 0, 0, 90, 9000, 0, 0, 0, 0, 0, 0, 1]
+[1, FR, 1, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]
 ```
 
 `eq_low/eq_mid/eq_high` and `vol` are emitted as `0` **by design** — they are
@@ -903,7 +1061,8 @@ are unvalidated heuristics, and a synthetic clone has no noise to remove.
 `speed` stays 1.0 unless `--meditation-pace` asks for a target syllable rate.
 `top_k`, `top_p` and `rep_pen` are fixed defaults (measured as near-inert); only
 `temp` is derived, from the F0 range. The Analyser owns the generation priors
-(the `{}` block + safe `hp`/`lp`); the Comparator owns the tonal match.
+(the `{}` block + a safe `hp`; `lp` is left off, see the `[]` table); the
+Comparator owns the tonal match.
 
 ---
 
@@ -957,7 +1116,11 @@ The Validator generates via `xtts_clone.py`, so swept cloning knobs
 take effect — and the winning `{}` is produced under the same conditioning the
 Comparator will use. `max_ref_len` (default 30 s) is a `{}` field like the
 others, and can be swept. Variants are post-processed by the Generator's own
-`render_voice_chain()`, so what you hear is what the final render will do.
+`render_voice_chain()`, so what you hear is what the final render will do. The
+text goes through the Generator's own `clean_text()` as well (final punctuation
+and pitch marks removed), so the same sentence with the same `{}` and seed gives
+the same take in the Validator and in the script, on the same machine. Before
+3.6.1 the raw text was rendered, and a seed chosen here did not reproduce there.
 
 ---
 
@@ -972,13 +1135,13 @@ sounds like — that was decided upstream — so the Comparator does one thing w
 
 1. Generates the clone **once** (via `xtts_clone.py`, honouring the cloning knobs) — with `--auto-text`, on the reference's own transcribed words.
 2. Renders it through the Generator's own chain (`render_voice_chain`: effects → speed → volume → limiter) with the current `[]`.
-3. Measures the rendered clone's LTAS (dB, log-frequency) against the **stretch of the reference that says the same words** (word timestamps), not against the whole reference.
-4. Fits the generator's **exact** 3-band peaking EQ (FFmpeg `equalizer` RBJ responses: low f0=120/BW=160, mid 1500/2000, high 5000/3000, modelled at the clone's own sample rate) + volume by bounded least squares (`scipy.optimize.least_squares`, perceptually weighted), `hp`/`lp` from the LTAS roll-off on the first pass. The cumulative gains stay within `--eq-limit` (default ±4 dB).
-5. Renders the proposal and **keeps it only if the measured spectrum improves** — a solver's predicted gain is not enough. Repeats (`--iterations`, default 3) until a pass no longer improves or the largest change falls below `--conv-threshold` dB (default 0.5).
+3. Measures the rendered clone's LTAS (dB, log-frequency) against the **stretch of the reference that says the same words** (word timestamps), not against the whole reference. Each point is the mean power of a band around it, 250 Hz wide or a third of an octave above 1.1 kHz: below that, a voice's spectrum is a comb of harmonics whose position follows the melody of the sentence, which no EQ should try to follow.
+4. Fits the generator's **exact** 3-band peaking EQ (FFmpeg `equalizer` RBJ responses: low f0=120/BW=160, mid 1500/2000, high 5000/3000, modelled at the clone's own sample rate) + volume by bounded least squares (`scipy.optimize.least_squares`, perceptually weighted), on the render's own power spectrum: the bells act on it bin by bin before the band smoothing, as they act on the audio, so the predicted error holds for every linear stage of the chain. The gains are fitted as they are exported, within `--eq-limit` (default ±4 dB): a band at its bound stays there and the others are fitted knowing it. On the first pass `hp`/`lp` are settled too: what the LTAS at the spectral extremes proposes, the low-pass off whenever one is on, and the block's own filters, each with the EQ fitted on the curve those filters will give (the exact responses of pydub's filters) and its error predicted. The low-pass off is rendered first when its prediction is the better one, the block's own filters last.
+5. Renders the proposal and **keeps it only if the measured spectrum improves** — a solver's predicted gain is not enough (on the first pass, the next filter setting is rendered if not). Repeats (`--iterations`, default 3) until a pass no longer improves or the largest change falls below `--conv-threshold` dB (default 0.5).
 
 Level (`vol`) comes from the RMS gap (or `--target-dbfs`); EQ shape from the LS
-fit. Each pass prints the rendered shape error before and after, and whether it
-was kept.
+fit. Each pass prints the rendered shape error before and after, the error the
+fit predicted, any filter change, and whether it was kept.
 
 ### Tips
 
@@ -988,7 +1151,7 @@ was kept.
 - `--raw-clone WAV` fits on an existing untouched render (the `--output-raw` of an earlier run) instead of generating one, and `--reference-interval BEGIN END` gives the stretch of the reference to compare with: a second fit then works on the very same clone and words, without loading XTTS. The pipeline's `a+blend` uses both.
 - `--target-dbfs -20` switches the volume fit to an absolute production level instead of matching the reference. Use it whenever the reference is quiet: matching a -33 dBFS reference produces an unusable meditation level (the fitted `vol` was the honest match, not a good render level).
 - comp and de-ess are now fitted by measurement too (crest factor and 5–8 kHz sibilance vs the reference), each kept only if the measured gap actually shrinks — `--no-fit-dynamics` disables it. NR, reverb, noise_gate and pan stay at 0 by design: no measurable target, and the gate chops speech.
-- `eq_*` and `vol` in the input `[]` are overwritten by the fit; `hp`/`lp` start from the block and are adjusted at most once (first pass); `NR` is kept from the block, `comp`/`de-ess` too unless the dynamics fit changes them.
+- `eq_*` and `vol` in the input `[]` are overwritten by the fit; `hp`/`lp` start from the block and are adjusted at most once (first pass), a low-pass switched off when the fit is better without it; `NR` is kept from the block, `comp`/`de-ess` too unless the dynamics fit changes them.
 - The `{}` is never modified — fix seed/temp in the Validator first.
 
 ---
@@ -1083,18 +1246,19 @@ has two phases — the conditioning search, then the sampling search (`--method
 rsm` by default, `coord` for coordinate descent) — maximising
 `w_accent·french + w_identity·identity`, deterministic per seed. With the
 defaults the sampling plan takes up to 60 generations (`--budget`) and the
-conditioning plan up to 21 (`--cond-budget`, default 24). Both plans are printed
+conditioning plan up to 34 (`--cond-budget`, default 34). Both plans are printed
 up front, with the budget that runs each one in full.
 
 ```bash
 python xtts_optimize.py curated.wav FR --xtts-block "{1, 0, ...}" \
-    --seeds "0 42 100 180 200" --budget 60 --cond-budget 24 \
+    --seeds "0 42 100 180 200" --budget 60 --cond-budget 34 \
     --gpt-cond-lens "20 30" --result-json winner.json
 ```
 
 It prints a ranked table and the winning `{}` block to paste into the Comparator;
 `--result-json` also writes the winner, the selected references in order, the
-texts, the scores, any stage cut short and the measured noise. Use it instead of
+texts, the scores, any stage cut short, the measured noise and the
+conditioning confirmation. Use it instead of
 hand-sweeping in the Validator when you want the optimum rather than an A/B
 listen.
 
@@ -1121,7 +1285,31 @@ d = |ΔF0| / 2 semitones  +  |Δcentroid| / 300 Hz  +  |ΔHNR| / 3 dB
 
 Each term divided by a gap that is audible on its own, so one unit of any of
 them is about as wrong as one unit of another. On the case above it reverses the
-ranking. On one voice it also gave the better result on unseen text — **0.701**
+ranking.
+
+A take with no usable voiced audio (a failed render) has no measurable timbre:
+it counts with the worst, 0, in the same formula as the others, and the log
+says so. When most takes fail, from the third on, it is the reference or the
+tools (librosa, parselmouth), not a take, and the search stops with that
+message; `--objective identity` then runs without the timbre.
+
+Since 3.6 the three are measured on the **voiced frames** only, each weighted
+by pyin's voicing probability: pitch as the level-weighted mean in semitones
+(tracking errors more than 7 st from the centre left out), brightness as the
+centroid of the voiced magnitude spectrum, HNR with Praat as in the Analyser
+and the Comparator (the harmonic/percussive ratio of the voiced frames without
+parselmouth, on another scale: clones are measured like the reference, and two
+files measured differently are not compared). Averaged over the whole file,
+as before, a frame of silence weighed as much as a vowel: the measure followed
+each render's pauses and consonants (an "HNR" of −1.3 dB for a reference Praat
+puts at 15.7 dB), and in a real run it carried 86 % of the score's
+draw-to-draw noise. On four real voices, with only the pauses and breaths
+around the same 4 s changed, the distance moved by 0.52–0.76 (sd) the old way
+and 0.06–0.10 now, while a 4 dB EQ change on the highs still moves the centroid
+by about 70 Hz. One offset remains: the reference says other words than the
+search sentences, so each sentence sits at its own distance from it. It is the
+same for every candidate of a search; matching the brightness itself is the
+Comparator's job, on the stretch of the reference that says the same words. On one voice it also gave the better result on unseen text — **0.701**
 against 0.636 — so the two measures are not simply trading places.
 
 The optimiser's default stays `identity`. In the **[Auto] Pipeline** tab the
@@ -1172,22 +1360,35 @@ denoised source caps out low.
 ### Statistical honesty
 
 Every score is a mean over N sentences, one random draw per sentence, and
-carries its standard deviation. Three rules follow:
+carries its standard deviation. Four rules follow:
 
 - **A setting changes only beyond the measured noise.** The optimiser measures
   the draw-to-draw spread of its own scores — the same settings rendered with
-  several seeds: the conditioning base with 3 extra seeds, and the sampling seed
-  screen. A challenger replaces the incumbent only if its gain exceeds
-  `z(1 − α/m) · √2 · sd`, `m` being the number of challengers in the stage
-  (Bonferroni). With `--adopt-alpha 0.05` (default) a stage would adopt pure
-  noise about 5 % of the time if the noise were known exactly. It is estimated
-  from few renders (4 at the conditioning base), so the real rate is higher,
-  and it adds up over the stages: in a simulation where no conditioning setting
-  has any effect, 50 runs out of 200 still changed at least one of them. Two
-  runs can therefore end on different conditioning by chance; compare them by
-  ear. `1` restores the old "any gain wins", which moved a setting with no real
-  effect in up to 17 runs out of 20. Seeds are interchangeable draws, so the
-  best one is simply kept; settings must earn their change.
+  several seeds: the conditioning base with 4 extra seeds, and the sampling seed
+  screen. In a stage, a challenger replaces the incumbent only if its gain
+  exceeds `z(1 − α/m) · √2 · sd`, `m` being the number of challengers in the
+  stage (Bonferroni). With `--adopt-alpha 0.05` (default) a stage would adopt
+  pure noise about 5 % of the time if the noise were known exactly. It is
+  estimated from few renders (5 at the conditioning base), so the real rate is
+  higher, and it adds up over the stages: in a simulation where no conditioning
+  setting has any effect, 45 runs out of 200 still changed at least one of them
+  in 3.6.1.
+- **The conditioning is decided on fresh seeds (C6).** Since 3.7, the
+  conditioning stages only steer the search. Their winner and the best other
+  screened candidates, 3 in all, are rendered again on the probe's 4 seeds and
+  compared with the base on the same seeds: a candidate replaces the base only
+  if its mean beats the base's by more than `t(1 − α/F, df) · sd · √(2/4)`,
+  `F` being the number of candidates, `sd` pooled over every render of the
+  comparison, `t` Student's quantile for its `df` degrees of freedom. The best
+  of twenty single draws is mostly the luckiest one (the winner's curse); the
+  renders C6 compares are fresh, independent of the screening that picked the
+  candidates. In the same simulation, 9 runs out of 200 change a setting. For
+  a spread of 0.03 the bar is about 0.05 with 3 candidates, against 0.07 for a
+  lone challenger on one draw and 0.14 for a grid of 87. The sampling stages
+  keep the single-draw rule. `1` restores the old "any gain wins", without C6,
+  which moved a setting with no real effect in up to 17 runs out of 20. Seeds
+  are interchangeable draws, so the best one is simply kept; settings must earn
+  their change.
 - **Ties are marked `=`** in the Validator ranking: when two variants differ by
   less than the measured noise floor, the ranking between them is noise. Pick
   by ear.
@@ -1202,6 +1403,21 @@ Every decision is printed with its bar:
   -> S2 temperature (seed 100): kept seed=100 temp=0.620 ... -- best gain +0.009 is within the noise (bar 0.094 for 6 candidate(s))
   -> S3 top_p: ADOPTED seed=42 temp=0.620 rep=5 top_p=0.9 ... (+0.120, bar 0.069 for 2 candidate(s))
 ```
+
+and C6, here on a simulated run where no setting has any effect:
+
+```
+  C6 — confirmation: 3 candidate(s) against the base, each on seeds 42 100 180 200 (the probe's)
+     base             gcl=30 chunk=4 norm=1 refs=1 max_ref=30: mean 0.821
+     screening winner gcl=20 chunk=4 norm=1 refs=1 max_ref=30: mean 0.826 (+0.005; screened 0.832 on seed 0)
+     candidate        gcl=30 chunk=10 norm=0 refs=1 max_ref=30: mean 0.824 (+0.003; screened 0.850 on seed 0)
+     candidate        gcl=20 chunk=10 norm=1 refs=1 max_ref=30: mean 0.830 (+0.009; screened 0.842 on seed 0)
+  -> C6 confirmation: kept the base -- best confirmed gain +0.009 is within the noise (bar 0.023 for 3 candidate(s) x 4 seeds, sd 0.014 pooled over 12 degrees of freedom)
+     the screening's gcl=20 chunk=4 norm=1 refs=1 max_ref=30 won on one draw and is not confirmed
+```
+
+The `screened` column is the winner's curse at work: 0.850 on its one draw,
+0.824 on four fresh ones.
 
 With 2 search sentences and a draw noise around 0.03, a setting needs a gain
 of about +0.07 to +0.10 to be told apart from luck, so the optimiser usually
@@ -1218,34 +1434,61 @@ measurement variability.
 Searching seeds on 1–2 sentences overfits them to those sentences. The optimiser
 therefore keeps sentences aside and re-scores the winner on them:
 
+An illustration, with made-up values, of a sentence that failed:
+
 ```
-  HELD-OUT score 0.637 ±0.021 (accent 0.653, identity 0.613)
-  HELD-OUT median 0.637 (+0.000 vs the mean)
-  Search -> hold-out drop +0.048; noise ~0.019
-  [!] Some overfitting remains; use more probe texts before raising budget.
+  HELD-OUT score 0.581 ±0.131 (accent 0.500, identity 0.664)
+  [H1] accent 0.930  identity 0.671  score 0.674  WER 0.00  (Whisper: FR)
+       text : Chaque expiration relâche un peu plus les épaules et la mâchoire.
+       heard: Chaque expiration relâche un peu plus les épaules et la mâchoire.
+  [H2] accent 0.070  identity 0.657  score 0.488  WER 1.00  (Whisper: EN)
+       text : Quarante-huit personnes attendaient déjà sur le quai numéro trois.
+       heard: Forty-eight people were already waiting on platform three.
+  [!] Unseen sentence 2: heard as EN, not FR (accent 0.07) -- listen to it
+  Search -> hold-out drop +0.089; noise ~0.112
+  [!] The score drop alone does not show it: the accent counts for 0.30 of the score, ...
 ```
 
 The held-out figure is the one reported and stored in the preset. A drop far
 above the noise means the winner was tuned to the test phrase and will not
-hold over a long meditation.
+hold over a long meditation. The composite score can also hide a failed
+sentence: the accent counts for 0.3 with the Resemblance weights, and identity
+can rise at the same time. So each unseen sentence is reported with what
+Whisper heard, and one is flagged when Whisper heard another language or
+nothing, or when its accent is more than 0.2 below the search's. In French,
+a number Whisper writes in digits counts the same as the words of the text
+(« 48 » for « quarante-huit »); a different number, or an added word, still
+counts, and the report gives the raw WER beside it. In the other languages,
+spelled-out numbers written as digits cost about 0.1. With three or more
+sentences the median is compared with the mean as well; with two, the median
+is the mean. `--holdout-wav-prefix` keeps the renders; the pipeline always
+passes it.
 
 | Option | Default | Effect |
 |---|---|---|
 | `--holdout-texts N` | 2 | Sentences reserved for validation (own budget) |
+| `--holdout-wav-prefix P` | off | Keep the unseen renders as `P1.wav`, `P2.wav`… (the pipeline sets it) |
 | `--no-holdout` | off | Skip it (reported score becomes optimistically biased) |
 | `--seed-robust` / `--seed-mean` | robust | Rank seeds on worst-case sentence vs mean |
 | `--probe-texts N` | 2 | Sentences averaged per score (noise falls as 1/√n) |
 | `--adopt-alpha A` | 0.05 | Chance per stage of adopting pure noise; 1 = any gain wins |
-| `--budget`, `--cond-budget` | 60, 24 | Sampling / conditioning generations |
+| `--budget`, `--cond-budget` | 60, 34 | Sampling / conditioning generations |
 
 ### Search stages (`xtts_optimize.py`)
 
-**Conditioning** (`--cond-budget`, default 24; one sentence per candidate), each
+**Conditioning** (`--cond-budget`, default 34; one sentence per candidate), each
 stage against the current best: C0 `max_ref_len` (with `--max-ref-lens` only),
 C1 `gpt_cond_len`, C2 `gpt_cond_chunk_len`, C2b the pairs the sequential search
 cannot reach, C3 `sound_norm_refs`, C4 reference subsets (several references
-only), C5 a bounded joint grid around the winner. C5 uses whatever budget is
-left, by design, so reaching its end is reported as information, not as a cut.
+only), C5 a bounded joint grid around the winner: its 8 nearest new
+combinations, a cap by design that the log reports as information, and never
+the renders C6 needs. At the same distance, a change of the GPT settings goes
+before a change of the reference cap: with one reference and no normalisation,
+a cap at or above `gpt_cond_len` leaves the GPT conditioning as it is (the
+first `gpt_cond_len` seconds, which decide the tokens), so such a render
+repeats the tokens of one already screened and changes only the speaker
+embedding. These stages screen one draw per candidate and steer the
+search; C6 confirms the result on the probe's seeds (see Statistical honesty).
 Each combination is checked against its own reference cap. Keep
 `--gpt-cond-lens` at 20–30 s when the reference allows it: the GPT conditioning
 carries prosody and accent, and neither score hears a regional accent (free to
@@ -1263,7 +1506,12 @@ clone came out Canadian).
    landscapes are often flat or non-concave, so keeping the start is a common,
    expected outcome.
 3. **`rep_pen` / `top_p` / `top_k`** — usually inert; each one changes only if
-   it beats the noise.
+   it beats the noise. Often the render is bit-identical: once the tokens
+   already emitted fall outside the `top_p` nucleus, a stronger `rep_pen`
+   changes nothing, and `top_k` changes nothing above the size of that nucleus.
+   Such a line says `= same audio as [S  6]` and is not scored again; it still
+   counts in the budget, since a stronger penalty can also shift the nucleus
+   by one token.
 4. **Decode-mode probe** (`--probe-beams`, optional) — `num_beams=3` beam search
    and greedy decoding. Beam search is the only mode where `length_penalty` does
    anything at all; at `num_beams=1` that field is dead. Beam search is forced
@@ -1294,12 +1542,18 @@ python voice_comparator.py ref_curated.wav FR \
 
 **1. Closed-loop tone fit (always on).** Least squares on the LTAS difference
 using the generator's EXACT EQ responses, perceptually weighted (IEC
-A-weighting), cumulative gains within `--eq-limit`, each pass kept only if the
-rendered spectrum improves, iterated until the largest change falls under
-`--conv-threshold`.
-`hp`/`lp` are guards, not tone controls: they are floored at 40 Hz and frozen
-after the first pass — re-deriving them each pass walked the high-pass down
-30 Hz per iteration until it filtered nothing.
+A-weighting), on spectra averaged over bands of max(250 Hz, 1/3 octave) so the
+harmonic comb of the voice is not fitted, with the EQ applied to the render's
+own power spectrum; cumulative gains within `--eq-limit`, each pass kept only
+if the rendered spectrum improves, iterated until the largest change falls
+under `--conv-threshold`.
+`hp` is a guard, not a tone control: floored at 40 Hz and, like `lp`, frozen
+after the first pass — re-deriving it each pass walked it down 30 Hz per
+iteration until it filtered nothing. `lp` is no guard at all at 24 kHz: pydub's
+first-order filter tilts the whole upper band, and with it on, `eq_high` spent
+its bound giving back what it took. The first pass switches it off when the
+exact filter responses predict a better fit without it, and the render
+confirms.
 
 **2. Sensitivity screening (`--screen-audio`).** Each audio parameter alone,
 across its full musical range, measuring how far ECAPA identity moves:
@@ -1317,9 +1571,9 @@ below 1×. The answer differs per voice — screen before assuming.
 **3. Joint optimisation (`--optimise-audio nelder|de`).** Evaluations here are
 cheap (one clone, then post-processing plus one embedding), which is exactly the
 regime where derivative-free global search pays off. `de` runs differential
-evolution (Sobol init) then a Nelder-Mead polish over 9 bounded axes at once,
-capturing the interactions one-factor-at-a-time screening misses by
-construction.
+evolution (Sobol init) then a Nelder-Mead polish over up to 9 bounded axes at
+once, capturing the interactions one-factor-at-a-time screening misses by
+construction. A filter that is off stays off, and `--target-dbfs` holds `vol`.
 
 Why not the other classics: least squares needs a design matrix and ECAPA is a
 non-differentiable black box; bisection is a 1-D monotonic tool; gradient
@@ -1423,18 +1677,27 @@ Manual chain:
 cd Python_Scripting
 python -m unittest -v test_clonage_regressions test_complements_regressions \
     test_voice_separation_regressions test_tone_fit_regressions \
-    test_render_search_regressions test_budget_plan_regressions
+    test_render_search_regressions test_budget_plan_regressions \
+    test_timbre_regressions test_holdout_report_regressions \
+    test_eq_headroom_regressions test_small_fixes_regressions \
+    test_script_blocks_regressions test_confirmation_regressions \
+    test_language_contract_regressions test_pron_numbers_regressions
 ```
 
-150 regression tests, no model download needed: XTTS, Whisper, ECAPA,
+259 regression tests, no model download needed: XTTS, Whisper, ECAPA,
 SepFormer, pyannote, MFA, Applio and Rubber Band are simulated, so the tests
 check parsing, routing, budgets, decisions and the audio chain — not voice
 quality. The render tests drive the generator's own functions through the real
 FFmpeg (skipped without pydub and FFmpeg; on Python 3.13, pydub needs
 `audioop-lts`). The budget tests run the optimiser down many search paths and
-check that the conditioning plan covers every one; the [Auto] tab's buttons are
-driven with stand-in widgets. Each fix and addition of 3.3 to 3.5 was checked by
-putting its bug back: every one makes at least one test fail.
+check that the conditioning plan covers every one; the confirmation tests give
+each setting a known true effect, so they check what one draw shows and what C6
+concludes; the [Auto] tab's buttons are driven with stand-in widgets. The timbre tests run librosa's pyin on synthetic
+voices and real FFmpeg EQ (skipped without librosa; the Praat case needs
+parselmouth). The tone-fit tests run the Comparator's fit through an exact model
+of the render chain, on noise and on synthetic harmonic voices, and once through
+the generator's own. Each fix and addition of 3.3 to 3.7.2 was checked by putting
+its bug back: every one makes at least one test fail.
 
 ---
 

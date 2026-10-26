@@ -32,10 +32,20 @@ S3_AXES = (("rep_pen", [4., 5., 7., 10.]),
 S4_LENGTH_PENALTIES = [0.8, 0.9, 1.0, 1.1, 1.2]
 
 # ── Conditioning schedule ─────────────────────────────────────────────────────
-NOISE_PROBES = 3         # extra seeds rendered at the base conditioning
+NOISE_PROBES = 4         # extra seeds rendered at the base conditioning; C6
+                         # renders its finalists on the same seeds
 NOISE_PROBE_MARGIN = 6   # the probe runs only if the budget leaves this many
                          # evaluations for the stages themselves
 C2B_RESERVE = 2          # generations C2b leaves untouched, so C3 can still run
+C2B_PAIRS = 8            # at most 3 x 3 neighbouring pairs, the winner's excluded
+# C0 to C5 screen: one draw per candidate. With a draw-to-draw spread of
+# 0.02-0.03 that can only show gains of 0.07 to 0.15, and the joint grid of C5
+# grew to 87 single draws on a real run without adopting anything. So C5 is
+# capped, and C6 spends the difference on what one draw cannot do: it renders
+# the stages' winner and the best other screened candidates again on the
+# probe seeds and compares their means with the base's.
+C5_SCREEN = 8            # new renders C5 may spend, nearest combinations first
+CONFIRM_FINALISTS = 3    # candidates C6 confirms, the stages' winner first
 
 # ── What the pipeline hands the optimiser ─────────────────────────────────────
 # voice_analyser.py always writes these sampling values into the {} block;
@@ -78,6 +88,28 @@ def parse_ints(text):
     """Integers separated by spaces or commas, the way the optimiser reads
     --seeds and --max-ref-lens. Anything else is an error, as it is there."""
     return [int(x) for x in (text or "").replace(",", " ").split()]
+
+
+def joined_seeds(seeds):
+    """Seeds that look like two typed without a space: '160180' among
+    0 42 ... 200. At least 1000, ten times the largest other seed, and
+    splittable into two numbers in the range of the others. They still run,
+    as one seed -- this only flags them before a long run."""
+    seeds = [int(s) for s in seeds]
+    found = []
+    for i, s in enumerate(seeds):
+        others = seeds[:i] + seeds[i + 1:]
+        if not others or s < 1000:
+            continue
+        top, low = max(max(others), 1), min(others)
+        if s < 10 * top:
+            continue
+        digits = str(s)
+        if any(low <= int(digits[:k]) <= 2 * top and low <= int(digits[k:]) <= 2 * top
+               and not (len(digits) - k > 1 and digits[k] == '0')
+               for k in range(1, len(digits))):
+            found.append(s)
+    return found
 
 
 # ── Sampling ──────────────────────────────────────────────────────────────────
@@ -166,10 +198,16 @@ def conditioning_plan(gcl_lens, chunks, ref_lengths, base_gcl, base_chunk, base_
     """--cond-budget that runs every conditioning stage in full, whatever wins.
 
     An upper bound on the generations (every candidate the stages can render,
-    plus the noise probe), plus the reserve C2b keeps for C3, and never below
-    what the noise probe needs. ref_sets is the number of reference subsets
-    C4 tries (0 when it does not run); C5 may then work on the winning subset,
-    whose candidates are counted separately.
+    plus the noise probe and the confirmation), plus the reserve C2b keeps for
+    C3, and never below what the noise probe needs. ref_sets is the number of
+    reference subsets C4 tries (0 when it does not run); C5 may then work on
+    the winning subset, whose candidates are counted separately.
+
+    Two bounds on the screening draws, the smaller one counts: every distinct
+    setting the stages can reach, and the slots the stages list (the
+    incumbent's own slot is cached, C2b has at most C2B_PAIRS, C5 at most
+    C5_SCREEN). C6 renders each finalist on the probe seeds; the base's
+    renders there are the probe itself.
     """
     total = len(conditioning_candidates(gcl_lens, chunks, ref_lengths, base_gcl,
                                         base_chunk, base_max_ref, n_refs))
@@ -187,7 +225,13 @@ def conditioning_plan(gcl_lens, chunks, ref_lengths, base_gcl, base_chunk, base_
         grid = ((len(_unique([g for g in gcl_lens if g >= 1])) + 1)
                 * (len(_unique([c for c in chunks if c >= 1])) + 1) * (len(lengths) + 1) * 2)
         total += ref_sets + min(subset, grid)
-    need = (total + NOISE_PROBES) * n_texts + C2B_RESERVE
+    lengths = _unique([int(d) for d in ref_lengths if int(d) >= 1])
+    slots = (1 + len(lengths)
+             + len(_unique([g for g in gcl_lens if g >= 1]))
+             + len(_unique([c for c in chunks if c >= 1]))
+             + C2B_PAIRS + 1 + (ref_sets if n_refs > 1 else 0) + C5_SCREEN)
+    confirm = CONFIRM_FINALISTS * NOISE_PROBES
+    need = (min(total, slots) + NOISE_PROBES + confirm) * n_texts + C2B_RESERVE
     return max(need, (1 + NOISE_PROBES + NOISE_PROBE_MARGIN) * n_texts)
 
 

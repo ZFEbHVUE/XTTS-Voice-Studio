@@ -31,6 +31,11 @@ Important:
   1 restores the old "any gain wins").
 - A stage cut short by a budget says so: live, in the summary, and in the
   result JSON ("truncated_stages"). The plan size is printed up front.
+- The conditioning stages screen with one draw per candidate, and what they
+  adopt only steers the next stages. C6 renders their winner and the best
+  other screened candidates again on the noise probe's seeds: one replaces the
+  base only when its mean beats the base's beyond a t bar
+  ("conditioning_confirmation" in the result JSON).
 """
 
 try:
@@ -42,6 +47,7 @@ except Exception:
     pass
 
 import argparse
+import hashlib
 import json
 from xtts_settings import parse_block, format_block, validate
 import itertools
@@ -60,8 +66,8 @@ LANGS = {"FR","EN","ES","DE","IT","PT","PL","TR","RU","NL","CS","AR",
 # The search grids and schedule constants live in search_plan.py, shared with
 # the plan arithmetic the [Auto] Pipeline tab uses to propose safe budgets.
 from search_plan import (GRID, AXIS_ORDER, S2_TEMPS, S3_AXES, S4_LENGTH_PENALTIES,
-                         NOISE_PROBES, NOISE_PROBE_MARGIN, C2B_RESERVE,
-                         sampling_plan, conditioning_plan)
+                         NOISE_PROBES, NOISE_PROBE_MARGIN, C2B_RESERVE, C5_SCREEN,
+                         CONFIRM_FINALISTS, sampling_plan, conditioning_plan)
 
 # Noise-aware adoption. A candidate is scored on one or two sentences with
 # one random draw: two settings that sound the same can differ by several
@@ -87,6 +93,51 @@ def adoption_bar(sd, n_challengers, alpha):
     from statistics import NormalDist
     z = NormalDist().inv_cdf(1.0 - alpha / n_challengers)
     return max(0.0, z) * float(np.sqrt(2.0)) * max(SD_FLOOR, float(sd))
+
+
+def t_quantile(p, df):
+    """Student's t quantile, by the Cornish-Fisher expansion (Abramowitz and
+    Stegun 26.7.5), with no scipy needed: within 1 % of the exact value from
+    4 degrees of freedom up to p = 0.999, within 0.2 % from 6 (the fewest the
+    confirmation stage has). That stage estimates its spread from a dozen
+    renders, where the normal quantile would understate the bar."""
+    from statistics import NormalDist
+    z = NormalDist().inv_cdf(p)
+    if not df or df <= 0 or not np.isfinite(df):
+        return z
+    g1 = (z ** 3 + z) / 4
+    g2 = (5 * z ** 5 + 16 * z ** 3 + 3 * z) / 96
+    g3 = (3 * z ** 7 + 19 * z ** 5 + 17 * z ** 3 - 15 * z) / 384
+    g4 = (79 * z ** 9 + 776 * z ** 7 + 1482 * z ** 5 - 1920 * z ** 3 - 945 * z) / 92160
+    return z + g1 / df + g2 / df ** 2 + g3 / df ** 3 + g4 / df ** 4
+
+
+def confirmation_decision(reference, finalists, alpha):
+    """C6's decision from fresh renders, all on the same seeds.
+
+    reference: scores of the base settings on those seeds; finalists:
+    [(label, scores)]. The spread is pooled over every group (each setting's
+    scores around its own mean), so it rests on a dozen renders instead of
+    the probe's handful. The best finalist is adopted when its mean beats the
+    reference's by more than a one-sided t bar, Bonferroni-corrected for the
+    number of finalists. Returns (index of the adopted finalist or None,
+    gains, bar, sd, df).
+    """
+    groups = [list(reference)] + [list(xs) for _label, xs in finalists]
+    df = sum(len(g) - 1 for g in groups)
+    ss = sum(float(np.sum((np.asarray(g) - np.mean(g)) ** 2)) for g in groups)
+    sd = max(SD_FLOOR, float(np.sqrt(ss / df))) if df > 0 else SD_FALLBACK
+    base = float(np.mean(reference))
+    gains = [float(np.mean(xs)) - base for _label, xs in finalists]
+    if not finalists:
+        return None, gains, 0.0, sd, df
+    k = min(len(g) for g in groups)
+    if alpha >= 1:
+        bar = 0.0
+    else:
+        bar = max(0.0, t_quantile(1.0 - alpha / len(finalists), df)) * sd * float(np.sqrt(2.0 / k))
+    best = int(np.argmax(gains))
+    return (best if gains[best] > bar else None), gains, bar, sd, df
 
 
 def parse_xtts_block(block):
@@ -141,12 +192,61 @@ TIMBRE_SCALE = {
     'centroid_hz': 300.0,   # 300 Hz of brightness is plainly audible
     'hnr_db': 3.0,          # 3 dB of harmonic-to-noise is a change of texture
 }
+# Frames further than this from the level-weighted median pitch are pitch
+# tracking errors (an octave is 12 st), not intonation: normal speech stays
+# within a few semitones of its centre.
+TIMBRE_OCTAVE_GUARD_ST = 7.0
+TIMBRE_NFFT, TIMBRE_HOP = 2048, 512
+# A take with no usable voiced audio (a failed render) gets the worst timbre, 0.
+# Only when most takes fail, from this many on, is it the reference or the
+# tools rather than a take, and the search stops.
+TIMBRE_FAILURE_STOP = 3
 
 
-def timbre_features(path, sr_target=22050):
-    """Median F0, spectral centroid and HNR of a file -- the three the ear uses.
+def _weighted_median(values, weights):
+    import numpy as _np
+    order = _np.argsort(values)
+    cum = _np.cumsum(weights[order])
+    return float(values[order][_np.searchsorted(cum, 0.5 * cum[-1])])
 
-    Returns None when the file holds no usable voiced material, so a failed
+
+def _praat_hnr_db(y, sr):
+    """Praat harmonicity over the frames where harmonics dominate (> 0 dB),
+    median: the definition the analyser and the comparator use, so the three
+    tools report the same HNR for the same file. Raises ImportError without
+    parselmouth."""
+    import numpy as _np
+    import parselmouth
+    snd = parselmouth.Sound(_np.asarray(y, dtype='float64'), sr)
+    v = snd.to_harmonicity().values
+    v = v[(v > -200) & (v > 0.0)]
+    return float(_np.median(v)) if len(v) else None
+
+
+def timbre_features(path, sr_target=22050, hnr_method=None):
+    """Pitch, brightness and HNR of the VOICED part of a file.
+
+    All three used to be averaged over the whole file, silences, breaths and
+    consonants included: a frame of silence weighed as much as a vowel in the
+    centroid, so the measure followed the pauses and the consonants of each
+    sentence more than the voice (on a real reference it read an HNR of
+    -1.3 dB where Praat measures 15.7 dB). Measured on four real voices, with
+    only the pauses and breaths around the same 4 s of audio changed, the
+    distance moved by 0.52-0.76 (sd) the old way and 0.06-0.10 now, while a
+    4 dB EQ change on the high band still moves the centroid by ~70 Hz. Now:
+
+    - pitch: level-weighted mean of the voiced frames, in semitones, with
+      pitch-tracking errors left out (the plain median varied by as much as
+      0.66 st, sd, on the same audio).
+    - centroid: of the magnitude spectrum summed over the voiced frames only.
+    - HNR: Praat's, as everywhere else in the studio ('praat'); without
+      parselmouth, the harmonic/percussive energy ratio of the voiced frames
+      ('hpss'), which is on another scale -- the method is recorded, and
+      timbre_distance only compares files measured the same way.
+
+    hnr_method forces one method ('praat' or 'hpss'), so the clones are
+    measured like the reference. Returns None when the file holds no usable
+    voiced material, or the forced method is unavailable, so a failed
     generation is skipped rather than scored as a perfect match.
     """
     try:
@@ -155,28 +255,58 @@ def timbre_features(path, sr_target=22050):
         y, sr = _lb.load(path, sr=sr_target, mono=True)
         if len(y) < sr // 4:
             return None
-        f0, voiced, _ = _lb.pyin(y, fmin=60, fmax=500, sr=sr,
-                                 frame_length=2048, hop_length=512)
-        fv = f0[~_np.isnan(f0)]
-        if len(fv) < 8:
+        f0, voiced, vprob = _lb.pyin(y, fmin=60, fmax=500, sr=sr,
+                                     frame_length=TIMBRE_NFFT, hop_length=TIMBRE_HOP)
+        spec = _np.abs(_lb.stft(y, n_fft=TIMBRE_NFFT, hop_length=TIMBRE_HOP))
+        n = min(spec.shape[1], len(f0))
+        f0, spec = _np.asarray(f0[:n], dtype=float), spec[:, :n]
+        vprob = _np.nan_to_num(_np.asarray(vprob[:n], dtype=float))
+        mask = _np.asarray(voiced[:n], dtype=bool) & _np.isfinite(f0) & (vprob > 0)
+        if mask.sum() < 8:
             return None
-        cen = float(_np.mean(_lb.feature.spectral_centroid(y=y, sr=sr)))
-        # HNR from the harmonic/percussive split: cheap, and consistent between
-        # the two files being compared, which is all that matters here.
-        h, p = _lb.effects.hpss(y)
-        eh = float(_np.mean(h ** 2)) + 1e-12
-        ep = float(_np.mean(p ** 2)) + 1e-12
-        return {'f0': float(_np.median(fv)),
-                'centroid': cen,
-                'hnr': float(10.0 * _np.log10(eh / ep))}
+        # Each voiced frame counts by its voicing probability: the frames at
+        # the edge of a vowel, half voice half consonant or pause, are the
+        # ones whose voiced/unvoiced call flips when the timing of a render
+        # shifts by a few milliseconds. Counted in full, they made the
+        # centroid jump by ~50 Hz on the same audio; weighted, by ~6 Hz.
+        frames, w = spec[:, mask], vprob[mask]
+        level = (_np.sqrt(_np.mean(frames ** 2, axis=0)) + 1e-12) * w
+        st = 12.0 * _np.log2(f0[mask])
+        keep = _np.abs(st - _weighted_median(st, level)) <= TIMBRE_OCTAVE_GUARD_ST
+        pitch_st = float(_np.sum(st[keep] * level[keep]) / _np.sum(level[keep]))
+        summed = (frames * w).sum(axis=1)
+        freqs = _lb.fft_frequencies(sr=sr, n_fft=TIMBRE_NFFT)
+        centroid = float(_np.sum(freqs * summed) / (_np.sum(summed) + 1e-12))
+
+        hnr, method = None, None
+        if hnr_method in (None, 'praat'):
+            try:
+                hnr, method = _praat_hnr_db(y, sr), 'praat'
+            except ImportError:
+                pass
+        if hnr is None and hnr_method in (None, 'hpss'):
+            harm, perc = _lb.decompose.hpss(spec)
+            eh = float(_np.sum(harm[:, mask] ** 2 * w)) + 1e-12
+            ep = float(_np.sum(perc[:, mask] ** 2 * w)) + 1e-12
+            hnr, method = float(10.0 * _np.log10(eh / ep)), 'hpss'
+        if hnr is None or not _np.isfinite(hnr):
+            return None
+        return {'f0': float(2.0 ** (pitch_st / 12.0)),
+                'centroid': centroid,
+                'hnr': float(hnr),
+                'hnr_method': method,
+                'voiced_frames': int(mask.sum())}
     except Exception:
         return None
 
 
 def timbre_distance(ref, clone):
-    """0 = same timbre. Each term normalised by an audible gap; see TIMBRE_SCALE."""
+    """0 = same timbre. Each term normalised by an audible gap; see TIMBRE_SCALE.
+    None when the two files were not measured the same way (HNR method)."""
     import numpy as _np
     if not ref or not clone:
+        return None
+    if ref.get('hnr_method') != clone.get('hnr_method'):
         return None
     st = abs(12.0 * _np.log2(max(clone['f0'], 1e-6) / max(ref['f0'], 1e-6)))
     d_f0 = st / TIMBRE_SCALE['f0_semitones']
@@ -189,6 +319,79 @@ def timbre_score(ref, clone):
     """Turn the distance into something to MAXIMISE, like every other score."""
     d = timbre_distance(ref, clone)
     return None if d is None else float(1.0 / (1.0 + d))
+
+
+# ── Hold-out report ──────────────────────────────────────────────────────────
+# An unseen sentence this far below the accent of the search is a failure to
+# listen to. Spelled-out numbers that Whisper writes as digits cost ~0.1
+# outside French (pron_score matches French cardinals); a sentence heard in
+# another language scores at most 0.10.
+HOLDOUT_ACCENT_DROP = 0.2
+
+
+def holdout_alerts(search_accent, details, lang):
+    """(sentence number, reason) for each unseen sentence worth a listen.
+
+    The composite score cannot be trusted for this: with the Resemblance
+    weights the accent counts for 0.3, and identity can rise at the same time.
+    In a real run the mean accent of two unseen sentences fell from 0.946 to
+    0.495 (most likely one of them failed) while the score dropped by 0.098
+    only, inside the noise, so the old report said 'no large score drop'.
+    """
+    want = (lang or '').lower().split('-')[0]
+    alerts = []
+    for k, d in enumerate(details or [], 1):
+        heard = (d.get('heard') or '').strip()
+        detected = (d.get('detected') or '').lower()
+        if not heard:
+            alerts.append((k, "Whisper heard nothing"))
+        elif detected and want and detected != want:
+            alerts.append((k, f"heard as {detected.upper()}, not {want.upper()} "
+                              f"(accent {d['accent']:.2f})"))
+        elif d['accent'] < search_accent - HOLDOUT_ACCENT_DROP:
+            alerts.append((k, f"accent {d['accent']:.2f} against {search_accent:.2f} "
+                              f"on the search"))
+    return alerts
+
+
+def format_holdout_details(details, width=110):
+    """Three lines per unseen sentence: the scores, what was asked, what
+    Whisper heard. The mean alone hid a failed sentence."""
+    def cut(s):
+        s = ' '.join((s or '').split())
+        return s if len(s) <= width else s[:width - 1] + '…'
+    lines = []
+    for k, d in enumerate(details or [], 1):
+        wer = '' if d.get('wer') is None else f"  WER {d['wer']:.2f}"
+        if d.get('wer_raw') is not None and d.get('wer') is not None and abs(d['wer_raw'] - d['wer']) > 1e-9:
+            wer += f" (raw spelling {d['wer_raw']:.2f}; FR numbers normalised)"
+        lang = (d.get('detected') or '?').upper()
+        lines.append(f"  [H{k}] accent {d['accent']:.3f}  identity {d['identity']:.3f}  "
+                     f"score {d['score']:.3f}{wer}  (Whisper: {lang})")
+        lines.append(f"       text : {cut(d.get('text'))}")
+        lines.append(f"       heard: {cut(d.get('heard')) or '(nothing)'}")
+    return lines
+
+
+def keep_holdout_wavs(details, prefix):
+    """Copy the unseen renders (raw XTTS output, as scored) to <prefix><k>.wav
+    so they can be listened to after the run; the work folder is deleted."""
+    import shutil
+    kept = []
+    for k, d in enumerate(details or [], 1):
+        src = d.get('wav')
+        if not src or not os.path.isfile(src):
+            kept.append(None)
+            continue
+        dst = f"{prefix}{k}.wav"
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+            shutil.copyfile(src, dst)
+            kept.append(os.path.abspath(dst))
+        except OSError as exc:
+            print(f"  [!] Could not keep the unseen render {k}: {exc}")
+            kept.append(None)
+    return kept
 
 
 def _unique(seq):
@@ -257,6 +460,9 @@ def main():
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--holdout-texts", type=int, default=2)
     ap.add_argument("--no-holdout", action="store_true")
+    ap.add_argument("--holdout-wav-prefix", default=None,
+                    help="Keep the unseen renders (raw XTTS, as scored) as <prefix>1.wav, "
+                         "<prefix>2.wav ... -- the work folder is deleted at the end")
     ap.add_argument("--seed-robust", action="store_true", default=True)
     ap.add_argument("--seed-mean", dest="seed_robust", action="store_false")
     ap.add_argument("--beam-width", type=int, default=3)
@@ -277,8 +483,9 @@ def main():
                     help="Search speaker-conditioning settings (default ON)")
     ap.add_argument("--no-search-conditioning", dest="search_conditioning",
                     action="store_false")
-    ap.add_argument("--cond-budget", type=int, default=24,
-                    help="Generation cap for conditioning search (default 24)")
+    ap.add_argument("--cond-budget", type=int, default=34,
+                    help="Generation cap for conditioning search (default 34: the whole "
+                         "plan of the pipeline's default fields, confirmation included)")
     ap.add_argument("--cond-probe-texts", type=int, default=1,
                     help="Sentences per conditioning candidate (1-2, default 1)")
     ap.add_argument("--gpt-cond-lens", default="6 10 15 20 30",
@@ -354,7 +561,11 @@ def main():
     known = lang.lower().split('-')[0] in _supported()
     try:
         if args.probe_text_file:
-            PROBES = _unique([text] + custom_sentences(args.probe_text_file))
+            # The file's sentences ARE the search sentences; --text, when given,
+            # still comes first. The built-in default sentence used to be put
+            # first anyway, so a two-sentence search used one line of the file.
+            explicit = bool(args.text or (args.text_file and os.path.exists(args.text_file)))
+            PROBES = _unique(([text] if explicit else []) + custom_sentences(args.probe_text_file))
         elif known:
             PROBES = [text] + [t for t in _probes(lang, 5) if t != text]
         elif args.probe_texts == 1 and args.cond_probe_texts == 1:
@@ -446,14 +657,23 @@ def main():
         if args.objective in ('timbre', 'both'):
             # Averaged over every reference, like the identity target above: one
             # take can sit a little higher or brighter than the speaker usually is.
-            feats = [f for f in (timbre_features(r) for r in all_refs) if f]
+            # Every file is measured with the HNR method of the first one, so
+            # the average never mixes Praat's scale with the fallback's.
+            feats, hnr_method = [], None
+            for r in all_refs:
+                f = timbre_features(r, hnr_method=hnr_method)
+                if f:
+                    feats.append(f)
+                    hnr_method = hnr_method or f['hnr_method']
             if feats:
                 ref_timbre = {k: float(np.mean([f[k] for f in feats]))
                               for k in ('f0', 'centroid', 'hnr')}
+                ref_timbre['hnr_method'] = hnr_method
             if ref_timbre:
-                print(f"  Reference timbre: F0 {ref_timbre['f0']:.0f} Hz, "
+                print(f"  Reference timbre (voiced frames): F0 {ref_timbre['f0']:.0f} Hz, "
                       f"centroid {ref_timbre['centroid']:.0f} Hz, "
-                      f"HNR {ref_timbre['hnr']:.1f} dB")
+                      f"HNR {ref_timbre['hnr']:.1f} dB "
+                      f"({'Praat' if hnr_method == 'praat' else 'HPSS fallback, no parselmouth'})")
             else:
                 print("  [!] Could not measure the reference timbre -- "
                       "falling back to identity")
@@ -463,6 +683,8 @@ def main():
         cond_evals = [0]
         holdout_evals = [0]
         score_cache = {}
+        audio_seen = {}   # (sha1 of a render, its text) -> its scores
+        timbre_takes = {'measured': 0, 'failed': 0}
         latent_cache = {}
 
         base_cond = {
@@ -548,7 +770,8 @@ def main():
                 return None
 
             latents = get_latents(c)
-            frs, ids, per, tms = [], [], [], []
+            frs, ids, per, tms, details, same = [], [], [], [], [], []
+            label = f"[{phase[0].upper()}{counter[0] + len(texts):>3}]"
             for txt in texts:
                 if counter[0] >= limit:
                     note_cut(phase, counter[0], limit)
@@ -566,25 +789,67 @@ def main():
                     num_beams=int(prm.get("num_beams", 1)),
                     do_sample=bool(prm.get("do_sample", True)),
                 )
-                ps = pron.score(wav, lang=lang, target_text=txt)
-                ident = enc.cosine(ref_emb, enc.embed(wav))
-                # The second term of the objective, whichever it is. A file whose
-                # timbre cannot be measured keeps its identity score rather than
-                # being scored as perfect.
-                if args.objective == 'identity' or ref_timbre is None:
-                    second = float(ident)
+                # A setting can leave the render bit-identical: rep_pen above
+                # the point where repeated tokens already fall outside top_p,
+                # top_k above the size of the top_p nucleus. Same audio, same
+                # text: the scores are the same, so they are not computed
+                # twice, and the line says so instead of showing a coincidence.
+                try:
+                    with open(wav, 'rb') as fh:
+                        digest = hashlib.sha1(fh.read()).hexdigest()
+                except OSError:
+                    digest = None
+                seen = audio_seen.get((digest, txt)) if digest else None
+                if seen is not None:
+                    ps, ident, second = seen["ps"], seen["ident"], seen["second"]
+                    same.append(seen["label"])
                 else:
-                    ts = timbre_score(ref_timbre, timbre_features(wav))
-                    if ts is None:
+                    ps = pron.score(wav, lang=lang, target_text=txt)
+                    ident = enc.cosine(ref_emb, enc.embed(wav))
+                    # The second term of the objective, whichever it is. A file whose
+                    # timbre cannot be measured keeps its identity score rather than
+                    # being scored as perfect.
+                    if args.objective == 'identity' or ref_timbre is None:
                         second = float(ident)
-                    elif args.objective == 'timbre':
-                        second = ts
                     else:
-                        second = 0.5 * float(ident) + 0.5 * ts
+                        ts = timbre_score(ref_timbre, timbre_features(
+                            wav, hnr_method=ref_timbre.get('hnr_method')))
+                        if ts is None:
+                            # No usable voiced audio in this take: the worst
+                            # timbre, 0, in the same formula as every other take.
+                            # Its identity alone ranked it on another scale (3.7.1),
+                            # and stopping the whole search for one failed render
+                            # lost every take before it.
+                            timbre_takes['failed'] += 1
+                            print(f"  [!] {label}: no measurable timbre in this take "
+                                  f"(no usable voiced audio) -- counted as 0, the worst")
+                            failed = timbre_takes['failed']
+                            total = failed + timbre_takes['measured']
+                            if failed >= TIMBRE_FAILURE_STOP and 2 * failed > total:
+                                sys.exit(f"[ERR] Timbre could not be measured on {failed} of "
+                                         f"{total} takes: that is the reference or the acoustic "
+                                         f"tools (librosa, parselmouth), not one take. Check "
+                                         f"them, or run with --objective identity.")
+                            ts = 0.0
+                        else:
+                            timbre_takes['measured'] += 1
+                        second = ts if args.objective == 'timbre' else 0.5 * float(ident) + 0.5 * ts
+                    if digest:
+                        audio_seen[(digest, txt)] = {"ps": ps, "ident": ident,
+                                                     "second": second, "label": label}
                 frs.append(float(ps["score"]))
                 ids.append(float(ident))
                 tms.append(second)
                 per.append(wa * frs[-1] + wi * second)
+                details.append({
+                    "text": txt, "accent": frs[-1], "identity": float(ident),
+                    "second": float(second), "score": per[-1],
+                    "heard": ps.get("text") or "", "detected": ps.get("detected") or "",
+                    "lang_prob": float(ps.get("lang_prob") or 0.0),
+                    "wer": None if ps.get("wer") is None else float(ps["wer"]),
+                    "wer_raw": None if ps.get("wer_raw") is None else float(ps["wer_raw"]),
+                    "wav": wav,
+                })
                 if device == "cuda":
                     try:
                         torch.cuda.empty_cache()
@@ -613,15 +878,24 @@ def main():
                 "len_pen": float(prm.get("len_pen", 1.0)),
                 "num_beams": int(prm.get("num_beams", 1)),
                 "do_sample": bool(prm.get("do_sample", True)),
+                "details": details,
+                "same_audio_as": (same[0] if len(same) == len(texts) and len(set(same)) == 1
+                                  else None),
             }
             score_cache[k] = rec
 
             ctag = (f"gcl={c['gpt_cond_len']:>2} chunk={c['gpt_cond_chunk_len']:>2} "
                     f"norm={int(bool(c['sound_norm_refs']))} refs={len(c['refs'])} "
                     f"max_ref={c['max_ref_len']}")
+            if rec["same_audio_as"]:
+                dup = f"  = same audio as {rec['same_audio_as']}"
+            elif same:
+                dup = f"  ({len(same)}/{len(texts)} render(s) identical to earlier ones)"
+            else:
+                dup = ""
             print(f"  [{phase[0].upper()}{counter[0]:>3}] {ctag} | "
                   f"seed={seed:>3} t={prm['temp']:.3f} -> "
-                  f"score={score:.3f} (acc={fr:.3f} id={identity:.3f})")
+                  f"score={score:.3f} (acc={fr:.3f} id={identity:.3f}){dup}")
             return rec
 
         # Draw-to-draw noise per evaluation, by phase. Measured whenever the
@@ -694,6 +968,7 @@ def main():
         # STAGE C — speaker-conditioning search
         # ------------------------------------------------------------------
         best_cond = dict(base_cond)
+        confirmation = None     # C6's figures, for the result JSON
         if args.search_conditioning:
             print("\n" + "-" * 72)
             print("  STAGE C — speaker-conditioning search")
@@ -701,13 +976,26 @@ def main():
             fixed_seed = seeds[0]
             fixed_prm = dict(start)
 
-            def test_cond(c, seed=None):
+            def clamp_cond(c):
+                """What XTTS reads: gpt_cond_len within the references, the
+                chunk within gpt_cond_len."""
                 c = dict(c)
                 c["gpt_cond_len"] = max(1, min(int(c["gpt_cond_len"]), int(c["max_ref_len"]) * len(c["refs"])))
                 c["gpt_cond_chunk_len"] = max(
                     1, min(int(c["gpt_cond_chunk_len"]), int(c["gpt_cond_len"])))
+                return c
+
+            def test_cond(c, seed=None):
                 return evaluate(fixed_seed if seed is None else seed, fixed_prm,
-                                cond_probe_texts, c, phase="cond")
+                                cond_probe_texts, clamp_cond(c), phase="cond")
+
+            def screened_already(c):
+                """True when test_cond(c) would cost nothing (rendered before)."""
+                return ("cond", sample_key(fixed_seed, fixed_prm, cond_probe_texts,
+                                           clamp_cond(c))) in score_cache
+
+            # Every screening draw of C0 to C5, for the confirmation (C6).
+            screened = []
 
             def run_stage(stage, conds):
                 """All of a stage's candidates against the stage's incumbent."""
@@ -715,6 +1003,7 @@ def main():
                 current_stage["name"] = stage
                 results = [test_cond(c) for c in conds]
                 current_stage["name"] = None
+                screened.extend(results)
                 win = adopt(best_r, results, "cond", stage)
                 if win is not None and win is not best_r:
                     best_r, best_cond = win, dict(win["cond"])
@@ -729,11 +1018,16 @@ def main():
             # stages themselves.
             probe_seeds = [s for s in _unique(list(seeds[1:]) + [1, 2, 3, 4])
                            if s != fixed_seed][:NOISE_PROBES]
+            probed = False      # the base rendered on every probe seed
             if base_r is not None and args.cond_budget >= (1 + NOISE_PROBES + NOISE_PROBE_MARGIN) * len(cond_probe_texts):
                 current_stage["name"] = "C noise probe"
                 reps = [base_r] + [test_cond(base_r["cond"], seed=s) for s in probe_seeds]
                 current_stage["name"] = None
                 measure_noise("cond", reps, "base conditioning")
+                probed = all(r is not None for r in reps)
+                if probed and args.adopt_alpha < 1:
+                    print("      (C0 to C5 screen one draw per candidate: what they adopt steers "
+                          "the next stages; C6 decides, on these seeds)")
             if draw_noise["cond"] is None:
                 print(f"  [*] Conditioning noise not measured (--cond-budget too small "
                       f"for the probe): assuming sd {SD_FALLBACK:.3f}")
@@ -815,26 +1109,162 @@ def main():
             names = ('gpt_cond_len', 'gpt_cond_chunk_len', 'max_ref_len', 'sound_norm_refs')
             combinations = [values for values in product(*choices)
                             if values[1] <= values[0] <= values[2] * len(anchor['refs'])]
-            combinations.sort(key=lambda values: sum(value != anchor[name]
-                                                     for name, value in zip(names, values)))
-            if cond_evals[0] + len(cond_probe_texts) <= args.cond_budget:
-                print('\n  C5 — joint GPT/chunk/reference-cap/normalization checks')
-                # This stage fills whatever budget is left, by design: running
-                # out here is expected, so it is reported as information.
-                current_stage["name"] = "C5 joint checks"
-                results, tried = [], 0
-                for values in combinations:
-                    if cond_evals[0] + len(cond_probe_texts) > args.cond_budget:
-                        break
-                    results.append(test_cond(dict(anchor, **dict(zip(names, values)))))
-                    tried += 1
-                current_stage["name"] = None
-                if tried < len(combinations):
-                    print(f"  [*] C5 used the remaining budget: {tried} of "
-                          f"{len(combinations)} combinations tried")
-                win = adopt(best_r, results, "cond", "C5 joint checks")
-                if win is not None and win is not best_r:
-                    best_r, best_cond = win, dict(win["cond"])
+            # Nearest first; at the same distance, a change of the GPT settings
+            # before a change of the reference cap. With one reference and no
+            # normalisation, a cap at or above gpt_cond_len leaves the GPT
+            # conditioning as it is (its first gpt_cond_len seconds, which
+            # decide the tokens): such a render repeats the tokens of one
+            # already screened and changes only the speaker embedding. On a
+            # real run, the joint grid's best draws came from a GPT pair (20 s,
+            # chunk 8) that no earlier stage had rendered.
+            def joint_order(values):
+                c = dict(zip(names, values))
+                gpt = sum(int(c[n]) != int(anchor[n])
+                          for n in ('gpt_cond_len', 'gpt_cond_chunk_len', 'sound_norm_refs'))
+                cap = int(int(c['max_ref_len']) != int(anchor['max_ref_len']))
+                return (gpt + cap, cap)
+            combinations.sort(key=joint_order)
+            conds = [dict(anchor, **dict(zip(names, values))) for values in combinations]
+            # C5 never spends what the confirmation (C6) needs: a comparison of
+            # means is worth more than more single draws. The reserve is the
+            # most C6 can render: every finalist on every probe seed, and the
+            # base too when the noise probe has not rendered it there.
+            n_txt = len(cond_probe_texts)
+            confirming = args.adopt_alpha < 1
+            c6_reserve = ((CONFIRM_FINALISTS + (0 if probed else 1)) * len(probe_seeds) * n_txt
+                          if confirming else 0)
+            c5_room = args.cond_budget - c6_reserve
+            print('\n  C5 — joint GPT/chunk/reference-cap/normalization checks')
+            # Capped at C5_SCREEN new renders, nearest combinations first:
+            # single draws cannot tell these apart (87 on a real run, none
+            # adopted), so the renders go to the confirmation instead.
+            # Combinations rendered by an earlier stage cost nothing and count
+            # as screened, not against the cap.
+            current_stage["name"] = "C5 joint checks"
+            results, new = [], 0
+            for i, c in enumerate(conds):
+                free = screened_already(c)
+                if not free and new >= C5_SCREEN:
+                    break
+                if not free and cond_evals[0] + n_txt > c5_room:
+                    short = min(C5_SCREEN - new, sum(not screened_already(x) for x in conds[i:]))
+                    cut_stages["C5 joint checks"] = short
+                    left = max(0, args.cond_budget - cond_evals[0])
+                    why = (f"the {left} generation(s) left are kept for the confirmation "
+                           f"(C6 needs up to {c6_reserve})" if left >= n_txt
+                           else "the budget is spent")
+                    print(f"  [!] conditioning budget: C5 stops {short} render(s) short of "
+                          f"its {C5_SCREEN}, {why}")
+                    break
+                results.append(test_cond(c))
+                new += not free
+            current_stage["name"] = None
+            screened.extend(results)
+            if len(results) < len(conds):
+                print(f"  [*] C5 screened the nearest {len(results)} of {len(conds)} "
+                      f"combinations ({new} new render(s), cap {C5_SCREEN})")
+            win = adopt(best_r, results, "cond", "C5 joint checks")
+            if win is not None and win is not best_r:
+                best_r, best_cond = win, dict(win["cond"])
+
+            # C6: confirmation. A screening draw is one render on one seed, and
+            # the best of twenty such draws is mostly the luckiest one: the
+            # stages above adopt on it only to steer the next stages. The
+            # result is decided here. The stages' winner and the best other
+            # screened candidates are rendered again on the probe seeds --
+            # fresh draws, independent of the screening that picked them -- and
+            # compared with the base on those same seeds, mean against mean
+            # (the base's renders there are the noise probe itself, cached). A
+            # candidate replaces the base only beyond the bar; otherwise the
+            # base stays, whatever the screening adopted.
+            confirm_note = None     # for the winner block
+            if base_r is not None and probe_seeds and confirming:
+                screen_winner = best_r
+                base_key = cond_key(base_r["cond"])
+                win_key = cond_key(screen_winner["cond"])
+                pool = {}
+                for r in screened:
+                    # A render identical to an earlier one is that one again.
+                    if r is None or r.get("same_audio_as") or cond_key(r["cond"]) in (base_key, win_key):
+                        continue
+                    k = cond_key(r["cond"])
+                    if k not in pool or r["score"] > pool[k]["score"]:
+                        pool[k] = r
+                finalists = ([screen_winner] if win_key != base_key else []) + sorted(
+                    (r for r in pool.values() if r["score"] > base_r["score"]),
+                    key=lambda r: -r["score"])
+                finalists = finalists[:CONFIRM_FINALISTS]
+                if not finalists:
+                    print("\n  C6 — confirmation: no screened candidate beat the base's draw; "
+                          "nothing to confirm")
+                else:
+                    seeds_txt = ' '.join(str(x) for x in probe_seeds)
+                    print(f"\n  C6 — confirmation: {len(finalists)} candidate(s) against the base, "
+                          f"each on seeds {seeds_txt} (the probe's)")
+                    current_stage["name"] = "C6 confirmation"
+                    ref = [test_cond(base_r["cond"], seed=x) for x in probe_seeds]
+                    groups = []
+                    if all(r is not None for r in ref):
+                        for f in finalists:
+                            reps = [test_cond(f["cond"], seed=x) for x in probe_seeds]
+                            if any(r is None for r in reps):
+                                break
+                            groups.append((f, reps))
+                    current_stage["name"] = None
+                    if not groups:
+                        # Nothing was confirmed, so nothing replaces the base: a
+                        # winner of single draws is too often a lucky one (22 % of
+                        # the runs on pure noise changed a setting in 3.6.1).
+                        best_r = base_r
+                        best_cond = dict(base_r["cond"])
+                        dropped = ("" if win_key == base_key else
+                                   f"; the screening's {describe(screen_winner)} is not adopted")
+                        print(f"  -> C6 confirmation: cut by the conditioning budget before one "
+                              f"complete comparison; the base stays{dropped} "
+                              f"(--cond-budget {cond_planned} runs every stage)")
+                        confirm_note = "C6 was cut by the budget: the base, nothing confirmed"
+                    else:
+                        won, gains, bar, sd, dof = confirmation_decision(
+                            [r["score"] for r in ref],
+                            [(f, [r["score"] for r in reps]) for f, reps in groups],
+                            args.adopt_alpha)
+                        ref_mean = float(np.mean([r["score"] for r in ref]))
+                        print(f"     base             {describe(base_r)}: mean {ref_mean:.3f}")
+                        for (f, reps), gain in zip(groups, gains):
+                            role = "screening winner" if f is screen_winner else "candidate"
+                            print(f"     {role:<16} {describe(f)}: mean "
+                                  f"{np.mean([r['score'] for r in reps]):.3f} ({gain:+.3f}; "
+                                  f"screened {f['score']:.3f} on seed {fixed_seed})")
+                        top = int(np.argmax(gains))
+                        detail = (f"bar {bar:.3f} for {len(groups)} candidate(s) x "
+                                  f"{len(probe_seeds)} seeds, sd {sd:.3f} pooled over "
+                                  f"{dof} degrees of freedom")
+                        if won is not None:
+                            best_r = groups[won][0]
+                            print(f"  -> C6 confirmation: ADOPTED {describe(best_r)} "
+                                  f"({gains[won]:+.3f} over the base, {detail})")
+                        else:
+                            best_r = base_r
+                            if gains[top] > 0:
+                                print(f"  -> C6 confirmation: kept the base -- best confirmed "
+                                      f"gain {gains[top]:+.3f} is within the noise ({detail})")
+                            else:
+                                print(f"  -> C6 confirmation: kept the base -- no candidate's "
+                                      f"mean beat it on fresh seeds (best {gains[top]:+.3f}; "
+                                      f"{detail})")
+                            if win_key != base_key:
+                                print(f"     the screening's {describe(screen_winner)} won on "
+                                      f"one draw and is not confirmed")
+                        best_cond = dict(best_r["cond"])
+                        confirmation = {
+                            "seeds": list(probe_seeds), "base": describe(base_r),
+                            "base_mean": ref_mean, "screening_winner": describe(screen_winner),
+                            "bar": bar, "sd": sd, "df": dof,
+                            "finalists": [{"cond": describe(f), "screened": f["score"],
+                                           "mean": float(np.mean([r["score"] for r in reps]))}
+                                          for f, reps in groups],
+                            "adopted": won is not None, "winner": describe(best_r),
+                            "mean": ref_mean + (gains[won] if won is not None else 0.0)}
 
             if best_r:
                 print("\n  Conditioning winner:")
@@ -846,6 +1276,11 @@ def main():
                     print(f"      - {os.path.basename(r)}")
                 print(f"    score              = {best_r['score']:.3f} "
                       f"(acc {best_r['french']:.3f}, id {best_r['identity']:.3f})")
+                if confirmation:
+                    print(f"    confirmed mean     = {confirmation['mean']:.3f} on seeds "
+                          f"{' '.join(str(x) for x in confirmation['seeds'])}")
+                elif confirm_note:
+                    print(f"    ({confirm_note})")
         else:
             print("\n[*] Conditioning search disabled; using input block values.")
 
@@ -1062,7 +1497,21 @@ def main():
                 noise = max(0.01, np.hypot(best.get("sem", 0), held.get("sem", 0)))
                 print(f"  HELD-OUT score {held['score']:.3f} ±{held['sd']:.3f} "
                       f"(accent {held['french']:.3f}, identity {held['identity']:.3f})")
-                if len(held.get("per_text", [])) > 1:
+                # Sentence by sentence: with two of them the mean hid a failed
+                # one, and the median check below cannot see it either (the
+                # median of two values IS their mean).
+                for line in format_holdout_details(held.get("details")):
+                    print(line)
+                if args.holdout_wav_prefix:
+                    kept = keep_holdout_wavs(held.get("details"), args.holdout_wav_prefix)
+                    for d, path in zip(held.get("details") or [], kept):
+                        d["kept"] = path
+                    if any(kept):
+                        print("  Unseen renders kept (raw XTTS, before any tone fit):")
+                        for path in kept:
+                            if path:
+                                print(f"    {path}")
+                if len(held.get("per_text", [])) > 2:
                     gap = held["median"] - held["score"]
                     print(f"  HELD-OUT median {held['median']:.3f} "
                           f"({gap:+.3f} vs the mean)")
@@ -1074,8 +1523,18 @@ def main():
                               f"(per-sentence: "
                               f"{', '.join(f'{x:.3f}' for x in held['per_text'])}). "
                               f"Judge on the median.")
+                held_alerts = holdout_alerts(best["french"], held.get("details"), lang)
+                held["alerts"] = held_alerts
+                for k, why in held_alerts:
+                    print(f"  [!] Unseen sentence {k}: {why} -- listen to it")
                 print(f"  Search -> hold-out drop {drop:+.3f}; noise ~{noise:.3f}")
-                if drop > 2 * noise:
+                if held_alerts:
+                    print(f"  [!] The score drop alone does not show it: the accent counts "
+                          f"for {wa:.2f} of the score, and identity can rise at the same "
+                          f"time. Listen to the unseen renders, then render that sentence "
+                          f"in the Validator with two other seeds: if only seed "
+                          f"{best['seed']} fails, it is a draw, not the voice.")
+                elif drop > 2 * noise:
                     print("  [!] Some overfitting remains; use more probe texts before raising budget.")
                 else:
                     print("  [INFO] No large score drop on these held-out texts; this is not proof of voice quality or a calibrated significance test.")
@@ -1110,6 +1569,9 @@ def main():
         if held:
             print(f"  HELD-OUT score {held['score']:.3f} "
                   f"(accent {held['french']:.3f}, identity {held['identity']:.3f})")
+            if held.get("alerts"):
+                print(f"  [!] unseen sentence(s) to listen to: "
+                      f"{', '.join(str(k) for k, _ in held['alerts'])} (see HOLD-OUT above)")
         if cut_stages:
             print(f"  [!] found with a cut schedule: {', '.join(cut_stages)}")
 
@@ -1119,6 +1581,10 @@ def main():
             "params": validate(dict(win, seed=best['seed'])),
             "selected_refs": list(cwin['refs']), "all_refs": all_refs,
             "target_reference": os.path.abspath(args.reference), "language": lang,
+            "score_definition": {
+                "objective": args.objective, "w_accent": wa, "w_identity": wi,
+                "wer_normalization": ('fr_cardinal_equivalence_v1' if lang == 'FR'
+                                      else 'unicode_basic_v1')},
             "search_texts": probe_texts, "holdout_texts": holdout_texts,
             "scores": {"search": best['score'],
                        "held_out": held['score'] if held else None,
@@ -1130,6 +1596,14 @@ def main():
             "noise": {"conditioning_sd": draw_noise["cond"],
                       "sampling_sd": draw_noise["sample"],
                       "adopt_alpha": args.adopt_alpha},
+            "conditioning_confirmation": confirmation,
+            "holdout_detail": [
+                {"text": d["text"], "accent": d["accent"], "identity": d["identity"],
+                 "score": d["score"], "heard": d["heard"], "detected": d["detected"],
+                 "wer": d["wer"], "wer_raw": d.get("wer_raw"), "wav": d.get("kept")}
+                for d in ((held or {}).get("details") or [])],
+            "holdout_alerts": [{"sentence": k, "reason": why}
+                               for k, why in ((held or {}).get("alerts") or [])],
         }
         if args.result_json:
             result_path = os.path.abspath(args.result_json)

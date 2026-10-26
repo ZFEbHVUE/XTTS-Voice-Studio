@@ -246,9 +246,10 @@ class OptimizerTests(unittest.TestCase):
 
     def test_max_reference_duration_is_searched_and_exported(self):
         result, _, conditioning, _ = self.run_optimizer([
-            '--method', 'coord', '--rounds', '0', '--cond-budget', '3', '--budget', '2',
+            '--method', 'coord', '--rounds', '0', '--cond-budget', '40', '--budget', '2',
             '--max-ref-lens', '20 45', '--no-holdout'],
             score=lambda r: .9 if r['conditioning']['max_ref_len'] == 45 else .1)
+        # (A budget for C6 too: since 3.7.2 an unconfirmed winner stays out.)
         self.assertEqual(result['params']['max_ref_len'], 45)
         self.assertEqual(settings.parse_block(result['xtts_block'])['max_ref_len'], 45)
         self.assertIn(20, [c['max_ref_len'] for c in conditioning])

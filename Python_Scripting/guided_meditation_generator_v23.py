@@ -50,8 +50,9 @@ TWO bracket formats in the text file:
     'eq_low': -2,             # 80-300 Hz  (reduce rumble)
     'eq_mid': +3,             # 300-3000 Hz (boost presence)
     'eq_high': -4,            # 3000-8000 Hz (cut artifacts, keep clarity)
-    'highpass': 90,           # cut everything below 90 Hz
-    'lowpass': 8000,          # cut everything above 8 kHz
+    'highpass': 90,           # first-order: -3 dB at 90 Hz, 6 dB/octave below
+    'lowpass': 8000,          # first-order: on a 24 kHz render a treble tilt, -2.3 dB
+                              # at 4 kHz and -4.9 dB at 8 kHz, not a cut; 0 = off
     'noise_reduction': 0.5,   # noise reduction strength (0=off, 2=aggressive)
     'compression': 0.4,       # dynamic compression (0=off, 2=heavy)
     'deesser': 0.3,           # de-esser strength (0=off, 1=max)
@@ -187,8 +188,9 @@ DEFAULT_AUDIO_CONFIG = {
     'eq_low': -2,           # 80-300 Hz  (reduce rumble)
     'eq_mid': +3,           # 300-3000 Hz (boost presence)
     'eq_high': -4,          # 3000-8000 Hz (cut artifacts, keep clarity)
-    'highpass': 90,         # cut everything below 90 Hz
-    'lowpass': 8000,        # cut everything above 8 kHz
+    'highpass': 90,         # first-order: -3 dB at 90 Hz, 6 dB/octave below
+    'lowpass': 8000,        # first-order: on a 24 kHz render a treble tilt, -2.3 dB
+                            # at 4 kHz and -4.9 dB at 8 kHz, not a cut; 0 = off
     'noise_reduction': 0.5, # noise reduction strength (0=off, 2=aggressive)
     'compression': 0.4,     # dynamic compression (0=off, 2=heavy)
     'deesser': 0.3,         # de-esser strength (0=off, 1=max)
@@ -254,12 +256,16 @@ def clean_text(text):
 # Audio processing helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def apply_eq(audio_segment, graves_db=0, mediums_db=0, aigus_db=0):
+def apply_eq(audio_segment, graves_db=0, mediums_db=0, aigus_db=0, headroom_db=0.0):
     """
     Apply a 3-band equaliser via FFmpeg.
       lows   : 80-300 Hz
       mids   : 300-3000 Hz
       highs  : 3000-8000 Hz
+
+    headroom_db lowers the audio by that much BEFORE the bands, in the same
+    filter graph, so that a boost has room below full scale; the caller gives
+    it back at the volume step (see render_voice_chain).
     """
     if graves_db == 0 and mediums_db == 0 and aigus_db == 0:
         return audio_segment
@@ -271,6 +277,11 @@ def apply_eq(audio_segment, graves_db=0, mediums_db=0, aigus_db=0):
         audio_segment.export(temp_in.name, format='wav')
 
         filters = []
+        headroom_db = max(0.0, float(headroom_db or 0))
+        if headroom_db > 0:
+            filters.append(f"volume=-{headroom_db:.6g}dB")
+            print(f"      [*]  EQ headroom: -{headroom_db:.1f} dB before the boost, "
+                  f"given back at the volume step")
         if graves_db  != 0: filters.append(f"equalizer=f=120:t=h:width=160:g={graves_db}")
         if mediums_db != 0: filters.append(f"equalizer=f=1500:t=h:width=2000:g={mediums_db}")
         if aigus_db   != 0: filters.append(f"equalizer=f=5000:t=h:width=3000:g={aigus_db}")
@@ -280,7 +291,8 @@ def apply_eq(audio_segment, graves_db=0, mediums_db=0, aigus_db=0):
             # 16-bit audio: measured on a voice peaking at -1 dBFS, +4 dB was
             # enough to clip 1-2 % of the samples, before the volume and the
             # final limiter could do anything. Overs are limited here instead;
-            # below full scale the limiter does nothing.
+            # below full scale the limiter does nothing. With headroom_db the
+            # boost stays under full scale and this is only a safety net.
             filters.append(_limiter_filter())
 
         subprocess.run(
@@ -333,7 +345,13 @@ def _trailing_silence_ms(seg, floor_db=-45.0, max_ms=1200):
 
 
 def apply_filters(audio_segment, highpass_hz=0, lowpass_hz=0):
-    """Apply high-pass and low-pass filters."""
+    """Apply high-pass and low-pass filters (0 = off).
+
+    pydub's first-order RC filters, 6 dB/octave. At the 24 kHz of an XTTS
+    render the low-pass is a tilt of the whole upper band, not a cut above
+    lowpass_hz: lp 9000 takes 2.1 dB at 4 kHz and 4.5 dB at 8 kHz
+    (ltas_match.rc_lowpass_db models both filters exactly).
+    """
     if highpass_hz > 0: audio_segment = audio_segment.high_pass_filter(highpass_hz)
     if lowpass_hz  > 0: audio_segment = audio_segment.low_pass_filter(lowpass_hz)
     return audio_segment
@@ -632,7 +650,7 @@ def apply_limiter(audio_segment):
     return apply_gain_and_limit(audio_segment, 0.0, limiter=True)
 
 
-def process_audio(audio_segment, config, xtts_params, limiter=True):
+def process_audio(audio_segment, config, xtts_params, limiter=True, eq_headroom_db=0.0):
     """
     Effects stage (per sentence):
     Trim -> Filters -> EQ -> NR -> De-esser -> Compression -> NoiseGate -> Reverb -> Fades -> Pan [-> Limiter]
@@ -686,7 +704,8 @@ def process_audio(audio_segment, config, xtts_params, limiter=True):
     audio_segment = apply_eq(audio_segment,
                                   graves_db=config['eq_low'],
                                   mediums_db=config['eq_mid'],
-                                  aigus_db=config['eq_high'])
+                                  aigus_db=config['eq_high'],
+                                  **({'headroom_db': eq_headroom_db} if eq_headroom_db else {}))
 
     # 4. Noise reduction
     audio_segment = apply_noise_reduction(audio_segment, force=config['noise_reduction'])
@@ -749,11 +768,32 @@ def render_voice_chain(audio_segment, config, xtts_params):
     after it, unprotected. The comparator, the validator and test_truncation
     call this same function, so the chain they measure cannot drift from the
     one the generator renders.
+
+    A boosting EQ writes 16-bit audio, so its overs were limited at full
+    scale -- BEFORE the volume step. Measured on a real fit (eq_mid +3.3,
+    eq_high +4, volume -2): the loudest peaks were clamped at -0.1 dBFS and
+    came out at -2.1 dBFS, up to 2 dB of peaks taken for nothing. So the EQ
+    now takes its boost off first and the volume step gives it back, in
+    floating point, right before the one limiter that matters. Only when
+    nothing after the EQ depends on the absolute level: noise reduction,
+    compression and the gate do (their thresholds are in dBFS), the de-esser,
+    reverb, fades and pan do not. With any of the three on, or the limiter
+    off, nothing changes.
     """
-    audio_segment = process_audio(audio_segment, config, xtts_params, limiter=False)
-    audio_segment = apply_speed_rubberband(audio_segment, config['speed'])
     limit = bool(config.get('limiter', 0))
-    audio_segment = apply_gain_and_limit(audio_segment, config.get('volume', 0), limiter=limit)
+    headroom = 0.0
+    if limit and not (float(config.get('noise_reduction', 0) or 0) > 0
+                      or float(config.get('compression', 0) or 0) > 0
+                      or float(config.get('noise_gate', 0) or 0) < 0):
+        headroom = sum(max(0.0, float(config.get(k, 0) or 0))
+                       for k in ('eq_low', 'eq_mid', 'eq_high'))
+    extra = {'eq_headroom_db': headroom} if headroom > 0 else {}
+    audio_segment = process_audio(audio_segment, config, xtts_params, limiter=False, **extra)
+    audio_segment = apply_speed_rubberband(audio_segment, config['speed'])
+    gain = config.get('volume', 0)
+    if headroom > 0:
+        gain = float(gain or 0) + headroom
+    audio_segment = apply_gain_and_limit(audio_segment, gain, limiter=limit)
     if limit:
         print(f"      [*]  Volume {float(config.get('volume', 0)):+.1f} dB, limiter: on")
     return audio_segment
@@ -879,10 +919,25 @@ def is_params_xtts_bracket(segment):
     return s.startswith('{') and s.endswith('}')
 
 
+def xtts_block_voice(segment):
+    """Voice number of a {N, ...} block: its first field."""
+    return int(segment.strip()[1:-1].split(',')[0])
+
+
 def parse_xtts_params(segment, base_params):
     """Read historical and extended blocks. Seed 0, booleans and top_k=0 are literal."""
     voice_num = int(segment.strip()[1:-1].split(',')[0])
     return voice_num, generator_params(segment, base_params)
+
+
+def xtts_block_params(segment, params_by_voice, default):
+    """(voice, params) of a {N, ...} block. The fields it leaves out come from
+    voice N's own last settings, as the README says of short blocks -- not
+    from the voice in use: a short {2, 17} met while voice 1 was speaking
+    gave voice 2 the settings of voice 1 with seed 17."""
+    voice = xtts_block_voice(segment)
+    return parse_xtts_params(
+        segment, params_by_voice.get(voice, params_by_voice.get(0, default)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1190,6 +1245,11 @@ def process_parallel_block(inner_segments, voice_files, tts_instances,
     cur_voice = 1
     cur_config = DEFAULT_AUDIO_CONFIG.copy()
     cur_xtts   = xtts_params_by_voice.get(1, xtts_params_by_voice.get(0, DEFAULT_XTTS_PARAMS.copy()))
+    # The {N, ...} blocks written inside this block, per voice. The documented
+    # layout puts {N, ...} BEFORE [N, ...], and the [N, ...] used to reload the
+    # settings from outside the block: every {} written here was discarded.
+    # They stay local to the block, as before.
+    local_xtts = {}
 
     def ensure_track(vn):
         if vn not in tracks:
@@ -1203,11 +1263,10 @@ def process_parallel_block(inner_segments, voice_files, tts_instances,
 
         # XTTS params block  {N, ...}
         if is_params_xtts_bracket(seg):
-            vn, new_params = parse_xtts_params(
-                seg,
-                xtts_params_by_voice.get(cur_voice, xtts_params_by_voice.get(0, DEFAULT_XTTS_PARAMS.copy()))
-            )
+            vn, new_params = xtts_block_params(
+                seg, {**xtts_params_by_voice, **local_xtts}, DEFAULT_XTTS_PARAMS.copy())
             if vn and vn <= len(voice_files):
+                local_xtts[vn] = new_params
                 cur_voice = vn
                 cur_xtts  = new_params
                 print(f"  [PARALLEL] XTTS params -> voice {vn}")
@@ -1220,7 +1279,8 @@ def process_parallel_block(inner_segments, voice_files, tts_instances,
             if vn and vn <= len(voice_files):
                 cur_voice  = vn
                 cur_config = cfg
-                cur_xtts   = xtts_params_by_voice.get(vn, xtts_params_by_voice.get(0, DEFAULT_XTTS_PARAMS.copy()))
+                cur_xtts   = local_xtts.get(vn, xtts_params_by_voice.get(
+                    vn, xtts_params_by_voice.get(0, DEFAULT_XTTS_PARAMS.copy())))
 
         # Punctual sound. It cannot be generated here: the main loop schedules
         # music at an ABSOLUTE position and overlays it at the end, and a
@@ -1600,10 +1660,8 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
 
         # ── XTTS params block  {N, seed, ...}  ───────────────────────────────
         elif segment.startswith('{') and segment.endswith('}'):
-            voice_num, new_params = parse_xtts_params(
-                segment,
-                xtts_params_by_voice.get(current_voice, xtts_params_by_voice.get(0, DEFAULT_XTTS_PARAMS.copy()))
-            )
+            voice_num, new_params = xtts_block_params(
+                segment, xtts_params_by_voice, DEFAULT_XTTS_PARAMS.copy())
             if voice_num and voice_num <= len(voice_files):
                 xtts_params_by_voice[voice_num] = new_params
                 if voice_num == current_voice:

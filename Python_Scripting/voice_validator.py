@@ -181,17 +181,21 @@ def main():
 
     # Separate language from voice refs
     voice_refs = args.voice_refs
-    lang = args.lang
-    if lang is None:
+    asked = args.lang
+    if asked is None:
         # Last positional arg might be a language code
         if voice_refs and voice_refs[-1].upper() in (
             'FR','EN','ES','DE','IT','PT','PL','TR','RU','NL','CS','AR','ZH-CN','HU','KO','JA','HI'
         ):
-            lang = voice_refs[-1].upper()
+            asked = voice_refs[-1].upper()
             voice_refs = voice_refs[:-1]
-        else:
-            lang = 'FR'
-            print(f"[!] No language specified, defaulting to FR")
+    # The [] block may name it instead (they must agree); FR when neither does.
+    from voice_comparator import block_language, resolve_language
+    lang, mismatch = resolve_language(asked, args.audio_block)
+    if mismatch:
+        parser.error(mismatch)
+    if not asked and not (args.audio_block and block_language(args.audio_block)):
+        print(f"[!] No language specified, defaulting to FR")
 
     # Validate voice refs
     for ref in voice_refs:
@@ -235,7 +239,7 @@ def main():
         try:
             from voice_comparator import parse_audio_block
             parsed_audio = parse_audio_block(args.audio_block)
-            lang = parsed_audio.pop('lang')
+            parsed_audio.pop('lang')        # resolved above, with the command's
             base_params.update(parsed_audio)
             print(f"[*] Audio block parsed: lang={lang}")
         except (ValueError, TypeError) as exc:
@@ -305,8 +309,15 @@ def main():
                 max_ref_len=key[2], sound_norm_refs=key[3])
         return _lat_cache[key]
 
+    # The text XTTS actually receives. The generator strips the final
+    # punctuation and the pitch marks before rendering (clean_text); the
+    # validator rendered the raw text, so the same sentence and seed gave a
+    # different take here and in the script, and a seed chosen here did not
+    # reproduce there. Set from the generator's own function once it loads.
+    spoken = [args.text]
+
     def gen_variant(params, out_path):
-        XC.generate(model, args.text, lang, _latents_for(params), out_path,
+        XC.generate(model, spoken[0], lang, _latents_for(params), out_path,
                     temperature=float(params.get('temp', 0.65)),
                     length_penalty=float(params.get('len_pen', 1.0)),
                     repetition_penalty=float(params.get('rep_pen', 5.0)),
@@ -332,6 +343,14 @@ def main():
             try:
                 _spec.loader.exec_module(_gmg)
                 _render_chain = getattr(_gmg, 'render_voice_chain', None)
+                _clean = getattr(_gmg, 'clean_text', None)
+                if _clean:
+                    spoken[0] = _clean(args.text) or args.text
+                    if spoken[0] != args.text:
+                        print(f"[*] Text as the generator renders it: {spoken[0]}")
+                else:
+                    print("[!] The generator has no clean_text: the text is rendered as "
+                          "typed, which can differ from the script's render.")
                 if _render_chain:
                     print("[*] Render chain imported from generator")
                 else:
@@ -476,7 +495,7 @@ def main():
                     rec = {'combo': list(zip(param_keys, combo)),
                            'fr': None, 'detected': '', 'wer': None, 'cos': None}
                     if pron is not None:
-                        pr = pron.score(scored_path, lang=lang, target_text=args.text)
+                        pr = pron.score(scored_path, lang=lang, target_text=spoken[0])
                         rec['fr'] = pr['score']; rec['detected'] = pr['detected']; rec['wer'] = pr['wer']
                     if enc is not None:
                         rec['cos'] = enc.cosine(ref_emb, enc.embed(scored_path))
