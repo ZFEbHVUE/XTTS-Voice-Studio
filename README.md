@@ -31,6 +31,53 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## What's new
 
+**3.7.5 — a small reverb renders**
+
+- The generator rounds the reverb's three echo decays to two decimals, and
+  FFmpeg's `aecho` refuses a decay of 0: any `reverb` below 0.028 failed with
+  "Reverb error" and the voice came out dry. The five failed trials of a real
+  audio search were all such values. The decays now stop at 0.01, an echo
+  40 dB down; from 0.028 on, the filter is the same as before. 302 tests.
+
+**3.7.4 — a review of 3.7.3 (ChatGPT): one adoption bar, budgets checked first**
+
+- The audio search adopts a block on the same bar with or without
+  `--screen-audio`: a mean gain above both 0.02 and twice the measured
+  tolerance. In 3.7.3 the diagnostic changed the decision: with it the bar was
+  twice its tolerance, which could fall to 0.008; without it, 0.02 whatever the
+  tolerance.
+- The pipeline and both tabs check the budget of the search before starting
+  (68 evaluations at most with every field and no target level): a budget too
+  small for `--search-all-fields` used to stop the pipeline only at the tone
+  fit, after the curation, the analysis and the optimiser.
+- **Include speed, pan and limiter** in [Auto] and [Cmp] does what
+  `--search-all-fields` does. The budget check now also holds at an EQ limit
+  of exactly 0.5 dB, where it counted 3 trials too few. 300 tests.
+
+**3.7.3 — the search of every `[]` field (ChatGPT), pruned and held**
+
+- From ChatGPT's version built on 3.7.2: `--optimise-audio` tries each field of
+  `[]` on its own, effects that are off included (hp, lp and the gate have a
+  real off state), then searches them jointly against ECAPA identity. A
+  candidate is adopted only if it gains on two other sentences, whose renders
+  are kept with a JSON audit; with `--target-dbfs` the level is measured after
+  the effects; an effect that fails is no longer scored as a trial.
+- The block is adopted as a whole, so a field that does nothing kept whatever
+  value the optimiser left it at. With a simulated ECAPA where only `eq_mid`
+  mattered, through the real search and adoption rule, every adopted block
+  also moved the speed (from 0.9 to anywhere in 0.76–1.23), the pan (up to
+  0.96), the reverb and the NR. A **pruning** pass now sends each change back
+  to its starting value unless that costs more than the heuristic tolerance,
+  one tolerance in all: `eq_mid` alone changes, its gain is kept.
+- **Speed, pan and limiter are held** (`--search-all-fields` frees them): the
+  speed is the meditation's pace, which ECAPA does not measure; ECAPA averages
+  both channels, so pan is only a gain to it; the limiter protects against
+  clipping.
+- The search is **off by default** in the pipeline and both tabs: hundreds of
+  renders (1.25–1.6 s each for 8 s of voice on two CPU cores, two per trial at
+  a target level) whose result has to be heard. A failed search keeps the tone
+  fit and the pipeline goes on; the recap names it. 288 tests.
+
 **3.7.2 — the Comparator compares smoothed spectra; a review of 3.7.1 merged**
 
 - Below about 1 kHz a voice's long-term spectrum is a comb: the harmonics of
@@ -330,7 +377,8 @@ XTTS-Voice-Studio/
 │   ├── xtts_clone.py                       # Low-level XTTS gen honouring all cloning knobs
 │   ├── voice_analyser.py                   # Acoustic analysis → XTTS priors
 │   ├── voice_validator.py                  # Param sweep + intelligibility/identity scoring
-│   ├── voice_comparator.py                 # Closed-loop EQ/vol fit (LTAS, least squares)
+│   ├── voice_comparator.py                 # Closed-loop EQ/vol fit (LTAS, least squares), ECAPA search of []
+│   ├── audio_parameter_search.py           # Trials, joint search and pruning of the [] fields
 │   ├── xtts_optimize.py                    # Conditioning + sampling search, noise-aware
 │   ├── search_plan.py                      # Search schedule and budget arithmetic ([Auto] auto buttons)
 │   ├── xtts_pipeline.py                    # One-shot: curate -> analyse -> optimise -> fit
@@ -411,7 +459,8 @@ Options (the safeguards below them are always on):
 | Control | CLI | Effect |
 |---|---|---|
 | Screen audio params | `--screen-audio` | Which knobs move identity for this voice |
-| Optimise audio | `--optimise-audio nelder\|de` | Joint search of the audio block, transfer-tested |
+| Audio search | `--optimise-audio nelder\|de` | Off by default: every free `[]` field tried, then searched jointly against ECAPA, pruned, and tested on two other sentences (see [Audio search](#audio-search---optimise-audio)); budget per EQ fit with `--optimise-budget` |
+| Include speed, pan and limiter | `--search-all-fields` | Let the audio search change these three too (held otherwise); selects `nelder` if the search was off |
 | Priority | `--w-accent`, `--w-identity`, `--objective` | Resemblance (0.3 / 0.7, `both`, the default) or Balanced (0.6 / 0.4, `identity`); Custom once a field is edited |
 | EQ weighting | `--eq-weighting a+blend` | Where EQ errors count; several weightings give several tone fits of the same clone (`a+blend` by default in the tab) |
 | Target dBFS | `--target-dbfs -20` | Absolute render level, −20 by default in the tab; empty matches each reference |
@@ -664,6 +713,7 @@ Takes a **frozen** `{}` block (seed/temp chosen upstream) and fits only the post
 - Each pass renders the generator's own chain and is **kept only if the measured spectrum actually improves**.
 - Writes the untouched XTTS render (`--output-raw`) next to the base and fitted renders; **Clone refs (optional)** separates the cloning references from the comparison target.
 - No seed search, no tuning of `{}` (that is the Validator's and the Optimiser's job).
+- **Audio search** (off by default), **Audio budget** and **Target dBFS** run the [audio search](#audio-search---optimise-audio) after the tone fit; **Include speed, pan and limiter** lets it change those three too.
 - `[]` Audio params field updates automatically with the fitted block.
 
 ---
@@ -1150,7 +1200,7 @@ fit predicted, any filter change, and whether it was kept.
 - The LS fit is perceptually weighted (A-weighting): errors are penalised where the ear hears them (~1–5 kHz) rather than uniformly across the spectrum.
 - `--raw-clone WAV` fits on an existing untouched render (the `--output-raw` of an earlier run) instead of generating one, and `--reference-interval BEGIN END` gives the stretch of the reference to compare with: a second fit then works on the very same clone and words, without loading XTTS. The pipeline's `a+blend` uses both.
 - `--target-dbfs -20` switches the volume fit to an absolute production level instead of matching the reference. Use it whenever the reference is quiet: matching a -33 dBFS reference produces an unusable meditation level (the fitted `vol` was the honest match, not a good render level).
-- comp and de-ess are now fitted by measurement too (crest factor and 5–8 kHz sibilance vs the reference), each kept only if the measured gap actually shrinks — `--no-fit-dynamics` disables it. NR, reverb, noise_gate and pan stay at 0 by design: no measurable target, and the gate chops speech.
+- comp and de-ess are now fitted by measurement too (crest factor and 5–8 kHz sibilance vs the reference), each kept only if the measured gap actually shrinks — `--no-fit-dynamics` disables it. The tone fit leaves NR, reverb, noise_gate and pan as given: no measurable target, and the gate chops speech. The audio search below tries NR, reverb and the gate against ECAPA; listen for clipped word endings if it adopts a gate.
 - `eq_*` and `vol` in the input `[]` are overwritten by the fit; `hp`/`lp` start from the block and are adjusted at most once (first pass), a low-pass switched off when the fit is better without it; `NR` is kept from the block, `comp`/`de-ess` too unless the dynamics fit changes them.
 - The `{}` is never modified — fix seed/temp in the Validator first.
 
@@ -1172,6 +1222,53 @@ closely; they diverge when a clone is wrong where the reference is quiet.
 their fundamental, a voice at 220 Hz barely more (0.32). So a voice's pitch does
 not settle the choice. The pipeline's `--eq-weighting a+blend` fits the same
 clone both ways, for a blind A/B.
+
+### Audio search (`--optimise-audio`)
+
+After the tone fit, an optional search of `[]` against ECAPA identity
+(`nelder`, or `de` for a global search first). It is off by default; the budget
+(`--optimise-budget`, default 400) counts every render it scores. The pipeline
+and both tabs check before starting that it covers every trial and the
+pruning: 68 evaluations at most for a search of all the fields without a
+target level, 64 with one.
+
+1. Every free field is tried on its own, the effects that are off included:
+   hp, lp and the gate have an off state next to their active range, so the
+   search cannot turn `lp 0` into a 6 kHz low-pass by clipping it into a range.
+2. The one-factor winners are combined, then refined jointly (Nelder-Mead;
+   with `de`, differential evolution first).
+3. **Pruning.** The block is adopted or rejected as a whole, so a field that
+   does nothing for the score would keep whatever value the optimiser left it
+   at. Each changed field goes back to its starting value when the block
+   without its change still scores within the heuristic tolerance (half the
+   identity spread between the two halves of the render, 0.004 at least) of
+   the best found. The floor is fixed, so pruning costs one tolerance at most;
+   one evaluation per field is reserved for it.
+4. The pruned block must gain on each of **two other sentences**, by a mean
+   above both 0.02 and twice the tolerance, and above 40 % of the gain on the
+   fitting sentence. `--screen-audio` is a diagnostic and leaves this bar as it
+   is. Their renders are kept next to the
+   clone (`*_audio_holdout1_raw.wav`, `_base.wav`, `_candidate.wav`) with
+   `*_audio_search.json`: values tried, failures, pruning, validation, decision.
+
+**Speed, pan and limiter are held** at the block's values (`--search-all-fields`,
+or **Include speed, pan and limiter** in [Auto] and [Cmp], frees them; ticking
+the box also selects `nelder` when the search was off). The speed is the
+meditation's pace: the Analyser derives it from
+the measured syllable rate and a target pace, and ECAPA does not measure pace.
+ECAPA averages the two channels, so pan is only a gain to it. The limiter
+protects against clipping. With `--target-dbfs`, `vol` is not searched either:
+each trial is rendered, its RMS measured over both channels and the gain
+corrected until it is within 0.35 dB of the target, so the level stays the
+target's whatever the effects do.
+
+An effect the generator reports as failed (FFmpeg missing; EQ, NR, de-esser,
+reverb, gate or limiter error) fails the trial instead of scoring unprocessed
+audio. If the search itself fails, the tone-fitted block is kept and the run
+goes on; the pipeline's recap names the failure.
+
+ECAPA is a speaker-recognition score: it does not hear naturalness, pace or
+comfort. Listen to the validation renders before keeping a searched block.
 
 ### Fixes worth knowing about
 
@@ -1681,10 +1778,11 @@ python -m unittest -v test_clonage_regressions test_complements_regressions \
     test_timbre_regressions test_holdout_report_regressions \
     test_eq_headroom_regressions test_small_fixes_regressions \
     test_script_blocks_regressions test_confirmation_regressions \
-    test_language_contract_regressions test_pron_numbers_regressions
+    test_language_contract_regressions test_pron_numbers_regressions \
+    test_audio_parameter_search_regressions test_audio_search_review_regressions
 ```
 
-259 regression tests, no model download needed: XTTS, Whisper, ECAPA,
+302 regression tests, no model download needed: XTTS, Whisper, ECAPA,
 SepFormer, pyannote, MFA, Applio and Rubber Band are simulated, so the tests
 check parsing, routing, budgets, decisions and the audio chain — not voice
 quality. The render tests drive the generator's own functions through the real
@@ -1696,8 +1794,10 @@ concludes; the [Auto] tab's buttons are driven with stand-in widgets. The timbre
 voices and real FFmpeg EQ (skipped without librosa; the Praat case needs
 parselmouth). The tone-fit tests run the Comparator's fit through an exact model
 of the render chain, on noise and on synthetic harmonic voices, and once through
-the generator's own. Each fix and addition of 3.3 to 3.7.2 was checked by putting
-its bug back: every one makes at least one test fail.
+the generator's own. The audio-search tests give the score known effects plus a
+small render-to-render perturbation, so they check what the search, the pruning
+and the adoption keep. Each fix and addition of 3.3 to 3.7.5 was checked by
+putting its bug back: every one makes at least one test fail.
 
 ---
 

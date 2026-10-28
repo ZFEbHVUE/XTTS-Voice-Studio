@@ -462,10 +462,14 @@ def apply_reverb(audio_segment, wet=0.3):
         audio_segment.export(temp_in.name, format='wav')
         w     = min(1.0, wet)
         # Multi-tap echo: three reflections at 25ms / 50ms / 80ms
-        # Decay scaled by wet level; out_gain reduced to avoid clipping
-        d1    = round(w * 0.45, 2)
-        d2    = round(w * 0.30, 2)
-        d3    = round(w * 0.18, 2)
+        # Decay scaled by wet level; out_gain reduced to avoid clipping.
+        # aecho refuses a decay of 0 ("out of allowed range: (0, 1]"): rounded
+        # to two decimals, any wet below 0.028 gave one, and the voice came out
+        # dry with a "Reverb error". The floor, 0.01, is an echo 40 dB down;
+        # from 0.028 on, the filter is the one rendered before.
+        d1    = max(0.01, round(w * 0.45, 2))
+        d2    = max(0.01, round(w * 0.30, 2))
+        d3    = max(0.01, round(w * 0.18, 2))
         out_g = round(max(0.5, 0.95 - w * 0.15), 2)
         flt   = f"aecho=0.8:{out_g}:25|50|80:{d1}|{d2}|{d3}"
         subprocess.run(

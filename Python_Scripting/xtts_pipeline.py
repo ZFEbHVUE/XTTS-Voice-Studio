@@ -54,7 +54,16 @@ RE_XTTS  = re.compile(r'^\s*(\{\s*\d[^}]*\})\s*$', re.M)   # "  {1, 42, ...}"
 RE_AUDIO = re.compile(r'^\s*(\[\s*\d[^\]]*\])\s*$', re.M)  # "  [1, FR, ...]"
 RE_NEXT  = re.compile(r'Next \[\]\s*:\s*(\[[^\]]*\])')
 RE_FIT   = re.compile(r'^\[\*\] Fit input: (\{.*\})\s*$', re.M)
+# The comparator's line when its --optimise-audio search fails (the tone fit is kept).
+AUDIO_SEARCH_FAILED = '[!] Audio search failed:'
+RE_AUDIO_REPORT = re.compile(r'^\[\*\] Audio-search report: (.+?)\s*$', re.M)
 EQ_WEIGHTINGS = ('a', 'voice', 'blend')
+
+
+def _audio_report(output):
+    """Path of the audio-search JSON a comparator run wrote, or None."""
+    match = RE_AUDIO_REPORT.search(output)
+    return match.group(1) if match else None
 
 
 def eq_weightings(text):
@@ -190,8 +199,15 @@ def main():
                    help='Comparator: sensitivity screening of each audio parameter '
                         '(which knobs move identity for this voice)')
     p.add_argument('--optimise-audio', default='none', choices=['none','nelder','de'],
-                   help='Comparator: derivative-free optimisation of the audio block '
-                        'against ECAPA identity (validated on an unseen sentence)')
+                   help='Comparator: trial of every free audio field, joint search '
+                        'against ECAPA, pruning, validation on two sentences '
+                        '(default: none = tone fit only)')
+    p.add_argument('--optimise-budget', type=int, default=400,
+                   help='Comparator: strict fit evaluation budget per EQ alternative, '
+                        'including the all-field trial and the pruning (default: 400)')
+    p.add_argument('--search-all-fields', action='store_true',
+                   help='Comparator: let --optimise-audio change speed, pan and '
+                        'limiter too (held by default: ECAPA cannot judge them)')
     p.add_argument('--beam-width', type=int, default=3,
                    help='Beam width for --probe-beams (2 on a 4 GB card)')
     p.add_argument('--probe-beams', action='store_true',
@@ -199,6 +215,15 @@ def main():
     p.add_argument('--whisper-model', default='small')
     p.add_argument('--device', default=None, help='cpu or cuda (default: auto)')
     args = p.parse_args()
+    if args.optimise_audio != 'none' and args.optimise_budget < 64:
+        p.error('optimise-budget must be at least 64 for an all-field search')
+    if args.optimise_audio != 'none':
+        from audio_parameter_search import EDITORIAL_FIELDS, worst_case_budget
+        held = {} if args.search_all_fields else EDITORIAL_FIELDS
+        need = max(64, worst_case_budget(4., args.target_dbfs is not None, held))
+        if args.optimise_budget < need:
+            p.error(f'optimise-budget must be at least {need} for this search '
+                    '(every free field tried, then pruned)')
 
     py = sys.executable
     S = lambda name: os.path.join(SCRIPT_DIR, name)
@@ -374,7 +399,10 @@ def main():
         if args.fit_identity:
             shared += ['--fit-identity']
         if args.optimise_audio != 'none':
-            shared += ['--optimise-audio', args.optimise_audio]
+            shared += ['--optimise-audio', args.optimise_audio,
+                       '--optimise-budget', str(args.optimise_budget)]
+            if args.search_all_fields:
+                shared += ['--search-all-fields']
         if args.device:
             shared += ['--device', args.device]
         cmd += shared
@@ -386,6 +414,12 @@ def main():
         m = RE_NEXT.search(out)
         if rc != 0 or not m:
             sys.exit(f"[ERR] Comparator failed for voice {n}")
+        # A failed audio search leaves the tone fit, a complete result: the run
+        # goes on, and the recap repeats the failure, which scrolls away.
+        search_failed = []
+        if args.optimise_audio != 'none' and AUDIO_SEARCH_FAILED in out:
+            search_failed.append(dict(weighting=args.eq_weighting[0],
+                                      report=_audio_report(out)))
         audio_fit = m.group(1)
 
         # Further EQ weightings: the SAME clone fitted again, against the same
@@ -420,6 +454,8 @@ def main():
                 print(f"[!] The '{weighting}' tone fit failed for voice {n}: "
                       f"only '{args.eq_weighting[0]}' is kept")
                 continue
+            if args.optimise_audio != 'none' and AUDIO_SEARCH_FAILED in out_alt:
+                search_failed.append(dict(weighting=weighting, report=_audio_report(out_alt)))
             alternatives.append(dict(weighting=weighting, clone=alt_out,
                                      audio=set_lang(renumber(m_alt.group(1), n), lang)))
 
@@ -434,7 +470,7 @@ def main():
                             scores=_sc, acoustics=_acoustics, references=clone_refs,
                             cut=_cut, weighting=args.eq_weighting[0],
                             alternatives=alternatives, unseen=_unseen, alerts=_alerts,
-                            confirmation=_confirm))
+                            confirmation=_confirm, search_failed=search_failed))
 
     # ── Final recap ───────────────────────────────────────────────────────────
     print(f"\n\n{'='*70}\n  [*] PIPELINE COMPLETE — READY TO PASTE\n{'='*70}")
@@ -464,6 +500,9 @@ def main():
         for alert in r.get('alerts') or []:
             print(f"  # [!] Unseen sentence {alert.get('sentence')}: {alert.get('reason')}"
                   f" -- listen to it before generating")
+        for failure in r.get('search_failed') or []:
+            print(f"  # [!] Audio search failed ('{failure['weighting']}' fit): its [] is "
+                  f"the tone fit -- see {failure['report'] or 'the comparator log'}")
         for a in r.get('alternatives') or []:
             # Commented out: pasting the recap must give one [] per voice.
             print(f"  # Same clone, tone fit with EQ weighting '{a['weighting']}' instead "

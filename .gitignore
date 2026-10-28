@@ -8,3 +8,10 @@ Voices_Cloning/*.wav
 __pycache__/
 *.pyc
 RVC_datasets/
+*:Zone.Identifier
+Logs/
+Voice_Presets/
+Meditation_Projects/
+Voices_Cloning/*.json
+SHA256SUMS
+*.7z

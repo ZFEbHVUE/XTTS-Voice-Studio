@@ -188,6 +188,37 @@ class RenderChainTests(unittest.TestCase):
         self.assertTrue(any('limiter skipped' in line for line in ns['printed']))
 
     @needs_audio
+    def test_a_small_reverb_renders_instead_of_failing(self):
+        # aecho refuses a decay of 0; rounded to two decimals, a wet below
+        # 0.028 gave one, and the voice came out dry with a "Reverb error"
+        # (five failed trials of a real audio search, all reverb 0.002-0.02).
+        ns = generator_namespace()
+        seg = voice_like(-12.0)
+        for wet in (.002, .01, .02, .027):
+            with self.subTest(wet=wet):
+                ns['printed'].clear()
+                ns['apply_reverb'](seg, wet)
+                self.assertFalse([line for line in ns['printed'] if 'error' in line.lower()])
+
+    def test_the_reverb_filter_is_unchanged_from_0_028_on(self):
+        graphs = []
+        def run(cmd, **kw):
+            graphs.append(cmd[cmd.index('-af') + 1])
+            shutil.copyfile(cmd[cmd.index('-i') + 1], cmd[-1])
+            return types.SimpleNamespace(returncode=0)
+        ns = generator_namespace(subprocess=types.SimpleNamespace(
+            run=run, SubprocessError=subprocess.SubprocessError,
+            CalledProcessError=subprocess.CalledProcessError))
+        if AudioSegment is None:
+            self.skipTest('pydub is needed to export the segment')
+        seg = voice_like(-12.0)
+        for wet in (.002, .028, .3):
+            ns['apply_reverb'](seg, wet)
+        self.assertEqual(graphs, ['aecho=0.8:0.95:25|50|80:0.01|0.01|0.01',
+                                  'aecho=0.8:0.95:25|50|80:0.01|0.01|0.01',
+                                  'aecho=0.8:0.9:25|50|80:0.14|0.09|0.05'])
+
+    @needs_audio
     def test_eq_boost_is_limited_instead_of_clipped(self):
         ns = generator_namespace()
         seg = voice_like(-1.0)

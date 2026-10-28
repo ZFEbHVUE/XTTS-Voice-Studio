@@ -11,6 +11,197 @@ measured. The [README](README.md) describes how the tools work now.
 
 ---
 
+## 3.7.5 — 2026-10-28 — a small reverb renders
+
+Prompted by the audio-search report of a real run (Vivienne, every field
+searched): 5 of its 240 trials failed, all with `reverb` between 0.002 and
+0.02 and the same FFmpeg error, exit status 234.
+
+- `apply_reverb` builds `aecho=0.8:<out>:25|50|80:<d1>|<d2>|<d3>` with the
+  decays 0.45, 0.30 and 0.18 times `wet`, rounded to two decimals, and
+  `aecho` accepts decays in (0, 1] only ("decay[2]: 0.000000 is out of
+  allowed range"). Any `wet` below 0.028 rounded one of them to 0: the effect
+  failed, the generator printed "Reverb error" and rendered the voice dry. The
+  search counted these trials as failed, as it should; a `[]` written by hand
+  with such a value lost its reverb in the meditation.
+- The decays now stop at 0.01, an echo 40 dB down. From 0.028 on, the filter
+  string is the one rendered before, so existing blocks sound the same.
+
+### Tests
+
+- 2 new tests (302 in all): small reverbs render through the real FFmpeg
+  without an error; the filter is unchanged from 0.028 on. Both fail without
+  the fix.
+
+---
+
+## 3.7.4 — 2026-10-28 — a review of 3.7.3 (ChatGPT): one adoption bar, budgets checked first
+
+ChatGPT's corrige6 was computed against 3.7.3 and applies to it without a
+conflict; its code is taken unchanged, as the first commit of this version.
+It changes four files; every other one is 3.7.3's, byte for byte, and the 19
+checks of 3.7.3 still fail when their bug is put back.
+
+### From ChatGPT's corrige6
+
+- **One adoption bar.** A searched block needs a mean gain on the two other
+  sentences above both 0.02 and twice the measured tolerance, with or without
+  `--screen-audio`. In 3.7.3 the diagnostic changed the decision: with it the
+  bar was twice the screening's tolerance, down to 0.008; without it, 0.02
+  whatever the tolerance. The JSON records the rule.
+- **Budgets checked before anything runs.** The pipeline checks at its start
+  the budget a search needs with the fields it may change: 68 evaluations at
+  most with every field and no target level, 64 with one. With
+  `--search-all-fields` and a budget of 64 to 67, 3.7.3 found out at the tone
+  fit, after the curation, the analysis and the optimiser, and stopped.
+- `worst_case_budget()` probes the EQ at half its limit (beyond the limit when
+  rounding to the exported precision would put that on the grid). At an EQ
+  limit of exactly 0.5 dB, 3.7.3's probe sat on the grid and the bound came out
+  3 evaluations short (65 for 68).
+- **Include speed, pan and limiter** in [Auto] and [Cmp] passes
+  `--search-all-fields`; ticking it selects `nelder` when the search was off.
+  Both tabs check the budget the same way.
+- A split-half identity score that is not finite is refused instead of
+  falling back on the floor (`max(0.004, nan)` gives 0.004); the search then
+  fails and the tone fit is kept. The docstring now says the halves differ by
+  their words too: the tolerance is a heuristic, not a confidence interval.
+
+### Added here
+
+- Two tests corrige6 did not have: the [Auto] tab refusing a full search's
+  budget of 64 without a target level (and taking it with one), and a block
+  fitted with the default limit, then searched with a tiny one, whose EQ
+  values are off the grid.
+- README for the box, the adoption bar and the budget check. The two French
+  delivery notes of corrige6 are folded into this entry, as in 3.7.3.
+
+### Tests
+
+- 300 tests: 3.7.3's 288, corrige6's 10, the 2 above. corrige6's changes were
+  checked by putting each bug back, 14 cases: 13 make at least one test fail,
+  two of them only with the tests added here; the fourteenth changes nothing
+  the code can reach (the EQ probe at 0.5 dB, which the rounding fallback
+  covers).
+
+### Upgrading to 3.7.4
+
+Install `audio_parameter_search.py`, `voice_comparator.py`, `xtts_pipeline.py`
+and `xtts_studio.py` together, with the test files. A searched block is now
+held to a bar at least as high as before, higher when the clip's two halves
+disagree: compare searches of 3.7.4 with each other.
+
+---
+
+## 3.7.3 — 2026-10-27 — the search of every `[]` field (ChatGPT), pruned and held
+
+ChatGPT's corrige5 was computed against 3.7.2 and applies to it without a
+conflict: it is the first commit of this version, unchanged. The second one
+changes what is listed under "Changed here".
+
+### From ChatGPT's corrige5
+
+- `audio_parameter_search.py` (new) maps each `[]` field to a [0, 1]
+  coordinate. hp, lp and the gate are off below 0.2 and active above it, the
+  limiter is on or off: a simplex can no longer turn `lp 0` into a 6 kHz
+  low-pass by clipping it into a range. Every free field is tried on its own,
+  both states of every switch included; the one-factor winners are combined,
+  then refined with Nelder-Mead, or differential evolution and Nelder-Mead,
+  within a strict budget. A failed trial is recorded and never selected; a
+  baseline that cannot be scored stops the search.
+- Comparator, `--optimise-audio`: two selection sentences instead of one; the
+  candidate needs a gain on each, and a mean gain above 40 % of the fitting
+  gain and above 0.02 (twice the tolerance after `--screen-audio`). Their
+  renders are kept with `*_audio_search.json`. With `--target-dbfs`, each trial is
+  rendered, its RMS measured over both channels and `vol` corrected until it
+  is within 0.35 dB (holding `vol` did not hold the level once compression,
+  NR, reverb or the gate changed it). An effect error printed by the generator
+  fails the trial. The screening uses the same trial values. The dynamics fit
+  says it keeps the block's value where it printed "-> 0" while keeping it, a
+  bug of 3.7.2.
+- Pipeline and tabs: method and budget reach every EQ fit; [Cmp] gets the
+  search, its budget and a target level.
+
+### Changed here
+
+- **Pruning.** The block is adopted or rejected as a whole, so a field that
+  does nothing for the score kept whatever value the optimiser left it at and
+  rode along with the fields that do. After the search, each changed field
+  goes back to its starting value when the block without its change still
+  scores within the tolerance of the best found (the heuristic tolerance of
+  the comparator: half the identity spread between the two halves of the
+  render, 0.004 at least). The floor is fixed, so the total loss is one
+  tolerance, not one per field; the fields whose one-factor trials moved the
+  score least are tried first. One evaluation per field is reserved for it
+  within the budget, so the minimum budget grows by that many (55 instead of
+  41 for a block of all 14 fields; the default search needs 54 at most, under
+  the tabs' 64).
+- **Speed, pan and limiter are held** unless `--search-all-fields` (comparator
+  and pipeline). The speed is the meditation's pace, which the Analyser derives
+  from the measured syllable rate and a target pace; corrige5 searched it from
+  0.75 to 1.25 against a score that does not measure pace. ECAPA averages the
+  two channels, so pan is only a gain to it. The limiter protects against
+  clipping. The screening still sweeps all three: it is a diagnostic.
+- **Off by default** in the pipeline, [Auto] and [Cmp] (corrige5 turned it
+  on). Measured here on 8 s of voice through the generator's chain, one render
+  takes 1.25 s (EQ, comp, de-ess, limiter) to 1.6 s (with NR and reverb) on two
+  cores, two renders per trial when a target level must be corrected; 400
+  trials per EQ fit, two fits per voice with `a+blend`.
+- **A failed search keeps the tone fit.** corrige5 exited with status 1, which
+  stopped the whole pipeline at that voice; a failure after an adoption could
+  leave the half-adopted block. Now the block is the tone fit, exactly as
+  without the search, the run succeeds (and saves its preset), and the
+  pipeline's recap lists each failed search with its report.
+- `EQ error` and `Limiter error`, the generator's own wording when FFmpeg fails
+  there and returns the audio unprocessed, now fail a trial too.
+- The two French delivery notes of corrige5 (`AMELIORATIONS_XTTS.md`,
+  `LISEZ_MOI_OPTIMISATION_AUDIO.md`) are folded into this entry: they
+  described its defaults.
+
+### Measured
+
+A simulated ECAPA where only `eq_mid` matters (+0.036 from −4 to −1 dB), every
+other field moving the score by render noise only (σ = 3·10⁻⁴), on a
+tone-fitted block with speed 0.9; the search and the adoption rule are the
+real ones, 20 draws, `vol` held by a target level:
+
+| | corrige5 | 3.7.3 |
+|---|---|---|
+| Blocks adopted | 20 / 20 | 20 / 20 |
+| Fields changed | 13 free fields; speed, pan, reverb, NR every time | `eq_mid` only |
+| Final speed (start 0.9) | 0.76 to 1.23 | 0.9 |
+| Largest pan | 0.96 | 0 |
+| Final `eq_mid` (best −1) | −1.12 to −0.76 | −1.14 to −0.81 |
+
+With a hypothetical penalty for the Rubber Band stretch added, corrige5 set
+the speed to 1.0 in the 20 draws.
+
+### Tests
+
+- 15 new tests (288 in all): the inert fields that rode along with a real
+  gain, now pruned; the total loss of one tolerance; pruning within the strict
+  budget; held fields kept in every render, freed on request; the budget floor
+  covering the default search; a failed search, before and after an adoption,
+  keeping the tone fit with a successful run and its preset; the pipeline going
+  on, with the failures in its recap; the EQ and limiter errors; the defaults;
+  a hold-out that regresses rejects even with a good mean; the dynamics fit's
+  message. corrige5's tests follow the new defaults and minimum budget.
+- The changes of this version were checked by putting the old behaviour back
+  (19 cases), and corrige5's additions the same way (12 cases): each makes at
+  least one test fail, except two of corrige5's that change nothing the code
+  can reach (two hold-outs are always rendered; the optimisers stop on their
+  own counts before the budget guard).
+
+### Upgrading to 3.7.3
+
+Install `audio_parameter_search.py`, `voice_comparator.py`, `xtts_pipeline.py`
+and `xtts_studio.py` together, with the test files. The audio search is off:
+choose `nelder` under **Audio search** in [Auto] or [Cmp], or pass
+`--optimise-audio nelder`, and listen to the two validation renders
+(`*_audio_holdout1_base.wav` / `_candidate.wav`) before keeping a searched
+block.
+
+---
+
 ## 3.7.2 — 2026-10-26 — the Comparator compares smoothed spectra; a review of 3.7.1 merged
 
 Prompted by a pipeline run on a 16 kHz reference. The tone fit moved the shape

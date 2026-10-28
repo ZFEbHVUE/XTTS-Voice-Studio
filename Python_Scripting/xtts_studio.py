@@ -16,6 +16,7 @@ import subprocess
 import threading
 import sys
 import os
+import math
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _root = None
@@ -1809,7 +1810,14 @@ def tab_auto(nb):
     # A production level by default: matching each reference gives every voice
     # of a meditation its own level, and drives a loud reference into the limiter.
     v_a_target = tk.StringVar(value='-20')       # empty = match each reference
+    # Opt-in: the ECAPA search of [] is a long run whose result has to be heard.
     v_a_optaud = tk.StringVar(value='none')
+    v_a_audbudget = tk.StringVar(value='400')
+    v_a_all_fields = tk.BooleanVar(value=False)
+    def _enable_full_audio_search(*_):
+        if v_a_all_fields.get() and v_a_optaud.get() == 'none':
+            v_a_optaud.set('nelder')
+    v_a_all_fields.trace_add('write', _enable_full_audio_search)
     try:
         import torch as _t_auto
         _auto_dev = 'cuda' if _t_auto.cuda.is_available() else 'cpu'
@@ -1921,7 +1929,7 @@ def tab_auto(nb):
     v_a_eqw = tk.StringVar(value='a+blend')
     ttk.Combobox(frm_c, textvariable=v_a_eqw, values=['a', 'voice', 'blend', 'a+blend'],
                  width=8, state='readonly').pack(side='left')
-    tk.Label(frm_c, text="Optimise audio").pack(side='left', padx=(10, 2))
+    tk.Label(frm_c, text="Audio search").pack(side='left', padx=(10, 2))
     ttk.Combobox(frm_c, textvariable=v_a_optaud, values=['none', 'nelder', 'de'],
                  width=7, state='readonly').pack(side='left')
     tk.Label(frm_c, text="Target dBFS").pack(side='left', padx=(10, 2))
@@ -2143,6 +2151,13 @@ def tab_auto(nb):
         row=5, column=1, sticky='e', padx=4, pady=(4, 0))
     tk.Button(extra, text="auto all", width=8, command=_auto_all, name='auto_all').grid(
         row=5, column=2, sticky='w', pady=(4, 0))
+    tk.Label(extra, text="Audio search budget (per EQ fit)").grid(row=6, column=0, sticky='w')
+    tk.Entry(extra, textvariable=v_a_audbudget, width=8).grid(row=6, column=1, sticky='w', padx=4)
+    tk.Checkbutton(extra, text="Include speed, pan and limiter", variable=v_a_all_fields).grid(
+        row=7, column=0, columnspan=3, sticky='w')
+    tk.Label(extra, text="Checking includes every numeric [] field and enables nelder if needed. "
+                         "Changes below the tolerance are pruned.", fg='grey', wraplength=580,
+             justify='left', font=("Arial", 8)).grid(row=8, column=0, columnspan=3, sticky='w')
 
     sent = tk.Frame(f)
     sent.grid(row=8, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
@@ -2232,8 +2247,20 @@ def tab_auto(nb):
             cmd += ['--eq-weighting', v_a_eqw.get()]
         if v_a_screen.get():
             cmd += ['--screen-audio']
+        cmd += ['--optimise-audio', v_a_optaud.get()]
         if v_a_optaud.get() != 'none':
-            cmd += ['--optimise-audio', v_a_optaud.get()]
+            from audio_parameter_search import EDITORIAL_FIELDS, worst_case_budget
+            held = {} if v_a_all_fields.get() else EDITORIAL_FIELDS
+            minimum = max(64, worst_case_budget(4., bool(v_a_target.get().strip()), held))
+            try:
+                audio_budget = int(v_a_audbudget.get().strip() or '400')
+                if audio_budget < minimum:
+                    raise ValueError
+            except ValueError:
+                log(console, f"[ERR] Audio search budget must be an integer >= {minimum}."); return
+            cmd += ['--optimise-budget', str(audio_budget)]
+            if v_a_all_fields.get():
+                cmd += ['--search-all-fields']
         if v_a_target.get().strip():
             cmd += ['--target-dbfs', v_a_target.get().strip()]
         if not any(pn for _, _, pn in voices):
@@ -3878,6 +3905,29 @@ def tab_comparator(nb):
              fg='gray', font=('Arial', 8)).pack(side='left', padx=6)
 
     row += 1
+    frm_search = tk.Frame(f)
+    frm_search.grid(row=row, column=0, columnspan=2, sticky='w', padx=6, pady=4)
+    tk.Label(frm_search, text="Audio search").pack(side='left')
+    v_cmp_search = tk.StringVar(value='none')       # opt-in, as in [Auto]
+    ttk.Combobox(frm_search, textvariable=v_cmp_search, values=['none', 'nelder', 'de'],
+                 width=7, state='readonly').pack(side='left', padx=4)
+    tk.Label(frm_search, text="Audio budget").pack(side='left', padx=(8, 2))
+    v_cmp_budget = tk.StringVar(value='400')
+    tk.Entry(frm_search, textvariable=v_cmp_budget, width=6).pack(side='left')
+    tk.Label(frm_search, text="Target dBFS (optional)").pack(side='left', padx=(8, 2))
+    v_cmp_target = tk.StringVar(value='')
+    tk.Entry(frm_search, textvariable=v_cmp_target, width=6).pack(side='left')
+
+    row += 1
+    v_cmp_all_fields = tk.BooleanVar(value=False)
+    def _enable_full_audio_search(*_):
+        if v_cmp_all_fields.get() and v_cmp_search.get() == 'none':
+            v_cmp_search.set('nelder')
+    v_cmp_all_fields.trace_add('write', _enable_full_audio_search)
+    tk.Checkbutton(f, text="Include speed, pan and limiter", variable=v_cmp_all_fields).grid(
+        row=row, column=0, columnspan=2, sticky='w', padx=6)
+
+    row += 1
     console = add_console(foot, 0)
 
     def lancer(btn, stop_btn=None):
@@ -3898,8 +3948,22 @@ def tab_comparator(nb):
         refs = split_paths(ref)
         if not refs:
             log(console, "[ERR] Reference voice file required."); return
-        n_iter = int(v_cmp_iter.get() or 1)
-        conv_thr = float(v_cmp_conv.get() or 0.5)
+        try:
+            n_iter = int(v_cmp_iter.get() or 3)
+            conv_thr = float(v_cmp_conv.get() or .5)
+            audio_budget = int(v_cmp_budget.get().strip() or '400')
+            if v_cmp_search.get() != 'none':
+                from audio_parameter_search import EDITORIAL_FIELDS, worst_case_budget
+                held = {} if v_cmp_all_fields.get() else EDITORIAL_FIELDS
+                minimum = max(64, worst_case_budget(4., bool(v_cmp_target.get().strip()), held))
+                if audio_budget < minimum:
+                    raise ValueError(f'audio budget must be >= {minimum}')
+            if v_cmp_target.get().strip():
+                target = float(v_cmp_target.get())
+                if not math.isfinite(target) or target >= 0:
+                    raise ValueError('Target dBFS must be finite and negative')
+        except ValueError as exc:
+            log(console, f"[ERR] Invalid comparison settings: {exc}"); return
 
         # Write text to temp file
         import tempfile as _tf
@@ -3919,6 +3983,11 @@ def tab_comparator(nb):
             cmd += ["--output-optimised", out_opt]
             cmd += ["--iterations", str(max_iter)]
             cmd += ["--conv-threshold", str(conv)]
+            cmd += ['--optimise-audio', v_cmp_search.get(), '--optimise-budget', str(audio_budget)]
+            if v_cmp_search.get() != 'none' and v_cmp_all_fields.get():
+                cmd += ['--search-all-fields']
+            if v_cmp_target.get().strip():
+                cmd += ['--target-dbfs', v_cmp_target.get().strip()]
             if v_cmp_eqw.get() != 'a':
                 cmd += ["--eq-weighting", v_cmp_eqw.get()]
             return cmd

@@ -1,8 +1,11 @@
 """Regressions derived from the supplied log, with real DSP and model stubs."""
 import contextlib
+import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +17,7 @@ import numpy as np
 from scipy.io import wavfile
 from scipy.signal import butter, lfilter, resample_poly, sosfilt
 import ltas_match as ltas
+from audio_parameter_search import AUDIO_KEYS as AUDIO_FIELDS
 import voice_comparator as comparator
 import xtts_settings as settings
 from test_render_search_regressions import AudioSegment, CHAIN, generator_namespace, needs_audio
@@ -609,31 +613,12 @@ class ComparatorWordingTests(unittest.TestCase):
         self.assertIn('one ECAPA score does not predict an entire meditation',source)
 
 
-class IdentityAxesTests(unittest.TestCase):
-    def names(self,opt,**kw):
-        axes,held=comparator.identity_axes(opt,4.,**kw)
-        return [axis[0] for axis in axes],held
-
-    def test_a_filter_that_is_off_stays_off(self):
-        # Clipped into 6000-16000, lp 0 started the search at a 6 kHz low-pass.
-        names,held=self.names(dict(hp=90,lp=0))
-        self.assertNotIn('lp',names); self.assertIn('hp',names); self.assertEqual(held,['lp'])
-        self.assertEqual(self.names(dict(hp=0,lp=0))[1],['hp','lp'])
-        names,held=self.names(dict(hp=90,lp=9000))
-        self.assertEqual((len(names),held),(9,[]))
-        axes,_=comparator.identity_axes(dict(hp=90,lp=9000),3.)
-        self.assertIn(('eq_high',-3.,3.),axes); self.assertIn(('lp',6000,16000),axes)
-
-    def test_a_target_level_is_not_a_free_axis(self):
-        names,held=self.names(dict(hp=90,lp=9000),freeze_vol=True)
-        self.assertNotIn('vol',names); self.assertEqual(held,['vol'])
-
-
 class ComparatorStageTests(unittest.TestCase):
     """The identity stages of main(), with the encoder and the render stubbed:
     `identity` scores the block rendered last."""
 
-    def run_main(self,block,extra,identity=lambda block:.8):
+    def run_main(self,block,extra,identity=lambda block:.8, return_report=False, post_error=None,
+                 presets=None, dynamics=False):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);reference=root/'reference.wav'
             tone=np.sin(2*np.pi*200*np.arange(48000)/24000).astype(np.float32)*.02
@@ -651,7 +636,11 @@ class ComparatorStageTests(unittest.TestCase):
                 generate=lambda model,text,lang,lat,path,**kw:wavfile.write(path,24000,tone))
             last,quiet=[None],[]
             def post(src,dst,blk,*a):
-                last[0]=dict(blk);shutil.copyfile(src,dst)
+                last[0]=dict(blk, _source=Path(src).name);shutil.copyfile(src,dst)
+            def loud_post(src,dst,blk,*a):
+                if post_error and post_error(blk,Path(dst).name):
+                    raise RuntimeError('render failed')
+                post(src,dst,blk)
             def quiet_post(src,dst,blk,*a):
                 quiet.append(dict(blk));post(src,dst,blk)
             class Encoder:
@@ -661,27 +650,137 @@ class ComparatorStageTests(unittest.TestCase):
             modules={'xtts_clone':clone,'torch':types.SimpleNamespace(),
                 'soundfile':types.SimpleNamespace(info=info,read=read),
                 'speaker_identity':types.SimpleNamespace(SpeakerEncoder=Encoder)}
+            if presets is not None:
+                modules['voice_presets']=types.SimpleNamespace(PRESET_DIR=str(root),
+                    name_from_reference=lambda path:'Voice',
+                    save=lambda name,xtts_block,audio_block,**kw:presets.append(audio_block) or name)
             argv=['voice_comparator.py',str(reference),'FR','--xtts-block',settings.format_block({'seed':0}),
                 '--audio-block',block,'--raw-clone',str(given),'--text','Bonjour Elo.',
                 '--reference-interval','0.5','1.5','--device','cpu','--no-fit-dynamics','--no-identity-check',
                 '--output',str(root/'base.wav'),'--output-optimised',str(root/'fit.wav'),
                 '--output-raw',str(root/'raw.wav'),*extra]
+            if dynamics:
+                argv.remove('--no-fit-dynamics')
             out=io.StringIO()
             with patch.dict(sys.modules,modules),patch.object(sys,'argv',argv), \
-                 patch.object(comparator,'apply_post',side_effect=post), \
+                 patch.object(comparator,'apply_post',side_effect=loud_post), \
                  patch.object(comparator,'_quiet_post',side_effect=quiet_post), \
                  contextlib.redirect_stdout(out):
-                comparator.main()
+                self.assertFalse(comparator.main())     # exit status 0
+            if return_report:
+                report=json.loads((root/'fit_audio_search.json').read_text())
+                for paths in report['validation_renders']:
+                    self.assertTrue(all(Path(path).is_file() for path in paths.values()))
+                return out.getvalue(),quiet,report
             return out.getvalue(),quiet
 
-    def test_the_optimiser_leaves_an_off_lowpass_and_a_target_level_alone(self):
-        # A metric that rewards level and a low-pass: free axes would take both.
-        out,quiet=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]',
-            ['--optimise-audio','nelder','--optimise-budget','16','--target-dbfs','-20'],
-            identity=lambda block:.8+.002*float(block.get('vol',0))+1e-5*float(block.get('lp',0)))
-        self.assertIn('held fixed: lp (off), vol (--target-dbfs)',out)
-        self.assertGreater(len(quiet),5)
-        self.assertEqual({(block['lp'],block['vol']) for block in quiet},{(0,quiet[0]['vol'])})
+    def test_all_zero_effects_and_switches_receive_real_trials(self):
+        out,quiet=self.run_main('[1, FR, 0.9, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]',
+            ['--optimise-audio','nelder','--optimise-budget','80'],
+            identity=lambda block:.7+.1*(block.get('lp')==8000))
+        self.assertNotIn('Audio search failed',out)
+        self.assertIn('ADOPTED',out)
+        self.assertIn('lp',out)
+        for field in ('lp','hp','NR','comp','de-ess','reverb','noise_gate'):
+            self.assertGreater(len({block.get(field) for block in quiet}),1,field)
+        # The pace, the stereo placement and the clipping protection are not
+        # ECAPA's to judge: every render keeps them.
+        self.assertEqual({(block['speed'],block['pan'],block['limiter']) for block in quiet},
+                         {(.9,0,1)})
+        self.assertRegex(out,r'speed: held at 0\.9 \(meditation pace')
+        self.assertIn('held-out clone 2:',out)
+        self.assertIn('Audio-search report:',out)
+
+    def test_speed_pan_and_limiter_are_searched_on_request_only(self):
+        _,quiet=self.run_main('[1, FR, 0.9, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]',
+            ['--optimise-audio','nelder','--optimise-budget','80','--search-all-fields'],
+            identity=lambda block:.7+.1*(block.get('lp')==8000))
+        for field in ('speed','pan'):
+            self.assertGreater(len({block.get(field) for block in quiet}),1,field)
+        self.assertEqual({block['limiter'] for block in quiet},{0,1})
+
+    def test_a_gain_elsewhere_only_changes_its_own_field(self):
+        # Every render differs a little: the encoder sees each distinct block
+        # through a small deterministic perturbation, as real renders do.
+        def identity(block):
+            digest=hashlib.sha256(repr(sorted((k,v) for k,v in block.items()
+                                              if k!='_source')).encode()).digest()
+            return .7+.1*(block.get('lp')==8000)+3e-4*(digest[0]/255-.5)
+        out,_,report=self.run_main('[1, FR, 0.9, 0, 0, 0, 0, 90, 0, 0, 0.2, 0.15, 0, 0, 0, 1]',
+            ['--optimise-audio','nelder','--optimise-budget','120'],identity,return_report=True)
+        self.assertIn('ADOPTED',out)
+        start,found,final=(report[k] for k in ('baseline_block','search_best_block','final_block'))
+        moved=lambda block:{k for k in AUDIO_FIELDS if block[k]!=start[k]}
+        self.assertGreater(len(moved(found)),1)       # the search alone let others drift
+        self.assertEqual(moved(final),{'lp'})
+        self.assertIn('pruned back to their start:',out)
+
+    def test_a_failed_search_keeps_the_tone_fit_and_the_run_succeeds(self):
+        block='[1, FR, 1, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]'
+        tone,_=self.run_main(block,[])
+        def lost(block):
+            raise RuntimeError('encoder lost')
+        presets=[]
+        out,_,report=self.run_main(block,['--optimise-audio','nelder','--optimise-budget','80',
+                                          '--save-preset'],
+                                   lost,return_report=True,presets=presets)
+        self.assertIn('[!] Audio search failed: encoder lost',out)
+        self.assertIn('[OK] Done.',out)
+        nxt=re.findall(r'Next \[\]\s*:\s*(.*)',out)
+        self.assertEqual(nxt,re.findall(r'Next \[\]\s*:\s*(.*)',tone))
+        self.assertEqual(report['error'],'encoder lost')
+        # The tone fit is a complete result: saved like one from a run without the search.
+        self.assertEqual(presets,[nxt[0].strip()])
+
+    def test_a_failure_after_adoption_still_leaves_the_tone_fit(self):
+        out,_=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]',
+            ['--optimise-audio','nelder','--optimise-budget','80'],
+            identity=lambda block:.7+.1*(block.get('lp')==8000),
+            post_error=lambda block,name:name=='cand.wav' and block.get('lp')==8000)
+        self.assertIn('ADOPTED',out)
+        self.assertIn('[!] Audio search failed: render failed',out)
+        nxt=re.search(r'Next \[\]\s*:\s*\[([^\]]*)\]',out).group(1).split(',')
+        self.assertEqual(float(nxt[8]),0)             # lp of the tone fit, not 8000
+        self.assertIn('tone-fitted []',out)
+
+    def test_one_regressing_holdout_rejects_the_candidate_and_retains_tested_zeros(self):
+        def identity(block):
+            direction=-1 if 'holdout_2' in block['_source'] else 1
+            return .7 + direction*.1*(block.get('lp')==8000)
+        out,_,report=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]',
+            ['--optimise-audio','nelder','--optimise-budget','80'], identity, return_report=True)
+        self.assertIn('REJECTED',out)
+        self.assertFalse(report['adopted'])
+        self.assertEqual(report['candidate_block']['lp'],8000)
+        self.assertEqual(report['final_block']['lp'],0)
+        self.assertEqual(report['validation_evaluations'],4)
+        self.assertEqual(len(report['validation_renders']),2)
+
+    def test_a_holdout_that_regresses_rejects_even_with_a_good_mean(self):
+        # +0.2 on one sentence, -0.01 on the other: the mean clears the bar,
+        # the candidate still made one sentence worse.
+        def identity(block):
+            gain=.1*(block.get('lp')==8000)
+            if 'holdout_1' in block['_source']:
+                gain*=2
+            elif 'holdout_2' in block['_source']:
+                gain*=-.1
+            return .7+gain
+        out,_,report=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]',
+            ['--optimise-audio','nelder','--optimise-budget','80'],identity,return_report=True)
+        self.assertGreater(np.mean([row['gain'] for row in report['validation']]),.02)
+        self.assertIn('REJECTED: insufficient independent gains',out)
+        self.assertEqual(report['final_block']['lp'],0)
+
+    def test_the_dynamics_fit_says_it_keeps_the_given_values(self):
+        # The clone and the reference are the same tone: both gaps are within
+        # tolerance, and the block's own de-ess and comp are kept, not zeroed.
+        out,_=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 0, 0, 0.2, 0.3, 0, 0, 0, 1]',[],dynamics=True)
+        self.assertRegex(out,r'de-ess: gap [+-]\d\.\d dB within tolerance \(1\.5\); keeping 0\.3')
+        self.assertRegex(out,r'comp: gap [+-]\d\.\d dB within tolerance \(2\.0\); keeping 0\.2')
+        self.assertNotIn('-> 0\n',out)
+        nxt=re.search(r'Next \[\]\s*:\s*\[([^\]]*)\]',out).group(1).split(',')
+        self.assertEqual((float(nxt[10]),float(nxt[11])),(.2,.3))
 
     def test_the_screening_tries_the_lowpass_off(self):
         out,quiet=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 9000, 0, 0, 0, 0, 0, 0, 1]',['--screen-audio'],
