@@ -36,12 +36,16 @@ def render_kwargs(settings):
     return dict(temperature=settings['temp'], length_penalty=settings['len_pen'],
                 repetition_penalty=settings['rep_pen'], top_k=settings['top_k'],
                 top_p=settings['top_p'], seed=settings['seed'],
-                num_beams=settings['num_beams'], do_sample=bool(settings['do_sample']))
+                num_beams=settings['num_beams'], do_sample=bool(settings['do_sample']),
+                **({'typical_p': settings['typical_p']} if settings.get('typical_p', 1.) < 1 else {}))
 
 
 def conditioning_kwargs(settings):
-    return {key: settings[key] for key in ('gpt_cond_len', 'gpt_cond_chunk_len',
-                                          'max_ref_len', 'sound_norm_refs')}
+    out = {key: settings[key] for key in ('gpt_cond_len', 'gpt_cond_chunk_len',
+                                        'max_ref_len', 'sound_norm_refs')}
+    out.update({key: settings[key] for key in ('speaker_ref_len', 'ref_trim_db')
+                if settings.get(key, 0)})
+    return out
 
 
 def load_texts(path, lang, defaults):

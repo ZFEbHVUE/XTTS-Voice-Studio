@@ -223,6 +223,103 @@ def _praat_hnr_db(y, sr):
     return float(_np.median(v)) if len(v) else None
 
 
+def timbre_voicing(y, sr, spec=None):
+    """Where the voice is in a signal, and how high: the pitch track, the
+    voiced frames, their weights and the pitch of the file, in semitones.
+
+    This is the slow half of the timbre measure (pitch tracking costs about a
+    second per file) and the half that EQ, gain, noise reduction and the gate
+    do not change: they colour a render, they do not move its pitch. A search
+    over those effects can therefore track the pitch once and measure each
+    candidate against it (TimbreMeter). None when fewer than 8 frames are
+    voiced. `spec` is the magnitude STFT of `y` when the caller has it.
+    """
+    import numpy as _np
+    import librosa as _lb
+    f0, voiced, vprob = _lb.pyin(y, fmin=60, fmax=500, sr=sr,
+                                 frame_length=TIMBRE_NFFT, hop_length=TIMBRE_HOP)
+    if spec is None:
+        spec = _np.abs(_lb.stft(y, n_fft=TIMBRE_NFFT, hop_length=TIMBRE_HOP))
+    n = min(spec.shape[1], len(f0))
+    f0, spec = _np.asarray(f0[:n], dtype=float), spec[:, :n]
+    vprob = _np.nan_to_num(_np.asarray(vprob[:n], dtype=float))
+    mask = _np.asarray(voiced[:n], dtype=bool) & _np.isfinite(f0) & (vprob > 0)
+    if mask.sum() < 8:
+        return None
+    # Each voiced frame counts by its voicing probability: the frames at
+    # the edge of a vowel, half voice half consonant or pause, are the
+    # ones whose voiced/unvoiced call flips when the timing of a render
+    # shifts by a few milliseconds. Counted in full, they made the
+    # centroid jump by ~50 Hz on the same audio; weighted, by ~6 Hz.
+    frames, w = spec[:, mask], vprob[mask]
+    level = (_np.sqrt(_np.mean(frames ** 2, axis=0)) + 1e-12) * w
+    st = 12.0 * _np.log2(f0[mask])
+    keep = _np.abs(st - _weighted_median(st, level)) <= TIMBRE_OCTAVE_GUARD_ST
+    pitch_st = float(_np.sum(st[keep] * level[keep]) / _np.sum(level[keep]))
+    return {'mask': mask, 'weights': w, 'frames': int(n), 'pitch_st': pitch_st}
+
+
+def timbre_measure(y, sr, voicing, hnr_method=None, spec=None):
+    """Brightness and HNR of the frames `voicing` calls voiced, with its pitch.
+
+    timbre_features is this with the signal's own voicing. None when the signal
+    has fewer frames than the voicing (a shorter render than the one that was
+    tracked: the caller measures it from scratch) or when HNR cannot be had.
+    """
+    import numpy as _np
+    import librosa as _lb
+    if spec is None:
+        spec = _np.abs(_lb.stft(y, n_fft=TIMBRE_NFFT, hop_length=TIMBRE_HOP))
+    n = voicing['frames']
+    if spec.shape[1] < n:
+        return None
+    spec = spec[:, :n]
+    mask, w = voicing['mask'], voicing['weights']
+    summed = (spec[:, mask] * w).sum(axis=1)
+    freqs = _lb.fft_frequencies(sr=sr, n_fft=TIMBRE_NFFT)
+    centroid = float(_np.sum(freqs * summed) / (_np.sum(summed) + 1e-12))
+
+    hnr, method = None, None
+    if hnr_method in (None, 'praat'):
+        try:
+            hnr, method = _praat_hnr_db(y, sr), 'praat'
+        except ImportError:
+            pass
+    if hnr is None and hnr_method in (None, 'hpss'):
+        harm, perc = _lb.decompose.hpss(spec)
+        eh = float(_np.sum(harm[:, mask] ** 2 * w)) + 1e-12
+        ep = float(_np.sum(perc[:, mask] ** 2 * w)) + 1e-12
+        hnr, method = float(10.0 * _np.log10(eh / ep)), 'hpss'
+    if hnr is None or not _np.isfinite(hnr):
+        return None
+    return {'f0': float(2.0 ** (voicing['pitch_st'] / 12.0)),
+            'centroid': centroid,
+            'hnr': float(hnr),
+            'hnr_method': method,
+            'voiced_frames': int(mask.sum())}
+
+
+def timbre_features_array(y, sr, sr_target=22050, hnr_method=None):
+    """timbre_features for a signal already in memory (resampled like a file
+    loaded at `sr_target`). Same result, same None cases."""
+    try:
+        import numpy as _np
+        import librosa as _lb
+        y = _np.asarray(y, dtype=_np.float32)
+        if sr != sr_target:
+            y = _lb.resample(y, orig_sr=sr, target_sr=sr_target)
+            sr = sr_target
+        if len(y) < sr // 4:
+            return None
+        spec = _np.abs(_lb.stft(y, n_fft=TIMBRE_NFFT, hop_length=TIMBRE_HOP))
+        voicing = timbre_voicing(y, sr, spec=spec)
+        if voicing is None:
+            return None
+        return timbre_measure(y, sr, voicing, hnr_method, spec=spec)
+    except Exception:
+        return None
+
+
 def timbre_features(path, sr_target=22050, hnr_method=None):
     """Pitch, brightness and HNR of the VOICED part of a file.
 
@@ -250,54 +347,81 @@ def timbre_features(path, sr_target=22050, hnr_method=None):
     generation is skipped rather than scored as a perfect match.
     """
     try:
-        import numpy as _np
         import librosa as _lb
         y, sr = _lb.load(path, sr=sr_target, mono=True)
-        if len(y) < sr // 4:
-            return None
-        f0, voiced, vprob = _lb.pyin(y, fmin=60, fmax=500, sr=sr,
-                                     frame_length=TIMBRE_NFFT, hop_length=TIMBRE_HOP)
-        spec = _np.abs(_lb.stft(y, n_fft=TIMBRE_NFFT, hop_length=TIMBRE_HOP))
-        n = min(spec.shape[1], len(f0))
-        f0, spec = _np.asarray(f0[:n], dtype=float), spec[:, :n]
-        vprob = _np.nan_to_num(_np.asarray(vprob[:n], dtype=float))
-        mask = _np.asarray(voiced[:n], dtype=bool) & _np.isfinite(f0) & (vprob > 0)
-        if mask.sum() < 8:
-            return None
-        # Each voiced frame counts by its voicing probability: the frames at
-        # the edge of a vowel, half voice half consonant or pause, are the
-        # ones whose voiced/unvoiced call flips when the timing of a render
-        # shifts by a few milliseconds. Counted in full, they made the
-        # centroid jump by ~50 Hz on the same audio; weighted, by ~6 Hz.
-        frames, w = spec[:, mask], vprob[mask]
-        level = (_np.sqrt(_np.mean(frames ** 2, axis=0)) + 1e-12) * w
-        st = 12.0 * _np.log2(f0[mask])
-        keep = _np.abs(st - _weighted_median(st, level)) <= TIMBRE_OCTAVE_GUARD_ST
-        pitch_st = float(_np.sum(st[keep] * level[keep]) / _np.sum(level[keep]))
-        summed = (frames * w).sum(axis=1)
-        freqs = _lb.fft_frequencies(sr=sr, n_fft=TIMBRE_NFFT)
-        centroid = float(_np.sum(freqs * summed) / (_np.sum(summed) + 1e-12))
-
-        hnr, method = None, None
-        if hnr_method in (None, 'praat'):
-            try:
-                hnr, method = _praat_hnr_db(y, sr), 'praat'
-            except ImportError:
-                pass
-        if hnr is None and hnr_method in (None, 'hpss'):
-            harm, perc = _lb.decompose.hpss(spec)
-            eh = float(_np.sum(harm[:, mask] ** 2 * w)) + 1e-12
-            ep = float(_np.sum(perc[:, mask] ** 2 * w)) + 1e-12
-            hnr, method = float(10.0 * _np.log10(eh / ep)), 'hpss'
-        if hnr is None or not _np.isfinite(hnr):
-            return None
-        return {'f0': float(2.0 ** (pitch_st / 12.0)),
-                'centroid': centroid,
-                'hnr': float(hnr),
-                'hnr_method': method,
-                'voiced_frames': int(mask.sum())}
+        return timbre_features_array(y, sr, sr_target, hnr_method)
     except Exception:
         return None
+
+
+class TimbreMeter:
+    """Timbre of renders that differ from one another by colouring only.
+
+    The pitch of `baseline_path` is tracked once; each candidate is then
+    measured against that voicing (brightness and HNR are measured on the
+    candidate itself). That holds while the candidate is laid out in time like
+    the baseline: the EQ, the filters, the gate, the noise reduction, the pan
+    and the level do not move a sample, and a reverb only adds the 80 ms of its
+    last echo at the end. A render stretched or shortened by a speed change has
+    its voiced frames elsewhere, and a baseline with no usable voice has
+    nothing to be measured against: those are measured from scratch, so a
+    number is never a guess. `ref` is timbre_features of the reference.
+    """
+    LONGER_S = 0.125      # the longest echo tail a render may add (reverb: 80 ms)
+
+    def __init__(self, ref, baseline_path, sr_target=22050):
+        self.ref, self.sr_target, self.voicing = ref, sr_target, None
+        self.length = None
+        self.method = (ref or {}).get('hnr_method')
+        try:
+            import librosa as _lb
+            y, sr = _lb.load(baseline_path, sr=sr_target, mono=True)
+            if len(y) >= sr // 4:
+                self.voicing = timbre_voicing(y, sr)
+                self.length = len(y)
+        except Exception:
+            self.voicing = None
+
+    def aligned(self, samples):
+        """Whether a render of this many samples (at sr_target) is laid out in
+        time like the baseline: as long, or longer by an echo tail."""
+        if self.voicing is None or self.length is None:
+            return False
+        return 0 <= samples - self.length <= self.LONGER_S * self.sr_target
+
+    def features(self, path):
+        if self.voicing is not None:
+            try:
+                import librosa as _lb
+                y, sr = _lb.load(path, sr=self.sr_target, mono=True)
+                if self.aligned(len(y)):
+                    got = timbre_measure(y, sr, self.voicing, self.method)
+                    if got is not None:
+                        return got
+            except Exception:
+                pass
+        return timbre_features(path, self.sr_target, self.method)
+
+    def score(self, path):
+        """The timbre score to maximise, or None when the file cannot be measured."""
+        return timbre_score(self.ref, self.features(path))
+
+
+def _timbre_terms(ref, clone):
+    """(signed gaps, terms) behind timbre_distance, or None when the two files
+    were not measured the same way. Gaps: semitones, Hz, dB (clone - reference)."""
+    import numpy as _np
+    if not ref or not clone:
+        return None
+    if ref.get('hnr_method') != clone.get('hnr_method'):
+        return None
+    st = 12.0 * _np.log2(max(clone['f0'], 1e-6) / max(ref['f0'], 1e-6))
+    gaps = {'pitch': float(st), 'brightness': float(clone['centroid'] - ref['centroid']),
+            'hnr': float(clone['hnr'] - ref['hnr'])}
+    terms = {'pitch': abs(st) / TIMBRE_SCALE['f0_semitones'],
+             'brightness': abs(gaps['brightness']) / TIMBRE_SCALE['centroid_hz'],
+             'hnr': abs(gaps['hnr']) / TIMBRE_SCALE['hnr_db']}
+    return gaps, {k: float(v) for k, v in terms.items()}
 
 
 def timbre_distance(ref, clone):
@@ -319,6 +443,58 @@ def timbre_score(ref, clone):
     """Turn the distance into something to MAXIMISE, like every other score."""
     d = timbre_distance(ref, clone)
     return None if d is None else float(1.0 / (1.0 + d))
+
+
+# What each term of the distance answers to, in the studio's own tools.
+TIMBRE_REMEDY = {
+    'pitch': 'nothing in the [] block (it has no pitch field)',
+    'brightness': 'the EQ and the low/high-pass filters, within --eq-limit',
+    'hnr': 'hardly anything: noise reduction gained +0.2 to +0.6 dB at its strongest setting',
+}
+TIMBRE_LABELS = {'pitch': 'pitch (F0)', 'brightness': 'brightness (centroid)', 'hnr': 'HNR'}
+
+
+def timbre_breakdown(ref, clone):
+    """The distance of timbre_distance, term by term, for a report.
+
+    {'gaps': {pitch: st, brightness: Hz, hnr: dB}  (clone - reference),
+     'terms': {pitch, brightness, hnr}             (each as a share of the distance),
+     'distance', 'score', 'largest'} or None when the files cannot be compared.
+    """
+    got = _timbre_terms(ref, clone)
+    if got is None:
+        return None
+    gaps, terms = got
+    d = timbre_distance(ref, clone)
+    return {'gaps': gaps, 'terms': terms, 'distance': d, 'score': 1.0 / (1.0 + d),
+            'largest': max(terms, key=terms.get)}
+
+
+def timbre_lines(ref, clone, indent='  '):
+    """The breakdown as printable lines (comparator, timbre_report.py)."""
+    b = timbre_breakdown(ref, clone)
+    if b is None:
+        return [indent + 'timbre: the two files were not measured the same way (HNR method); '
+                         'no comparison']
+    rows = [(f"{'':<24}{'reference':>11}{'clone':>11}{'gap':>12}{'cost':>8}")]
+    unit = {'pitch': ('f0', 'Hz', 'st'), 'brightness': ('centroid', 'Hz', 'Hz'),
+            'hnr': ('hnr', 'dB', 'dB')}
+    for key in ('pitch', 'brightness', 'hnr'):
+        field, shown, gap_unit = unit[key]
+        gap = b['gaps'][key]
+        rows.append(f"{TIMBRE_LABELS[key]:<24}{ref[field]:>9.1f} {shown[:2]}"
+                    f"{clone[field]:>9.1f} {shown[:2]}{gap:>+9.1f} {gap_unit:<2}"
+                    f"{b['terms'][key]:>8.2f}")
+    lines = [indent + r for r in rows]
+    if b['distance'] < 0.05:
+        lines.append(f"{indent}distance {b['distance']:.2f} -> timbre score {b['score']:.2f}; "
+                     "no term costs anything")
+        return lines
+    lines.append(f"{indent}distance {b['distance']:.2f} -> timbre score {b['score']:.2f}; "
+                 f"largest cost: {TIMBRE_LABELS[b['largest']]} "
+                 f"({b['terms'][b['largest']]:.2f} of {b['distance']:.2f})")
+    lines.append(f"{indent}what moves it: {TIMBRE_REMEDY[b['largest']]}")
+    return lines
 
 
 # ── Hold-out report ──────────────────────────────────────────────────────────
@@ -492,12 +668,22 @@ def main():
                     help='Candidate gpt_cond_len values, e.g. "6 10 15 20 30"')
     ap.add_argument("--gpt-chunks", default="4 6 8 10",
                     help='Candidate gpt_cond_chunk_len values, e.g. "4 6 8 10"')
+    ap.add_argument('--advanced-conditioning', action='store_true',
+                    help='Also search a separate decoder speaker-reference cap and CPU reference trimming')
+    ap.add_argument('--speaker-ref-lens', default='',
+                    help='Independent speaker embedding caps, e.g. "0 10 20 45"; 0 shares max_ref_len')
+    ap.add_argument('--ref-trim-dbs', default='',
+                    help='Reference silence trimming thresholds, e.g. "0 30 45 60"; 0 is off')
+    ap.add_argument('--joint-sampling', type=int, default=0,
+                    help='Additional coupled Sobol candidates (0=legacy, 1..64; suggested 12)')
     ap.add_argument("--search-ref-sets", dest="search_ref_sets",
                     action="store_true", default=True,
                     help="If multiple refs are supplied, test useful subsets (default ON)")
     ap.add_argument("--no-search-ref-sets", dest="search_ref_sets",
                     action="store_false")
     args = ap.parse_args()
+    if not 0 <= args.joint_sampling <= 64:
+        ap.error('joint-sampling must be in 0..64')
 
     # Backward-compatible positional parsing:
     #   ref.wav FR
@@ -540,6 +726,15 @@ def main():
         for seed in seeds:
             validate({'seed': seed})
         ref_lengths = [int(v) for v in args.max_ref_lens.replace(',', ' ').split()]
+        speaker_lengths = [int(v) for v in args.speaker_ref_lens.replace(',', ' ').split()]
+        trim_thresholds = [float(v) for v in args.ref_trim_dbs.replace(',', ' ').split()]
+        if args.advanced_conditioning:
+            speaker_lengths = speaker_lengths or [0, 10, 20, 45]
+            trim_thresholds = trim_thresholds or [0, 30, 45, 60]
+        for value in speaker_lengths:
+            validate({'speaker_ref_len': value})
+        for value in trim_thresholds:
+            validate({'ref_trim_db': value})
         if any(v <= 0 for v in ref_lengths):
             raise ValueError('Reference durations must be positive')
         if args.w_accent < 0 or args.w_identity < 0 or not np.isfinite(
@@ -607,6 +802,8 @@ def main():
     plan_start = {a: float(xtts.get(a, GRID[a][len(GRID[a]) // 2])) for a in GRID}
     planned = sampling_plan(len(seeds), args.keep_seeds, len(probe_texts), plan_start,
                             args.method, args.rounds, args.probe_beams)
+    from search_plan import joint_sampling_plan, conditioning_extension_trials
+    planned += joint_sampling_plan(args.joint_sampling, len(probe_texts))
     print(f"  Sampling plan: up to {planned} generations for a budget of {args.budget}")
     if planned > args.budget:
         print(f"  [!] The budget cannot run the whole plan: its last stages will be "
@@ -618,7 +815,8 @@ def main():
             [int(x) for x in re.findall(r"\d+", args.gpt_cond_lens)],
             [int(x) for x in re.findall(r"\d+", args.gpt_chunks)], ref_lengths,
             int(xtts.get("gpt_cond_len", 30)), int(xtts.get("gpt_cond_chunk_len", 4)),
-            args.max_ref_len, len(all_refs), len(cond_probe_texts), _sets)
+            args.max_ref_len, len(all_refs), len(cond_probe_texts), _sets,
+            extension_trials=conditioning_extension_trials(speaker_lengths, trim_thresholds))
         print(f"  Conditioning plan: up to {cond_planned} generations for a budget of "
               f"{args.cond_budget}")
         if cond_planned > args.cond_budget:
@@ -693,6 +891,8 @@ def main():
             "sound_norm_refs": int(bool(xtts.get("sound_norm_refs", 0))),
             "refs": tuple(all_refs),
             "max_ref_len": args.max_ref_len,
+            'speaker_ref_len': int(xtts.get('speaker_ref_len', 0)),
+            'ref_trim_db': float(xtts.get('ref_trim_db', 0)),
         }
         base_cond["gpt_cond_len"] = max(1, min(base_cond["gpt_cond_len"], args.max_ref_len * len(all_refs)))
         base_cond["gpt_cond_chunk_len"] = max(
@@ -702,7 +902,8 @@ def main():
             return (int(c["gpt_cond_len"]),
                     int(c["gpt_cond_chunk_len"]),
                     int(bool(c["sound_norm_refs"])),
-                    tuple(c["refs"]), int(c["max_ref_len"]))
+                    tuple(c["refs"]), int(c["max_ref_len"]),
+                    int(c.get('speaker_ref_len', 0)), float(c.get('ref_trim_db', 0)))
 
         def get_latents(c):
             k = cond_key(c)
@@ -715,6 +916,7 @@ def main():
                     gpt_cond_chunk_len=int(c["gpt_cond_chunk_len"]),
                     max_ref_len=int(c["max_ref_len"]),
                     sound_norm_refs=bool(c["sound_norm_refs"]),
+                    **{k: c[k] for k in ('speaker_ref_len', 'ref_trim_db') if c.get(k, 0)},
                 )
             return latent_cache[k]
 
@@ -725,6 +927,7 @@ def main():
         start["len_pen"] = float(xtts.get("len_pen", 1.0))
         start["num_beams"] = int(xtts.get("num_beams", 1))
         start["do_sample"] = bool(xtts.get("do_sample", 1))
+        start['typical_p'] = float(xtts.get('typical_p', 1.))
 
         # Budget bookkeeping. evaluate() used to return None in silence when a
         # budget ran out: the stage's remaining candidates were skipped and the
@@ -754,6 +957,7 @@ def main():
                 round(float(prm.get("len_pen", 1.0)), 4),
                 int(prm.get("num_beams", 1)),
                 bool(prm.get("do_sample", True)),
+                round(float(prm.get('typical_p', 1.)), 4),
                 tuple(texts),
             )
 
@@ -788,6 +992,7 @@ def main():
                     speed=1.0, seed=int(seed),
                     num_beams=int(prm.get("num_beams", 1)),
                     do_sample=bool(prm.get("do_sample", True)),
+                    **({'typical_p': prm['typical_p']} if prm.get('typical_p', 1.) < 1 else {}),
                 )
                 # A setting can leave the render bit-identical: rep_pen above
                 # the point where repeated tokens already fall outside top_p,
@@ -878,6 +1083,7 @@ def main():
                 "len_pen": float(prm.get("len_pen", 1.0)),
                 "num_beams": int(prm.get("num_beams", 1)),
                 "do_sample": bool(prm.get("do_sample", True)),
+                'typical_p': float(prm.get('typical_p', 1.)),
                 "details": details,
                 "same_audio_as": (same[0] if len(same) == len(texts) and len(set(same)) == 1
                                   else None),
@@ -929,7 +1135,9 @@ def main():
                 c = r["cond"]
                 return (f"gcl={c['gpt_cond_len']} chunk={c['gpt_cond_chunk_len']} "
                         f"norm={int(bool(c['sound_norm_refs']))} refs={len(c['refs'])} "
-                        f"max_ref={c['max_ref_len']}")
+                        f"max_ref={c['max_ref_len']}" +
+                        (f" speaker_ref={c.get('speaker_ref_len', 0)} trim_db={c.get('ref_trim_db', 0):g}"
+                         if c.get('speaker_ref_len') or c.get('ref_trim_db') else ''))
             decode = (f"beam{r['num_beams']}" if r["num_beams"] > 1
                       else "sampling" if r["do_sample"] else "greedy")
             return (f"seed={r['seed']} temp={r['temp']:.3f} rep={r['rep_pen']:g} "
@@ -1092,6 +1300,26 @@ def main():
                 print("\n  C4 — reference-set search")
                 run_stage("C4 reference sets",
                           [dict(best_cond, refs=tuple(rs)) for rs in _reference_sets(all_refs)])
+
+            # These affect different conditioning paths, rather than shortening
+            # GPT prosody whenever the decoder likes a shorter identity sample.
+            if speaker_lengths:
+                print('\n  C4b — independent speaker embedding reference length')
+                run_stage('C4b speaker_ref_len',
+                          [dict(best_cond, speaker_ref_len=value)
+                           for value in _unique([best_cond['speaker_ref_len']]+speaker_lengths)])
+            if trim_thresholds:
+                print('\n  C4c — CPU reference silence trimming')
+                run_stage('C4c ref_trim_db',
+                          [dict(best_cond, ref_trim_db=value)
+                           for value in _unique([best_cond['ref_trim_db']]+trim_thresholds)])
+            if speaker_lengths and trim_thresholds:
+                print('\n  C4d — independent speaker cap x reference trimming')
+                anchor = dict(best_cond)
+                run_stage('C4d speaker cap x trim',
+                    [dict(anchor, speaker_ref_len=cap, ref_trim_db=trim)
+                     for cap in _unique([anchor['speaker_ref_len']]+speaker_lengths)
+                     for trim in _unique([anchor['ref_trim_db']]+trim_thresholds)])
 
             # Joint bounded grid: later GPT/chunk winners can change which
             # reference cap or normalization is best. Nearest choices go first.
@@ -1298,6 +1526,7 @@ def main():
                 "len_pen": start["len_pen"] if lp is None else float(lp),
                 "num_beams": 1,
                 "do_sample": True,
+                'typical_p': start['typical_p'],
             }
 
         def screen_seeds(params, stage):
@@ -1400,7 +1629,7 @@ def main():
                 for value in values:
                     trial = {key: best[key] for key in
                              ("temp", "rep_pen", "top_p", "top_k", "len_pen",
-                              "num_beams", "do_sample")}
+                              "num_beams", "do_sample", 'typical_p')}
                     trial[axis] = value
                     trials.append(evaluate(best["seed"], trial, probe_texts, cwin,
                                            phase="sample"))
@@ -1441,6 +1670,21 @@ def main():
                         print(f"  beam({bw}) lp={lp}: skipped ({type(e).__name__}: {e})")
                 current_stage["name"] = None
                 best = adopt(best, decode_cands, "sample", stage)
+
+        joint_report = None
+        if args.joint_sampling:
+            from joint_sampling import run_joint_search
+            print('\n  S5 — coupled Sobol sampling + confirmation on matched seeds')
+            current_stage['name'] = 'S5 joint sampling'
+            best, joint_report = run_joint_search(best, seeds,
+                lambda seed, params: evaluate(seed, params, probe_texts, cwin, phase='sample'),
+                count=args.joint_sampling,
+                max_draws=(args.budget-sample_evals[0])//len(probe_texts),
+                progress=lambda message: print('  '+message, flush=True))
+            current_stage['name'] = None
+            if joint_report['screened'] < args.joint_sampling:
+                cut_stages['S5 joint sampling'] = args.joint_sampling-joint_report['screened']
+            print('  Joint sampling: '+joint_report['reason'])
 
         # ------------------------------------------------------------------
         # Ranking and hold-out
@@ -1488,6 +1732,7 @@ def main():
                 "len_pen": best["len_pen"],
                 "num_beams": best["num_beams"],
                 "do_sample": best["do_sample"],
+                'typical_p': best.get('typical_p', 1.),
             }
             current_stage["name"] = "hold-out"
             held = evaluate(best["seed"], hp, holdout_texts, cwin, phase="holdout")
@@ -1548,10 +1793,13 @@ def main():
         win["len_pen"] = best["len_pen"]
         win["num_beams"] = best["num_beams"]
         win["do_sample"] = int(best["do_sample"])
+        win['typical_p'] = float(best.get('typical_p', 1.))
         win["max_ref_len"] = int(cwin["max_ref_len"])
         win["gpt_cond_len"] = int(cwin["gpt_cond_len"])
         win["gpt_cond_chunk_len"] = int(cwin["gpt_cond_chunk_len"])
         win["sound_norm_refs"] = int(bool(cwin["sound_norm_refs"]))
+        win['speaker_ref_len'] = int(cwin.get('speaker_ref_len', 0))
+        win['ref_trim_db'] = float(cwin.get('ref_trim_db', 0))
 
         print(f"\n{'='*72}")
         print("  FINAL WINNER")
@@ -1559,13 +1807,15 @@ def main():
         print(f"  conditioning : gpt_cond_len={win['gpt_cond_len']}  "
               f"chunk={win['gpt_cond_chunk_len']}  "
               f"sound_norm_refs={win['sound_norm_refs']}")
+        print(f"  extensions   : speaker_ref_len={win['speaker_ref_len']} (0=shared cap); "
+              f"ref_trim_db={win['ref_trim_db']:g} (0=off)")
         print(f"  references   : {len(cwin['refs'])}")
         for r in cwin["refs"]:
             print(f"    - {os.path.basename(r)}")
         print(f"  sampling     : seed={best['seed']} temp={best['temp']:.3f} "
               f"rep={best['rep_pen']:.1f} top_p={best['top_p']:.2f} "
               f"top_k={best['top_k']} beams={best['num_beams']} "
-              f"len_pen={best['len_pen']:.2f}")
+              f"len_pen={best['len_pen']:.2f} typical_p={best.get('typical_p', 1.):g}")
         if held:
             print(f"  HELD-OUT score {held['score']:.3f} "
                   f"(accent {held['french']:.3f}, identity {held['identity']:.3f})")
@@ -1586,6 +1836,7 @@ def main():
                 "wer_normalization": ('fr_cardinal_equivalence_v1' if lang == 'FR'
                                       else 'unicode_basic_v1')},
             "search_texts": probe_texts, "holdout_texts": holdout_texts,
+            'conditioning_texts': cond_probe_texts if args.search_conditioning else [],
             "scores": {"search": best['score'],
                        "held_out": held['score'] if held else None,
                        "french": (held or best)['french'],
@@ -1606,6 +1857,7 @@ def main():
                                for k, why in ((held or {}).get("alerts") or [])],
         }
         if args.result_json:
+            result['joint_sampling'] = joint_report
             result_path = os.path.abspath(args.result_json)
             os.makedirs(os.path.dirname(result_path), exist_ok=True)
             with open(result_path + '.tmp', 'w', encoding='utf-8') as f:

@@ -41,8 +41,10 @@ import re
 import sys
 import argparse
 import json
+import math
 import shlex
 import tempfile
+import time
 from xtts_settings import parse_block, validate
 import subprocess
 
@@ -57,6 +59,7 @@ RE_FIT   = re.compile(r'^\[\*\] Fit input: (\{.*\})\s*$', re.M)
 # The comparator's line when its --optimise-audio search fails (the tone fit is kept).
 AUDIO_SEARCH_FAILED = '[!] Audio search failed:'
 RE_AUDIO_REPORT = re.compile(r'^\[\*\] Audio-search report: (.+?)\s*$', re.M)
+RE_TIMBRE = re.compile(r'^\[\*\] Timbre: (\{.*\})\s*$', re.M)
 EQ_WEIGHTINGS = ('a', 'voice', 'blend')
 
 
@@ -64,6 +67,179 @@ def _audio_report(output):
     """Path of the audio-search JSON a comparator run wrote, or None."""
     match = RE_AUDIO_REPORT.search(output)
     return match.group(1) if match else None
+
+
+def _timbre_json(output):
+    """The comparator's `[*] Timbre: {...}` line as a dict, or None."""
+    match = RE_TIMBRE.search(output or '')
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(1))
+        return data if isinstance(data, dict) and 'terms' in data else None
+    except ValueError:
+        return None
+
+
+def _timbre_recap(t):
+    """One line for the recap: the timbre score and what costs most."""
+    try:
+        names = {'pitch': ('pitch', 'st'), 'brightness': ('brightness', 'Hz'), 'hnr': ('HNR', 'dB')}
+        big = t['largest']
+        label, unit = names[big]
+        stages = ' | '.join(f"{k} {v:.2f}" for k, v in (t.get('stages') or {}).items()
+                            if v is not None)
+        return (f"Timbre score {t['score']:.2f} ({stages}); largest cost: {label} "
+                f"{t['gaps'][big]:+.1f} {unit} ({t['terms'][big]:.2f} of {t['distance']:.2f})")
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _read_json(path):
+    """A report the comparator wrote, or None. Never raises: the preset is
+    written from whatever could be read."""
+    try:
+        with open(path, encoding='utf-8') as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _ml(text, width=140):
+    """One line, cut: a sentence of a few hundred characters is not a comment."""
+    text = ' '.join(str(text or '').split())
+    return text if len(text) <= width else text[:width - 3] + '...'
+
+
+def _preset_info(args, r):
+    """Sections written under the two blocks of a preset: how this result came
+    about. Everything here is commentary; losing it costs nothing, so each part
+    is built from what exists and skipped when it does not."""
+    info = {}
+    opt = r.get('opt') or {}
+    sd = opt.get('score_definition') or {}
+    run = [f"pipeline, voice {r['n']} [{r['lang']}], {time.strftime('%Y-%m-%d %H:%M')}",
+           f"seeds {args.seeds} | budget {args.budget} | probe texts {args.probe_texts} | "
+           f"objective {sd.get('objective', args.objective)} | "
+           f"w_accent {sd.get('w_accent', args.w_accent)} | "
+           f"w_identity {sd.get('w_identity', args.w_identity)}",
+           f"conditioning search: gpt_cond_len {args.gpt_cond_lens} | chunks {args.gpt_chunks} | "
+           f"budget {args.cond_budget} | max_ref_len {args.max_ref_len}"]
+    gens = opt.get('generations')
+    if gens:
+        run.append('XTTS generations: ' + ' | '.join(f"{k} {v}" for k, v in gens.items()))
+    if r.get('cut'):
+        run.append('[!] stages cut short by the budget: ' + ', '.join(r['cut']))
+    info['Run'] = run
+
+    cur = r.get('curation') or {}
+    info['Curation'] = [f"reference : {r['ref']}",
+                        f"curated   : {cur.get('file') or r['ref']}  ({cur.get('status', '?')})"]
+
+    start = [f"{{}} prior : {r.get('xtts_prior')}", f"[] prior : {r.get('audio_prior')}"]
+    info['Starting point (analyser priors)'] = [x for x in start if 'None' not in x]
+
+    cond = []
+    refs = opt.get('selected_refs') or r.get('references') or []
+    if refs:
+        cond.append(f"{len(refs)} reference file(s) cloned from: "
+                    + ', '.join(os.path.basename(x) for x in refs))
+    c = r.get('confirmation')
+    if c and c.get('finalists'):
+        gain = max(f['mean'] for f in c['finalists']) - c['base_mean']
+        verdict = f"adopted {c.get('winner')}" if c.get('adopted') else f"kept the base {c.get('base')}"
+        cond.append(f"confirmation on seeds {' '.join(str(x) for x in c['seeds'])}: {verdict} "
+                    f"(best candidate {gain:+.3f} over the base, bar {c['bar']:.3f})")
+    if cond:
+        info['Conditioning'] = cond
+
+    fit = r.get('fit') or {}
+    tone = [f"EQ weighting '{r.get('weighting_used', r.get('weighting'))}'"]
+    if args.target_dbfs is not None:
+        tone.append(f"volume computed for a {args.target_dbfs:g} dBFS target")
+    if fit.get('text'):
+        tone.append(f"fitted sentence: {_ml(fit['text'])}")
+    if fit.get('interval'):
+        tone.append('fitted on the reference from %.2f s to %.2f s' % tuple(fit['interval']))
+    if args.fit_identity:
+        tone.append('--fit-identity: post-processing also searched for ECAPA identity')
+    info['Tone fit'] = tone
+
+    if args.optimise_audio == 'none':
+        info['Audio search'] = ['off (--optimise-audio none): the [] is the tone fit']
+    else:
+        import audio_parameter_search as APS
+        rep = _read_json(r['report']) if r.get('report') else None
+        name = (rep or {}).get('objective') or APS.report_objective(
+            getattr(args, 'audio_objective', 'identity'), args.objective)
+        fidelity = name == APS.FIDELITY
+        lines = [f"method {args.optimise_audio} | budget {args.optimise_budget} | "
+                 + ('speed, pan and limiter searched too' if args.search_all_fields
+                    else 'speed, pan and limiter held'),
+                 APS.objective_line(name)]
+        if rep is None:
+            lines.append('no report read: ' + (r['report'] or 'none written'))
+        elif rep.get('error'):
+            lines.append(f"FAILED: {_ml(rep['error'])}; the [] is the tone fit")
+        else:
+            verdict = 'adopted' if rep.get('adopted') else 'rejected, the tone fit is kept'
+            lines.append(f"result: {verdict}")
+            if rep.get('baseline_score') is not None and rep.get('best_score') is not None:
+                lines.append(f"fit sentence {APS.score_label(name)} "
+                             f"{rep['baseline_score']:.4f} -> {rep['best_score']:.4f}")
+            if rep.get('adoption_tolerance') is not None:
+                lines.append(f"bar on {'three paired' if fidelity else 'two other'} sentences: {rep['adoption_tolerance']:.4f} "
+                             '(heuristic threshold, not a statistical confidence interval)')
+            if APS.stop_line(rep):
+                lines.append(APS.stop_line(rep))
+        if r.get('report'):
+            lines.append(f"report: {r['report']}")
+        info['Audio search'] = lines
+    if opt.get('joint_sampling'):
+        joint = opt['joint_sampling']
+        info['Joint XTTS sampling'] = [f"{joint.get('method')}: {joint.get('screened')} candidates",
+                                      joint.get('reason', '')]
+
+    if r.get('timbre'):
+        # One section of the commentary: a line that is JSON but not a timbre
+        # must not cost the others.
+        try:
+            import voice_presets as VP
+            info['Timbre'] = VP.explain_timbre(r['timbre'])
+        except Exception:
+            pass
+
+    unseen = r.get('unseen') or []
+    if unseen:
+        rows = []
+        for k, d in enumerate(unseen, 1):
+            wer = '' if d.get('wer') is None else f" | WER {d['wer']:.2f}"
+            rows.append(f"H{k}: accent {d['accent']:.3f} | identity {d['identity']:.3f} | "
+                        f"score {d['score']:.3f}{wer} | {_ml(d.get('text'), 90)}")
+        for a in r.get('alerts') or []:
+            rows.append(f"[!] sentence {a.get('sentence')}: {a.get('reason')}: listen to it")
+        info['Unseen sentences (hold-out)'] = rows
+
+    files = [f"clone to listen to : {r['clone']}"]
+    files += [f"unseen render      : {u['wav']} (raw XTTS, before the [])"
+              for u in unseen if u.get('wav')]
+    info['Files'] = files
+    return info
+
+
+def _alt_info(args, r, alt, main_name):
+    """The sections of an alternative preset: same clone, same fitted material,
+    another EQ weighting and its own audio-search report."""
+    try:
+        info = _preset_info(args, dict(r, weighting_used=alt['weighting'],
+                                       clone=alt['clone'], report=alt.get('report'),
+                                       timbre=alt.get('timbre')))
+        info['Run'].append(f"alternative to '{main_name}' (EQ weighting '{r['weighting']}'): "
+                           f"same clone, tone fit repeated")
+        return info
+    except Exception:
+        return None
 
 
 def eq_weightings(text):
@@ -119,7 +295,12 @@ def _free_name(path):
 
 
 def main():
-    p = argparse.ArgumentParser(description='One-shot XTTS voice pipeline (curate -> analyse -> optimise -> fit)')
+    # allow_abbrev=False: --fidelity decides what the user chose by reading the
+    # option names on the command line. An abbreviation ('--obj identity') would
+    # be parsed as a choice yet not recognised as one, and the profile would
+    # then overwrite it. A shortened name is now an error, not a silent override.
+    p = argparse.ArgumentParser(description='One-shot XTTS voice pipeline (curate -> analyse -> optimise -> fit)',
+                                allow_abbrev=False)
     p.add_argument('--voice', nargs=2, action='append', metavar=('WAV', 'LANG'),
                    required=True, help='Voice reference + language; repeatable')
     p.add_argument('--start-num', type=int, default=1, help='First voice number (default: 1)')
@@ -130,7 +311,8 @@ def main():
                    default='identity',
                    help="What the optimiser's second term measures: ECAPA "
                         "identity (default), timbre closeness (pitch, "
-                        "brightness, HNR), or both.")
+                        "brightness, HNR), or both. With --optimise-audio it is "
+                        "also what the [] search maximises.")
     p.add_argument('--gpt-cond-lens', default='20 30',
                    help="Optimiser: candidate gpt_cond_len values in seconds "
                         "(default: '20 30'). The GPT conditioning carries prosody "
@@ -142,6 +324,18 @@ def main():
                         "too short to supply more.")
     p.add_argument('--cond-budget', type=int, default=34)
     p.add_argument('--gpt-chunks', default='4 6 8 10')
+    p.add_argument('--advanced-conditioning', action='store_true',
+                   help='Search independent speaker embedding cap and reference silence trimming')
+    p.add_argument('--speaker-ref-lens', default='')
+    p.add_argument('--ref-trim-dbs', default='')
+    p.add_argument('--joint-sampling', type=int, default=0,
+                   help='Coupled Sobol XTTS sampling candidates (0=off, suggested 12)')
+    p.add_argument('--fidelity', action='store_true',
+                   help='Shortcut for the fidelity profile: --objective both, advanced conditioning, '
+                        'joint sampling (12), beam probing (width 2), a DE audio search with the fidelity '
+                        'criterion, a 8 dB EQ limit, weights .3/.7 and budgets sized for all of it. Each '
+                        'of those keeps a value given explicitly on the command line. Speed, pan and '
+                        'limiter stay held (add --search-all-fields to free them).')
     p.add_argument('--max-ref-lens', default='')
     p.add_argument('--max-ref-len', type=int, default=30)
     p.add_argument('--probe-texts', type=int, default=2)
@@ -149,6 +343,7 @@ def main():
                    help='Optimiser: chance of adopting pure noise per search stage '
                         '(default: the optimiser\'s 0.05; 1 = any gain wins, the old rule)')
     p.add_argument('--text', help='Search sentence in the selected language')
+    p.add_argument('--unseen-text', help='Optional independent sentence for the final Comparator check')
     p.add_argument('--probe-text-file', help='Custom search sentences, one per line')
     p.add_argument('--holdout-text-file', help='Custom unseen sentences, one per line')
     p.add_argument('--w-accent', type=float, default=0.6)
@@ -200,11 +395,22 @@ def main():
                         '(which knobs move identity for this voice)')
     p.add_argument('--optimise-audio', default='none', choices=['none','nelder','de'],
                    help='Comparator: trial of every free audio field, joint search '
-                        'against ECAPA, pruning, validation on two sentences '
-                        '(default: none = tone fit only)')
+                        'against the --audio-objective, pruning, validation on other '
+                        'sentences (default: none = tone fit only)')
     p.add_argument('--optimise-budget', type=int, default=400,
                    help='Comparator: strict fit evaluation budget per EQ alternative, '
                         'including the all-field trial and the pruning (default: 400)')
+    p.add_argument('--audio-objective', choices=['identity', 'fidelity'], default='fidelity',
+                   help='What the --optimise-audio search scores. fidelity (default): ECAPA identity '
+                        'plus an acoustic profile of the voiced speech, with up to --audio-finalists '
+                        'candidates checked on three other sentences (ASR and identity guards). '
+                        'identity: ECAPA, or the timbre term of --objective, as in 3.9')
+    p.add_argument('--audio-min-gain', type=float, default=.005,
+                   help='fidelity search: smallest paired gain, on the three checking sentences, '
+                        'that can adopt a candidate (an engineering threshold, default .005)')
+    p.add_argument('--audio-finalists', type=int, default=3,
+                   help='fidelity search: candidates checked on the other sentences (1..5, default 3)')
+    p.add_argument('--eq-limit', type=float, default=4., help='Maximum absolute EQ gain per band')
     p.add_argument('--search-all-fields', action='store_true',
                    help='Comparator: let --optimise-audio change speed, pan and '
                         'limiter too (held by default: ECAPA cannot judge them)')
@@ -215,12 +421,44 @@ def main():
     p.add_argument('--whisper-model', default='small')
     p.add_argument('--device', default=None, help='cpu or cuda (default: auto)')
     args = p.parse_args()
+    if args.fidelity:
+        explicit = {arg.split('=', 1)[0] for arg in sys.argv[1:]}
+        if '--objective' not in explicit:
+            args.objective = 'both'
+        if '--audio-objective' not in explicit:
+            args.audio_objective = 'fidelity'
+        args.advanced_conditioning = True
+        args.probe_beams = True
+        if '--beam-width' not in explicit:
+            args.beam_width = 2
+        if '--eq-limit' not in explicit:
+            args.eq_limit = 8.
+        if not explicit.intersection(('--w-accent', '--w-identity')):
+            args.w_accent, args.w_identity = .3, .7
+        if '--joint-sampling' not in explicit:
+            args.joint_sampling = 12
+        if '--optimise-audio' not in explicit:
+            args.optimise_audio = 'de'
+        if '--cond-budget' not in explicit:
+            args.cond_budget = 80
+        if '--budget' not in explicit:
+            from search_plan import pipeline_sampling_budget, parse_ints, joint_sampling_plan
+            texts = max(1, min(5, args.probe_texts))
+            args.budget = (pipeline_sampling_budget(parse_ints(args.seeds), args.probe_beams, texts)
+                           + joint_sampling_plan(args.joint_sampling, texts))
+    if (not math.isfinite(args.audio_min_gain) or args.audio_min_gain <= 0
+            or not 1 <= args.audio_finalists <= 5):
+        p.error('audio-min-gain must be finite and positive; audio-finalists must be in 1..5')
+    if not 0 <= args.joint_sampling <= 64:
+        p.error('joint-sampling must be in 0..64')
+    if not math.isfinite(args.eq_limit) or args.eq_limit <= 0:
+        p.error('eq-limit must be finite and positive')
     if args.optimise_audio != 'none' and args.optimise_budget < 64:
         p.error('optimise-budget must be at least 64 for an all-field search')
     if args.optimise_audio != 'none':
         from audio_parameter_search import EDITORIAL_FIELDS, worst_case_budget
         held = {} if args.search_all_fields else EDITORIAL_FIELDS
-        need = max(64, worst_case_budget(4., args.target_dbfs is not None, held))
+        need = max(64, worst_case_budget(args.eq_limit, args.target_dbfs is not None, held))
         if args.optimise_budget < need:
             p.error(f'optimise-budget must be at least {need} for this search '
                     '(every free field tried, then pruned)')
@@ -240,6 +478,7 @@ def main():
         print(f"\n{'#'*70}\n#  VOICE {n}  [{lang}]  {os.path.basename(ref)}\n{'#'*70}")
 
         # ── 1. Curation ───────────────────────────────────────────────────────
+        curation = dict(file=ref, status='skipped (--no-curate)')
         if args.no_curate:
             work = ref
             print("[*] Curation skipped (--no-curate)")
@@ -251,9 +490,11 @@ def main():
                 # file is REUSED on purpose, and numbering it would silently
                 # curate again every run.
                 work = _free_name(work)
+            curation = dict(file=work, status=f'new, keep target {args.keep_seconds:g} s')
             if os.path.exists(work) and not args.recurate:
                 print(f"[*] Curated file already exists -> reusing {os.path.basename(work)} "
                       f"(--recurate to redo)")
+                curation['status'] = 'existing file reused (--recurate to redo)'
             else:
                 cmd = [py, S('curate_reference.py'), ref, '-o', work,
                        '--keep-seconds', str(args.keep_seconds)]
@@ -315,6 +556,14 @@ def main():
                '--probe-texts', str(args.probe_texts)]
         if args.max_ref_lens.strip():
             cmd += ['--max-ref-lens', args.max_ref_lens]
+        if args.advanced_conditioning:
+            cmd += ['--advanced-conditioning']
+        if args.joint_sampling:
+            cmd += ['--joint-sampling', str(args.joint_sampling)]
+        if args.speaker_ref_lens.strip():
+            cmd += ['--speaker-ref-lens', args.speaker_ref_lens]
+        if args.ref_trim_dbs.strip():
+            cmd += ['--ref-trim-dbs', args.ref_trim_dbs]
         if args.objective != 'identity':
             cmd += ['--objective', args.objective]
         if args.gpt_cond_lens and args.gpt_cond_lens.strip():
@@ -357,6 +606,7 @@ def main():
                                              for r in clone_refs):
                     raise ValueError('Missing winning cloning references')
                 _sc = result['scores']
+                _opt = result
                 # Stages the budget cut short: the recap repeats them, since
                 # the optimiser's own warning scrolls away in a long run.
                 _cut = dict(result.get('truncated_stages') or {})
@@ -393,14 +643,29 @@ def main():
         # What every tone fit of this voice shares, the further ones included.
         holdout = (cmd[cmd.index('--holdout-text'):cmd.index('--holdout-text') + 2]
                    if '--holdout-text' in cmd else [])
-        shared = []
+        shared = ['--eq-limit', str(args.eq_limit)]
+        if args.unseen_text:
+            shared += ['--unseen-text', args.unseen_text]
         if args.target_dbfs is not None:
             shared += ['--target-dbfs', str(args.target_dbfs)]
         if args.fit_identity:
             shared += ['--fit-identity']
         if args.optimise_audio != 'none':
             shared += ['--optimise-audio', args.optimise_audio,
-                       '--optimise-budget', str(args.optimise_budget)]
+                       '--optimise-budget', str(args.optimise_budget),
+                       '--audio-objective', args.audio_objective,
+                       '--audio-min-gain', str(args.audio_min_gain),
+                       '--audio-finalists', str(args.audio_finalists)]
+            if args.audio_objective == 'identity' and args.objective != 'identity':
+                # The [] search judges the final clone with the same second term
+                # as the {} search: ECAPA cannot see most effects.
+                shared += ['--objective', args.objective]
+            if args.holdout_text_file:
+                shared += ['--audio-holdout-file', args.holdout_text_file]
+            if args.audio_objective == 'fidelity':
+                history = list(dict.fromkeys(_opt.get('search_texts', [])
+                    + _opt.get('conditioning_texts', []) + _opt.get('holdout_texts', [])))
+                shared += ['--exclude-unseen-texts-json', json.dumps(history, ensure_ascii=False)]
             if args.search_all_fields:
                 shared += ['--search-all-fields']
         if args.device:
@@ -421,6 +686,14 @@ def main():
             search_failed.append(dict(weighting=args.eq_weighting[0],
                                       report=_audio_report(out)))
         audio_fit = m.group(1)
+        _report = _audio_report(out)
+        _timbre = _timbre_json(out)
+        _fit = None
+        try:
+            _fit_match = RE_FIT.search(out)
+            _fit = json.loads(_fit_match.group(1)) if _fit_match else None
+        except ValueError:
+            pass
 
         # Further EQ weightings: the SAME clone fitted again, against the same
         # stretch of the reference, so that only the weighting differs. No rule
@@ -457,7 +730,9 @@ def main():
             if args.optimise_audio != 'none' and AUDIO_SEARCH_FAILED in out_alt:
                 search_failed.append(dict(weighting=weighting, report=_audio_report(out_alt)))
             alternatives.append(dict(weighting=weighting, clone=alt_out,
-                                     audio=set_lang(renumber(m_alt.group(1), n), lang)))
+                                     audio=set_lang(renumber(m_alt.group(1), n), lang),
+                                     report=_audio_report(out_alt),
+                                     timbre=_timbre_json(out_alt)))
 
         # Identity on UNSEEN text, if the comparator measured it: that is the
         # figure matching real usage, so it belongs in the preset.
@@ -470,7 +745,9 @@ def main():
                             scores=_sc, acoustics=_acoustics, references=clone_refs,
                             cut=_cut, weighting=args.eq_weighting[0],
                             alternatives=alternatives, unseen=_unseen, alerts=_alerts,
-                            confirmation=_confirm, search_failed=search_failed))
+                            confirmation=_confirm, search_failed=search_failed,
+                            opt=_opt, xtts_prior=xtts_prior, audio_prior=audio_block,
+                            curation=curation, fit=_fit, report=_report, timbre=_timbre))
 
     # ── Final recap ───────────────────────────────────────────────────────────
     print(f"\n\n{'='*70}\n  [*] PIPELINE COMPLETE — READY TO PASTE\n{'='*70}")
@@ -493,6 +770,8 @@ def main():
                 print(f"  # The screening's {c['screening_winner']} won on one draw only: "
                       f"not confirmed")
         print(f"  # Listen before generating: {r['clone']}")
+        if r.get('timbre') and _timbre_recap(r['timbre']):
+            print(f"  # {_timbre_recap(r['timbre'])}")
         kept = [u.get('wav') for u in r.get('unseen') or [] if u.get('wav')]
         if kept:
             print("  # Unseen sentences of the hold-out (raw XTTS, as scored): "
@@ -526,10 +805,16 @@ def main():
                     continue
                 if not nm:
                     nm = VP.name_from_reference(r['ref'])
+                try:
+                    info = _preset_info(args, r)
+                except Exception as exc:
+                    # Commentary only: the blocks are saved without it.
+                    info = None
+                    print(f"  [!] Preset information skipped: {exc}")
                 saved = VP.save(nm, r['xtts'], r['audio'], reference=r['ref'],
                                 source='pipeline', scores=r.get('scores'),
                                 acoustics=r.get('acoustics'), references=r['references'],
-                                overwrite=not args.keep_preset_history)
+                                overwrite=not args.keep_preset_history, info=info)
                 print(f"    '{saved}'  {VP.describe(saved)}")
                 for a in r.get('alternatives') or []:
                     # The identity on unseen text was measured with the first fit.
@@ -539,6 +824,7 @@ def main():
                         f"{nm} {a['weighting']}", r['xtts'], a['audio'], reference=r['ref'],
                         source='pipeline', scores=scores, acoustics=r.get('acoustics'),
                         references=r['references'], overwrite=not args.keep_preset_history,
+                        info=_alt_info(args, r, a, saved) if info else None,
                         note=(f"same clone as '{saved}', tone fit with EQ weighting "
                               f"'{a['weighting']}' instead of '{r['weighting']}'"))
                     print(f"    '{alt_saved}'  {VP.describe(alt_saved)}")

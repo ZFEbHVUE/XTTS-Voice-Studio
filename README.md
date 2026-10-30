@@ -31,6 +31,92 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## What's new
 
+**3.10.1 — a review of 3.10.0 by ChatGPT, two defects fixed:** `--fidelity` now
+keeps the `--objective`, `--audio-objective` and `--optimise-audio none` you
+write (it overwrote them), and the timbre `[]` search no longer reuses the pitch
+track of the baseline for a render that was slowed down by a few percent.
+Abbreviated option names are refused by the pipeline instead of being
+overwritten. 15 tests added, and the benchmark behind the figures of
+[FIDELITY.md](FIDELITY.md) is now a script. See the [changelog](CHANGELOG.md).
+
+**3.10.0 — 3.9.0 plus ChatGPT's fidelity extension, without its two traps**
+
+ChatGPT wrote a fidelity extension on top of 3.8.1 while 3.9.0 was being built.
+3.10.0 applies it to 3.9.0 (a three-way merge, not an overlay) and corrects what
+the review of the patch found wrong. Everything is described in
+**[FIDELITY.md](FIDELITY.md)**.
+
+- **A new `[]` search target, `fidelity`** (`--audio-objective fidelity`): half
+  ECAPA, half an acoustic score of the voiced speech (envelope, pitch,
+  periodicity, sibilance, dynamics, floor), with up to three finalists checked
+  on three other sentences against ASR, identity and clipping guards. It is the
+  default of the pipeline and of the GUI when an audio search is on;
+  `--audio-objective identity` is the 3.9 search, and the Comparator's own
+  default stays `identity`.
+- **Three optional trailing `{}` fields**: `speaker_ref_len`, `ref_trim_db` and
+  `typical_p` (positions 18 to 20; old blocks read unchanged). The optimiser
+  searches them (`--advanced-conditioning`), and a Sobol search of five decoding
+  settings is confirmed on the same seeds (`--joint-sampling`).
+- **`--fidelity` and the [Auto] button *Fidelity setup + auto budgets*** switch
+  all of it on and size the budgets.
+- **Corrected in the patch**: the tone fit is the baseline and what you get when
+  nothing is proven better (the patch dropped it when a search was refused);
+  the input `[]` and a neutral block compete beside it; speed, pan and limiter
+  stay held unless you ask (the patch's shortcut and button freed them);
+  the Comparator tab has one *Search target* menu, not two; the options of a
+  search are sent only to a search that runs.
+- Not run against real XTTS, Whisper or ECAPA, and not judged by ear. 502 tests.
+
+**3.9.0 — the `[]` search scores what the `{}` search scores, and stops when it cannot pay**
+
+- `--objective identity|timbre|both` is now also what `--optimise-audio`
+  maximises. Until 3.8 the `[]` search judged every candidate with ECAPA
+  alone, which an EQ or a filter moves by less than its noise: on a real voice
+  every one-factor trial but one gained 0.004 or less, 240 evaluations went to
+  refining one sentence, and the result was rejected on two others. With
+  `timbre` or `both` the pitch, brightness and HNR of the voiced frames are in
+  the score, as in the `{}` search. The default stays `identity`; the [Auto]
+  tab's Resemblance (`both`) now reaches the `[]`, and the Comparator tab has
+  a *Search target* menu.
+- The search stops before its joint refinement when the best change gained less
+  than the tolerance, or when it does not carry over to the other two
+  sentences (checked first, once). On the logged case that is about 80
+  evaluations instead of 240 (worked out from the log, not re-run). The final
+  adoption rule is the same.
+- The timbre, term by term: the Comparator, the pipeline's recap and the preset
+  file say which of pitch, brightness and HNR costs the most, and
+  `timbre_report.py REFERENCE.wav CLONE.wav` does it on any WAV. No pitch field
+  was added to `[]`: that waits for what the breakdown shows.
+- Not tested on a real voice: only on synthetic voices and a stand-in
+  encoder. 418 tests.
+
+**3.8.1 — a review of 3.8.0 (ChatGPT): provenance and alignment**
+
+- The `blend` preset named the main clone's WAV; it names its own.
+- The final acoustic table was computed on the whole reference while the fit
+  used a stretch of it; it now uses that stretch and prints its interval.
+- A transcribed text could end on half a French word (`pour s` before
+  `'adapter`); an elision now stays one unit with its audio.
+- The `[]` search is still ECAPA-only: the presets now say so. 346 tests.
+
+**3.8.0 — a voice preset says how it was made**
+
+- A preset file used to hold the two blocks and a few header lines. It now
+  also carries the blocks in plain words and one section per stage of the run
+  that produced them: the pipeline's settings, the curation, the analyser's
+  starting point, the conditioning confirmation, the tone fit (EQ weighting,
+  fitted sentence and stretch of the reference), what the audio search
+  decided, each unseen sentence's scores, and where the files are. The
+  comparator and the analyser write their own sections.
+- The blocks stay at the top, and everything below is `#` commentary: the
+  generator ignores it, a preset pasted whole still gives exactly two blocks,
+  and no value, a line break included, can add a third. Presets written
+  before still open.
+- **`[Gen]`**: *Insert* puts a `# name - voice` line above the two blocks, so a
+  script with several voices reads without opening the files; the new *Info*
+  button shows the whole commentary of the selected preset.
+- 334 tests.
+
 **3.7.5 — a small reverb renders**
 
 - The generator rounds the reverb's three echo decays to two decimals, and
@@ -373,12 +459,16 @@ XTTS-Voice-Studio/
 ├── Python_Scripting/
 │   ├── xtts_studio.py                      # Tkinter GUI (main entry point)
 │   ├── guided_meditation_generator_v23.py  # Meditation generator + the shared render chain
-│   ├── xtts_settings.py                    # Shared, lossless {} block format (17 fields)
+│   ├── xtts_settings.py                    # Shared, lossless {} block format (17 to 20 fields)
 │   ├── xtts_clone.py                       # Low-level XTTS gen honouring all cloning knobs
 │   ├── voice_analyser.py                   # Acoustic analysis → XTTS priors
 │   ├── voice_validator.py                  # Param sweep + intelligibility/identity scoring
-│   ├── voice_comparator.py                 # Closed-loop EQ/vol fit (LTAS, least squares), ECAPA search of []
-│   ├── audio_parameter_search.py           # Trials, joint search and pruning of the [] fields
+│   ├── voice_comparator.py                 # Closed-loop EQ/vol fit (LTAS, least squares), search of [] (ECAPA and/or timbre)
+│   ├── audio_parameter_search.py           # Trials, early stop, joint search and pruning of the [] fields
+│   ├── fidelity_search.py                  # The fidelity [] search: finalists checked on other sentences
+│   ├── voice_fidelity.py                   # Acoustic profile of the voiced speech, paired decision with guards
+│   ├── joint_sampling.py                   # Sobol search of the decoding settings, confirmed on matched seeds
+│   ├── timbre_report.py                    # Pitch / brightness / HNR cost of clones against a reference, term by term
 │   ├── xtts_optimize.py                    # Conditioning + sampling search, noise-aware
 │   ├── search_plan.py                      # Search schedule and budget arithmetic ([Auto] auto buttons)
 │   ├── xtts_pipeline.py                    # One-shot: curate -> analyse -> optimise -> fit
@@ -413,6 +503,7 @@ XTTS-Voice-Studio/
 ├── MP3toTXT/                               # Audio/video sources for transcription
 ├── Output_Song_files/                      # Generated meditation WAVs
 ├── README.md
+├── FIDELITY.md
 └── CHANGELOG.md
 ```
 
@@ -459,8 +550,11 @@ Options (the safeguards below them are always on):
 | Control | CLI | Effect |
 |---|---|---|
 | Screen audio params | `--screen-audio` | Which knobs move identity for this voice |
-| Audio search | `--optimise-audio nelder\|de` | Off by default: every free `[]` field tried, then searched jointly against ECAPA, pruned, and tested on two other sentences (see [Audio search](#audio-search---optimise-audio)); budget per EQ fit with `--optimise-budget` |
+| Audio search | `--optimise-audio nelder\|de` | Off by default: every free `[]` field tried, then searched jointly, pruned, and tested on other sentences (see [Audio search](#audio-search---optimise-audio)); budget per EQ fit with `--optimise-budget` |
+| Audio objective | `--audio-objective fidelity\|identity` | What that search scores. `fidelity` (default): ECAPA plus an acoustic profile, three finalists checked on three sentences with ASR guards ([FIDELITY.md](FIDELITY.md)). `identity`: the 3.9 search, ECAPA or the timbre term of `--objective`, checked on two sentences |
 | Include speed, pan and limiter | `--search-all-fields` | Let the audio search change these three too (held otherwise); selects `nelder` if the search was off |
+| Advanced XTTS conditioning, Joint XTTS sampling | `--advanced-conditioning`, `--joint-sampling 12` | The optimiser also tries a speaker-embedding cap and silence trimming of the references, and twelve Sobol combinations of the decoding settings confirmed on the same seeds |
+| Fidelity setup + auto budgets | `--fidelity` | One click or flag for all of the above: `both`, the fidelity search with `de`, advanced conditioning, joint sampling, beam probes (width 2), EQ limit 8 dB, budgets sized. It does not free speed, pan and limiter |
 | Priority | `--w-accent`, `--w-identity`, `--objective` | Resemblance (0.3 / 0.7, `both`, the default) or Balanced (0.6 / 0.4, `identity`); Custom once a field is edited |
 | EQ weighting | `--eq-weighting a+blend` | Where EQ errors count; several weightings give several tone fits of the same clone (`a+blend` by default in the tab) |
 | Target dBFS | `--target-dbfs -20` | Absolute render level, −20 by default in the tab; empty matches each reference |
@@ -684,7 +778,7 @@ Sweeps XTTS/audio parameters, generates a variation per value for A/B listening,
 - Auto-fill Values field from XTTS/Audio blocks when selecting a parameter
 - **Default** / **Raw** fill buttons
 - Single XTTS generation for audio params (fast), N generations for XTTS params
-- Sweepable: every `{}` field — `gpt_cond_chunk_len`, `sound_norm_refs`, `num_beams`, `do_sample`, `max_ref_len`, trims and fades included — and every `[]` field, limiter included. Invalid combinations are rejected before the models load.
+- Sweepable: every `{}` field — `gpt_cond_chunk_len`, `sound_norm_refs`, `num_beams`, `do_sample`, `max_ref_len`, trims, fades and (3.10) `speaker_ref_len`, `ref_trim_db` and `typical_p` included — and every `[]` field, limiter included. Invalid combinations are rejected before the models load.
 - **Scoring**: intelligibility (faster-whisper → `french`/WER) + identity (ECAPA cosine vs reference) per variant, measured on the audio you will hear (after the render chain, so audio sweeps are scored too), a ranked table with ties marked `=`, and the best block to paste into the Comparator. `--no-score` to disable.
 - **Blind** option: random order, only "Variante N" announced, key printed after the ranking.
 
@@ -700,7 +794,9 @@ only when its gain beats the draw-to-draw noise measured on the same settings
 with several seeds; the plan size is printed up front, and a stage cut short by
 the budget says so. Fields: voice ref(s), starting `{}` (hand-off from the
 Analyser), seeds, budgets, sentence count, weights, objective, method, GPT
-durations, chunk sizes, reference durations, beam probe, whisper model, device.
+durations, chunk sizes, reference durations, beam probe, whisper model, device;
+the boxes *Speaker cap / ref trim* and *Joint sampling (12)* switch on the 3.10
+stages (C4b to C4d and S5, see [FIDELITY.md](FIDELITY.md)).
 Prints the winning `{}` block; **→ Comparator** pushes it — with the winning
 reference subset — to the next stage.
 
@@ -713,7 +809,7 @@ Takes a **frozen** `{}` block (seed/temp chosen upstream) and fits only the post
 - Each pass renders the generator's own chain and is **kept only if the measured spectrum actually improves**.
 - Writes the untouched XTTS render (`--output-raw`) next to the base and fitted renders; **Clone refs (optional)** separates the cloning references from the comparison target.
 - No seed search, no tuning of `{}` (that is the Validator's and the Optimiser's job).
-- **Audio search** (off by default), **Audio budget** and **Target dBFS** run the [audio search](#audio-search---optimise-audio) after the tone fit; **Include speed, pan and limiter** lets it change those three too.
+- **Audio search** (off by default), **Audio budget** and **Target dBFS** run the [audio search](#audio-search---optimise-audio) after the tone fit; **Include speed, pan and limiter** lets it change those three too; **Search target** is what it maximises (`fidelity`, the default: ECAPA plus an acoustic profile; `identity`: ECAPA, as in 3.9; `timbre`; `both`).
 - `[]` Audio params field updates automatically with the fitted block.
 
 ---
@@ -750,15 +846,16 @@ its own beat rate.
 
 ## Guided Meditation Generator
 
-### XTTS parameter block `{}` — 17 values
+### XTTS parameter block `{}` — 17 values, up to 20
 
 ```
-{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs, num_beams, do_sample, max_ref_len}
+{N, seed, trim_start, trim_end, fade_in, fade_out, temp, top_k, top_p, rep_pen, len_pen, gpt_cond_len, gpt_cond_chunk_len, sound_norm_refs, num_beams, do_sample, max_ref_len [, speaker_ref_len, ref_trim_db, typical_p]}
 ```
 
 Older blocks with 9, 11, 14 or 15 values are still read: the missing fields
 keep their inherited value. The Analyser still writes 14 values; the
-Optimiser, Comparator and Pipeline write all 17. One shared module,
+Optimiser, Comparator and Pipeline write 17, and add positions 18 to 20 only
+when one of them differs from its default (3.10). One shared module,
 `xtts_settings.py`, reads and writes the block for every tool, so no field is
 lost between them.
 
@@ -781,11 +878,14 @@ lost between them.
 | 15 | `num_beams` | 1 | 1 = sampling; >1 = deterministic beam search (`do_sample` forced to 0) |
 | 16 | `do_sample` | 1 | 0 with one beam = greedy decoding |
 | 17 | `max_ref_len` | 30 | Seconds read from EACH reference file: XTTS cuts every file to this length before the speaker embedding and the GPT conditioning alike |
+| 18 | `speaker_ref_len` | 0 | A cap of its own for the speaker embedding only (a second call of the public API; the GPT keeps `max_ref_len`). `0` shares `max_ref_len` |
+| 19 | `ref_trim_db` | 0 | Threshold (dB) for cutting silence at the edges of each reference, on the CPU, after the cap. `0` is off |
+| 20 | `typical_p` | 1.0 | Typical sampling. `1` is off; it acts only with `do_sample=1` and is passed to XTTS only when below 1 |
 
 Rules: an empty field keeps the inherited value; a `0` in a strictly positive
 setting (`temp`, `top_p`, `rep_pen`, `len_pen`, `gpt_cond_len`,
 `gpt_cond_chunk_len`, `num_beams`, `max_ref_len`) is the historical placeholder
-and does the same; `top_k 0` really disables top-k filtering; an invalid
+and does the same (`speaker_ref_len` and `ref_trim_db` use `0` for "off", `typical_p` uses `1`); `top_k 0` really disables top-k filtering; an invalid
 combination is rejected before any model loads, never silently adjusted.
 `len_pen` only has an effect when `num_beams > 1` — XTTS forwards it to HF
 `generate()`, which ignores it in sampling mode (the runtime warning about
@@ -961,11 +1061,12 @@ choose there is the one the script will render.
 ### Voice presets (`Voice_Presets/`)
 
 One readable `.txt` per voice, written automatically at the end of a pipeline
-run, holding the blocks plus the scores and acoustics that produced them:
+run (and by the comparator and the analyser when asked). The two blocks come
+first, under a short header; everything below is commentary:
 
 ```
 # Voice preset: anna
-# Source    : pipeline  |  2026-08-19 14:32
+# Source    : pipeline  |  2026-10-29 22:39
 # Reference : .../Voices_Cloning/anna.wav
 # Clone references: [".../Voices_Cloning/anna_curated.wav"]
 # Voice     : baritone / contralto | F0 148 Hz | 71% voiced | -24.1 dBFS | SNR 62 dB
@@ -973,10 +1074,66 @@ run, holding the blocks plus the scores and acoustics that produced them:
 # Paste these two lines into a script (the '#' lines are ignored).
 {1, 200, 0, 200, 150, 300, 0.65, 50, 0.85, 5, 1, 30, 4, 0, 1, 1, 30}
 [1, FR, 1, -4, -0.1, 1.8, -1.7, 75, 8000, 0, 0, 0, 0, 0, 0, 1]
+#
+# ---- In words --------------------------------------------------
+#   {} sampling     : voice 1 | seed 200 | temp 0.65 | top_k 50 | top_p 0.85 | rep_pen 5 | len_pen 1
+#   {} edges        : trim_start 0 ms | trim_end 200 ms | fade_in 150 ms | fade_out 300 ms
+#   {} conditioning : gpt_cond_len 30 s | gpt_cond_chunk_len 4 s | max_ref_len 30 s | sound_norm_refs off
+#   {} decoding     : num_beams 1 | do_sample on
+#   [] voice     : 1 | language FR
+#   [] level, EQ : speed 1 | volume -4 dB | EQ low -0.1 dB / mid +1.8 dB / high -1.7 dB
+#   [] filters   : high-pass 75 Hz | low-pass 8000 Hz | noise reduction off | compression off | de-esser off
+#   [] effects   : reverb off | noise gate off | pan centre | limiter on
+#
+# ---- Run -------------------------------------------------------
+#   pipeline, voice 1 [FR], 2026-10-29 22:39
+#   seeds 200 201 202 203 | budget 60 | probe texts 2 | objective identity | w_accent 0.6 | w_identity 0.4
+#   conditioning search: gpt_cond_len 20 30 | chunks 4 6 8 10 | budget 34 | max_ref_len 30
+#   XTTS generations: conditioning 34 | sampling 40 | holdout 6
+#
+# ---- Curation --------------------------------------------------
+#   reference : .../Voices_Cloning/anna.wav
+#   curated   : .../Voices_Cloning/anna_curated.wav  (new, 45 s kept)
+#
+# ---- Starting point (analyser priors) --------------------------
+#   {} prior : {1, 42, 0, 200, 150, 300, 0.65, 50, 0.85, 5, 1, 30, 4, 0}
+#   [] prior : [1, FR, 1, 0, 0, 0, 0, 95, 0, 0, 0, 0, 0, 0, 0, 1]
+#
+# ---- Conditioning ----------------------------------------------
+#   1 reference file(s) cloned from: anna_curated.wav
+#   confirmation on seeds 11 12 13: kept the base gpt_cond_len 30 (best candidate +0.006 over the base, bar 0.020)
+#
+# ---- Tone fit --------------------------------------------------
+#   EQ weighting 'a'
+#   fitted sentence: Bonjour, je suis heureuse de vous accueillir pour cette séance.
+#   fitted on the reference from 0.00 s to 14.98 s
+#
+# ---- Audio search ----------------------------------------------
+#   off (--optimise-audio none): the [] is the tone fit
+#
+# ---- Unseen sentences (hold-out) -------------------------------
+#   H1: accent 0.930 | identity 0.660 | score 0.770 | WER 0.00 | Respirez profondément et laissez le calme venir.
+#
+# ---- Files -----------------------------------------------------
+#   clone to listen to : .../Voices_Cloning/anna_pipeline_clone.wav
+#   unseen render      : .../anna_pipeline_clone_holdout1.wav
 ```
 
-The blocks paste straight into a prompt. In `[Gen]`, the preset bar inserts,
-saves, deletes and browses them; inserting a preset that carries clone
+What the commentary is for: months later, the two blocks alone do not say which
+run they came from, what was fitted on, or whether the audio search changed
+anything. Each section is written from what the run knew and left out when it
+did not, and a `{}` or `[]` field the block does not set is shown as *not set*
+rather than as a value.
+
+The generator ignores every `#` line, so a preset file can be pasted whole into
+a script and gives exactly the two blocks; line breaks inside any value are
+flattened so that none can start a third. The pipeline keeps the file even if
+building the commentary fails. Files written before 3.8.0 keep working: they
+have no sections.
+
+In `[Gen]`, the preset bar inserts, saves, deletes and browses them. *Insert*
+adds a `# name - voice` comment above the blocks, and *Info* shows the whole
+commentary of the selected preset. Inserting a preset that carries clone
 references can restore them into the voice's row. `--preset-name` names them
 per voice from the pipeline, `--keep-preset-history` keeps earlier runs as
 `name (2)`, `name (3)`… instead of replacing them, and `--no-save-preset`
@@ -1225,18 +1382,25 @@ clone both ways, for a blind A/B.
 
 ### Audio search (`--optimise-audio`)
 
-After the tone fit, an optional search of `[]` against ECAPA identity
-(`nelder`, or `de` for a global search first). It is off by default; the budget
-(`--optimise-budget`, default 400) counts every render it scores. The pipeline
-and both tabs check before starting that it covers every trial and the
-pruning: 68 evaluations at most for a search of all the fields without a
-target level, 64 with one.
+After the tone fit, an optional search of `[]` (`nelder`, or `de` for a global
+search first). It is off by default. Since 3.10 there are two searches,
+chosen by `--audio-objective`: `fidelity`, the default of the pipeline and of
+the tabs (described [below](#the-fidelity-search---audio-objective-fidelity)
+and in [FIDELITY.md](FIDELITY.md)), and `identity`, the Comparator's own
+default, which is the search of 3.9 and what the numbered steps and the next
+paragraphs describe: it scores what `--objective` names, ECAPA identity, the
+timbre, or both. The two share the trials, the joint refinement, the pruning
+and the budget (`--optimise-budget`, default 400), which counts every render
+they score. The pipeline and both tabs check before starting that it covers
+every trial and the pruning: 68 evaluations at most for a search of all the
+fields without a target level, 64 with one.
 
 1. Every free field is tried on its own, the effects that are off included:
    hp, lp and the gate have an off state next to their active range, so the
    search cannot turn `lp 0` into a 6 kHz low-pass by clipping it into a range.
-2. The one-factor winners are combined, then refined jointly (Nelder-Mead;
-   with `de`, differential evolution first).
+2. The one-factor winners are combined and swept (about 70 to 80 evaluations),
+   then refined jointly (Nelder-Mead; with `de`, differential evolution first),
+   unless the search stops first (*Early stop*, below).
 3. **Pruning.** The block is adopted or rejected as a whole, so a field that
    does nothing for the score would keep whatever value the optimiser left it
    at. Each changed field goes back to its starting value when the block
@@ -1250,6 +1414,89 @@ target level, 64 with one.
    is. Their renders are kept next to the
    clone (`*_audio_holdout1_raw.wav`, `_base.wav`, `_candidate.wav`) with
    `*_audio_search.json`: values tried, failures, pruning, validation, decision.
+
+**What it maximises (`--objective`).** `identity` (the default of the Comparator
+and the pipeline): the ECAPA cosine between the render and the reference, which
+an EQ or a filter moves by less than its own noise (on one real voice, by
+0.004 at most). `timbre`: the timbre score of the `{}` search (see [What the
+score measures](#what-the-score-measures----objective)): pitch, brightness
+and HNR of the voiced frames against the whole reference, `1 / (1 + distance)`,
+0 for a render with no measurable voice. `both`: their mean. The accent is not
+scored here, effects do not change what is said. The pruning tolerance and the
+adoption bar are in the units of the score that is searched: the spread of that
+score between the two halves of the tone-fitted render. The pipeline forwards
+its `--objective` to every Comparator run when the search is on, so the [Auto]
+tab's Resemblance (`both`) covers the `[]` as well. If the reference timbre
+cannot be measured (no librosa or parselmouth, no voiced audio) the search says
+so and scores ECAPA alone. The pitch of the tone-fitted render is tracked once
+(the effects searched here colour a render, they do not move its pitch), and each
+candidate is measured against that voicing; a render whose length differs, as
+after a speed change, is measured from scratch.
+
+#### The fidelity search (`--audio-objective fidelity`)
+
+Same trials, refinement and pruning, a different judge and a different way to
+choose:
+
+- **The score** is half the ECAPA cosine and half an acoustic score of the
+  voiced speech (envelope, pitch, periodicity, sibilance, dynamics, floor),
+  which sees an EQ or a filter where ECAPA does not. `--objective` does not
+  apply to it.
+- **The tone fit is the baseline**, and what you get if nothing is proven
+  better. The input `[]` and a neutral block (effects off) are scored as they
+  stand and compete with it.
+- **Up to three finalists** (`--audio-finalists`) are checked on **three** other
+  sentences, against the tone fit, for a paired gain above `--audio-min-gain`
+  and one standard error, with guards on identity, word error rate, ASR score,
+  detected language and clipping. The one with the largest paired gain is
+  delivered; otherwise the tone fit. No early stop: the finalists are the
+  check.
+- **A last reserved sentence** from a list of its own (`--unseen-text` for
+  languages without one) is rendered for diagnosis and never ranks anything.
+- It keeps `*_tone.wav`, `*_audio_holdout<n>_*.wav` and
+  `*_fidelity_unseen_*.wav` next to the clone, and the report names every
+  render's `{}` and `[]`.
+- Speed, pan and limiter stay held unless `--search-all-fields`.
+
+**Early stop** (the `identity` search). The joint refinement takes most of the budget and works on the
+one sentence the trials already used: it can polish a change that carries over,
+never make one carry over. So the search stops before it in two cases.
+(1) The best change gained less than the pruning tolerance: the pruning would
+revert all of it. (2) The best candidate is generated on the two other
+sentences (once; they are kept for the final check) and does not gain on both,
+with a mean of at least half the adoption bar. The report says
+`stopped after N of B evaluations`, the preset file says it too, and a candidate
+refused at the checkpoint is reported as the candidate that was refused. The
+final adoption rule is the same as before: the early stop saves evaluations, it
+does not create gains.
+
+**The timbre, term by term.** A timbre score says how far the clone is, not
+where. The Comparator prints, for the final clone, pitch, brightness and HNR
+against the reference, the largest cost and what in the studio can move it, and
+the score of the raw render, the base `[]` and the final one; the pipeline's
+recap and the preset file carry it. `timbre_report.py` does the same on any WAV
+already on disk, with no model and no GPU:
+
+```
+python timbre_report.py reference.wav clone_raw.wav clone_final.wav
+```
+
+```
+Reference ref.wav: F0 210 Hz, centroid 1380 Hz, HNR 41.1 dB (Praat)
+
+low.wav
+                            reference      clone         gap    cost
+  pitch (F0)                  210.3 Hz    165.4 Hz     -4.2 st    2.08
+  brightness (centroid)      1379.8 Hz   3936.0 Hz  +2556.3 Hz    8.52
+  HNR                          41.1 dB      9.6 dB    -31.5 dB   10.51
+  distance 21.12 -> timbre score 0.05; largest cost: HNR (10.51 of 21.12)
+  what moves it: hardly anything: noise reduction gained +0.2 to +0.6 dB at its strongest setting
+```
+
+(Synthetic voices: the numbers show the layout, not a voice.) Pitch cannot be
+moved by the `[]` block at all (it has no pitch field, on purpose, until a
+breakdown shows that pitch is what costs), brightness by the EQ and the filters
+within `--eq-limit`, and the HNR hardly by anything it holds.
 
 **Speed, pan and limiter are held** at the block's values (`--search-all-fields`,
 or **Include speed, pan and limiter** in [Auto] and [Cmp], frees them; ticking
@@ -1268,7 +1515,8 @@ audio. If the search itself fails, the tone-fitted block is kept and the run
 goes on; the pipeline's recap names the failure.
 
 ECAPA is a speaker-recognition score: it does not hear naturalness, pace or
-comfort. Listen to the validation renders before keeping a searched block.
+comfort, and the timbre score does not hear them either. Listen to the validation
+renders before keeping a searched block.
 
 ### Fixes worth knowing about
 
@@ -1366,6 +1614,11 @@ listen.
 | `identity` *(default)* | ECAPA cosine against the reference embedding |
 | `timbre` | closeness in pitch, brightness and harmonic-to-noise ratio |
 | `both` | the mean of the two |
+
+Since 3.9 the same value is also what the Comparator's `--optimise-audio`
+maximises on the `[]` block (see [Audio search](#audio-search---optimise-audio)):
+the `{}` search scores the raw XTTS render with it, the `[]` search the render
+after the effects.
 
 ECAPA is robust to pitch shifts **by design** — it has to recognise someone who
 speaks higher today than yesterday. That is right for speaker verification and
@@ -1570,6 +1823,9 @@ passes it.
 | `--probe-texts N` | 2 | Sentences averaged per score (noise falls as 1/√n) |
 | `--adopt-alpha A` | 0.05 | Chance per stage of adopting pure noise; 1 = any gain wins |
 | `--budget`, `--cond-budget` | 60, 34 | Sampling / conditioning generations |
+| `--advanced-conditioning` | off | Also search stages C4b to C4d (below) |
+| `--speaker-ref-lens`, `--ref-trim-dbs` | `0 10 20 45`, `0 30 45 60` | The candidates of C4b and C4c (with `--advanced-conditioning`) |
+| `--joint-sampling N` | 0 | Stage S5: N Sobol combinations of temperature, `rep_pen`, `top_k`, `top_p` and `typical_p`, 1 to 64 (12 suggested) |
 
 ### Search stages (`xtts_optimize.py`)
 
@@ -1591,6 +1847,11 @@ Each combination is checked against its own reference cap. Keep
 carries prosody and accent, and neither score hears a regional accent (free to
 go down to 6 s, the search once picked 6 s on a Paris-French voice and the
 clone came out Canadian).
+
+With `--advanced-conditioning` (3.10), three stages follow: C4b a cap of its own
+for the speaker embedding (`speaker_ref_len`, the GPT keeping its latent), C4c
+the cutting of silence at the edges of each reference (`ref_trim_db`, on the
+CPU), C4d their combinations. See [FIDELITY.md](FIDELITY.md).
 
 **Sampling** (method `rsm`, `--budget`), matched to the structure of each axis:
 
@@ -1616,6 +1877,13 @@ clone came out Canadian).
    `beam_sample`, which yields inf/nan probabilities on the XTTS GPT and kills
    the process with a CUDA device-side assert. `xtts_clone.generate` clamps that
    combination, so the crash cannot be reached from any caller.
+
+5. **Joint sampling** (`--joint-sampling N`, S5, 3.10) — a Sobol sequence of N
+   combinations of `temp`, `rep_pen`, `top_k`, `top_p` and `typical_p`, which
+   reaches the `rep_pen` region below 4 that the one-axis stages never visit.
+   The two best are compared with the current setting on the same three seeds
+   and sentences, on paired differences, with identity and intelligibility
+   checked; a confirmation that is incomplete keeps the current setting.
 
 A stage cut short by its budget says so when it happens, in the summary, in
 the final block and in the result JSON (`truncated_stages`); the Pipeline
@@ -1779,10 +2047,13 @@ python -m unittest -v test_clonage_regressions test_complements_regressions \
     test_eq_headroom_regressions test_small_fixes_regressions \
     test_script_blocks_regressions test_confirmation_regressions \
     test_language_contract_regressions test_pron_numbers_regressions \
-    test_audio_parameter_search_regressions test_audio_search_review_regressions
+    test_audio_parameter_search_regressions test_audio_search_review_regressions \
+    test_preset_info_regressions test_latest_review_regressions \
+    test_bracket_criterion_regressions test_fidelity_regressions \
+    test_max_ref_len test_truncation
 ```
 
-302 regression tests, no model download needed: XTTS, Whisper, ECAPA,
+502 regression tests, no model download needed: XTTS, Whisper, ECAPA,
 SepFormer, pyannote, MFA, Applio and Rubber Band are simulated, so the tests
 check parsing, routing, budgets, decisions and the audio chain — not voice
 quality. The render tests drive the generator's own functions through the real
@@ -1796,8 +2067,19 @@ parselmouth). The tone-fit tests run the Comparator's fit through an exact model
 of the render chain, on noise and on synthetic harmonic voices, and once through
 the generator's own. The audio-search tests give the score known effects plus a
 small render-to-render perturbation, so they check what the search, the pruning
-and the adoption keep. Each fix and addition of 3.3 to 3.7.5 was checked by
-putting its bug back: every one makes at least one test fail.
+and the adoption keep. The 3.9 tests drive the Comparator with a stand-in
+encoder and timbre, the pipeline with stand-in commands, and the Comparator tab
+with stand-in widgets. The 3.10 tests drive the fidelity search on real signals
+with stand-in models: they check that the tone fit is the baseline and what a
+refused search gives back, that the input and neutral blocks compete, that
+`typical_p` reaches every generation, which options reach which search, and
+each threshold of the paired decision on both sides of its value.
+Each fix and addition of 3.3 to 3.9.0, and the scoring, the guards, the
+selection and the decision of the 3.10.0 fidelity search with the merge's own
+rules, was checked by putting its bug back: every one makes at least one test
+fail (the exceptions are listed in the [changelog](CHANGELOG.md)). The joint
+sampling, the conditioning stages and `compute_latents` of the patch rest on
+the patch's own tests and were not checked that way.
 
 ---
 

@@ -8,6 +8,7 @@ import contextlib
 import importlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -324,6 +325,7 @@ class ValidatorTests(unittest.TestCase):
             def export(self, path, **kw): Path(path).write_bytes(b'simulated audio')
         for parameter, value in (('gpt_cond_chunk_len', '6'), ('sound_norm_refs', '1'),
                                  ('num_beams', '3'), ('do_sample', '0'), ('max_ref_len', '45'),
+                                 ('speaker_ref_len', '20'), ('ref_trim_db', '45'), ('typical_p', '.9'),
                                  ('seed', 'none')):
             with self.subTest(parameter=parameter), tempfile.TemporaryDirectory() as td:
                 ref = Path(td) / 'reference.wav'; ref.touch()
@@ -344,8 +346,9 @@ class ValidatorTests(unittest.TestCase):
                         '--text', 'TEST', '--no-score', '--no-labels',
                         '--output', str(Path(td) / 'out.wav')])
                 self.assertEqual(generated[0]['seed'], None if parameter == 'seed' else 0)
-                target = latents[0] if parameter in ('gpt_cond_chunk_len', 'sound_norm_refs', 'max_ref_len') else generated[0]
-                self.assertEqual(target[parameter], None if value == 'none' else int(value))
+                target = latents[0] if parameter in ('gpt_cond_chunk_len', 'sound_norm_refs', 'max_ref_len',
+                                                    'speaker_ref_len', 'ref_trim_db') else generated[0]
+                self.assertEqual(target[parameter], None if value == 'none' else float(value))
 
     def test_invalid_cartesian_combination_is_rejected_before_models_load(self):
         with tempfile.TemporaryDirectory() as td:
@@ -397,7 +400,7 @@ class GuiTests(unittest.TestCase):
         def add_row(parent, label, var, row, *args, **kw): FakeWidget.entries[label] = var
         ns = dict(tk=tk, ttk=types.SimpleNamespace(Combobox=FakeWidget),
             scrolledtext=types.SimpleNamespace(ScrolledText=FakeWidget), os=os, sys=sys,
-            json=json, parse_block=settings.parse_block, HANDOFF={}, TARGETS=targets,
+            json=json, math=math, parse_block=settings.parse_block, HANDOFF={}, TARGETS=targets,
             DEFAULT_LANG='FR', LANGS=['FR'], DIR_VOICES='/voices', DIR_OUTPUT='/tmp',
             SCRIPTS_DIR=str(ROOT), _BUILTIN_TEXTS=set(), _default_text=lambda lang: 'TEST',
             scrollable_tab=lambda *a: (FakeWidget(), FakeWidget()), add_row=add_row,

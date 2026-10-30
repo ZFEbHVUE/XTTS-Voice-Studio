@@ -19,6 +19,8 @@ from test_truncation import load_texts, render_kwargs, conditioning_kwargs
 def isolated_latents(model, reference, settings, values, reference_duration, clone):
     """Compute once per cap; returned tuples share the identical GPT latent."""
     options = conditioning_kwargs(settings)
+    # This diagnostic explicitly replaces the speaker embedding per cap.
+    options.pop('speaker_ref_len', None)
     full_cap = max(math.ceil(reference_duration), settings['gpt_cond_len'], max(values))
     full = clone.compute_latents(model, reference, **dict(options, max_ref_len=full_cap))
     result = {}

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import math
 import tempfile
 import types
 import unittest
@@ -313,7 +314,7 @@ class AutoTabTests(unittest.TestCase):
         tk = types.SimpleNamespace(StringVar=Var, BooleanVar=Var, IntVar=Var, Frame=Widget,
                                    LabelFrame=Widget, Label=Widget, Entry=Widget, Button=Widget,
                                    Checkbutton=Widget)
-        ns = dict(tk=tk, ttk=types.SimpleNamespace(Combobox=Widget), os=os, sys=sys, SP=SP,
+        ns = dict(tk=tk, ttk=types.SimpleNamespace(Combobox=Widget), os=os, sys=sys, SP=SP, math=math,
                   threading=types.SimpleNamespace(Thread=SyncThread),
                   filedialog=types.SimpleNamespace(askopenfilename=lambda **k: ''),
                   scrollable_tab=lambda *a: (Widget(), Widget()), add_console=lambda *a: Widget(),

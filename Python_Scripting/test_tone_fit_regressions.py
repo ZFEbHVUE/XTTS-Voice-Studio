@@ -21,6 +21,25 @@ from audio_parameter_search import AUDIO_KEYS as AUDIO_FIELDS
 import voice_comparator as comparator
 import xtts_settings as settings
 from test_render_search_regressions import AudioSegment, CHAIN, generator_namespace, needs_audio
+import xtts_optimize as optimizer
+import voice_presets as real_presets
+
+
+_REAL_TIMBRE={name:getattr(optimizer,name) for name in ('timbre_features','timbre_features_array')}
+
+
+def no_real_timbre_analysis():
+    """The comparator measures the timbre of its clones (3.9) with librosa. These
+    harnesses run main() with `soundfile` and friends replaced by stand-ins, and a
+    library first imported under such a replacement is imported a second time
+    afterwards: its native extension refuses that and aborts the whole process.
+    So no real audio analysis runs under them, unless a test installed a fake of
+    its own (the tests of the timbre do)."""
+    stack=contextlib.ExitStack()
+    for name,real in _REAL_TIMBRE.items():
+        if getattr(optimizer,name) is real:
+            stack.enter_context(patch.object(optimizer,name,lambda *a,**kw:None))
+    return stack
 
 
 def shaped_noise(sr, seconds, seed, tilt_db=0.):
@@ -619,6 +638,7 @@ class ComparatorStageTests(unittest.TestCase):
 
     def run_main(self,block,extra,identity=lambda block:.8, return_report=False, post_error=None,
                  presets=None, dynamics=False):
+        self.preset_infos=[];self.generated=[];self.quiet_targets=[]
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);reference=root/'reference.wav'
             tone=np.sin(2*np.pi*200*np.arange(48000)/24000).astype(np.float32)*.02
@@ -633,7 +653,7 @@ class ComparatorStageTests(unittest.TestCase):
                 return data,rate
             clone=types.SimpleNamespace(load_xtts=lambda device:(None,None),
                 compute_latents=lambda *a,**kw:(None,None),
-                generate=lambda model,text,lang,lat,path,**kw:wavfile.write(path,24000,tone))
+                generate=lambda model,text,lang,lat,path,**kw:(self.generated.append(Path(path).name),wavfile.write(path,24000,tone))[-1])
             last,quiet=[None],[]
             def post(src,dst,blk,*a):
                 last[0]=dict(blk, _source=Path(src).name);shutil.copyfile(src,dst)
@@ -642,7 +662,7 @@ class ComparatorStageTests(unittest.TestCase):
                     raise RuntimeError('render failed')
                 post(src,dst,blk)
             def quiet_post(src,dst,blk,*a):
-                quiet.append(dict(blk));post(src,dst,blk)
+                quiet.append(dict(blk));self.quiet_targets.append(Path(dst).name);post(src,dst,blk)
             class Encoder:
                 def __init__(self,**kw): pass
                 def embed(self,source,sr=None): return np.array([1.,0.])
@@ -652,8 +672,9 @@ class ComparatorStageTests(unittest.TestCase):
                 'speaker_identity':types.SimpleNamespace(SpeakerEncoder=Encoder)}
             if presets is not None:
                 modules['voice_presets']=types.SimpleNamespace(PRESET_DIR=str(root),
-                    name_from_reference=lambda path:'Voice',
-                    save=lambda name,xtts_block,audio_block,**kw:presets.append(audio_block) or name)
+                    name_from_reference=lambda path:'Voice',explain_timbre=real_presets.explain_timbre,
+                    save=lambda name,xtts_block,audio_block,**kw:(
+                        presets.append(audio_block),self.preset_infos.append(kw.get('info')),name)[-1])
             argv=['voice_comparator.py',str(reference),'FR','--xtts-block',settings.format_block({'seed':0}),
                 '--audio-block',block,'--raw-clone',str(given),'--text','Bonjour Elo.',
                 '--reference-interval','0.5','1.5','--device','cpu','--no-fit-dynamics','--no-identity-check',
@@ -665,7 +686,7 @@ class ComparatorStageTests(unittest.TestCase):
             with patch.dict(sys.modules,modules),patch.object(sys,'argv',argv), \
                  patch.object(comparator,'apply_post',side_effect=loud_post), \
                  patch.object(comparator,'_quiet_post',side_effect=quiet_post), \
-                 contextlib.redirect_stdout(out):
+                 no_real_timbre_analysis(),contextlib.redirect_stdout(out):
                 self.assertFalse(comparator.main())     # exit status 0
             if return_report:
                 report=json.loads((root/'fit_audio_search.json').read_text())
@@ -731,6 +752,22 @@ class ComparatorStageTests(unittest.TestCase):
         self.assertEqual(report['error'],'encoder lost')
         # The tone fit is a complete result: saved like one from a run without the search.
         self.assertEqual(presets,[nxt[0].strip()])
+        # ... and its commentary says the search failed, so the file does not read like a searched result.
+        self.assertIn('FAILED: encoder lost',' '.join(self.preset_infos[0]['Audio search']))
+        self.assertIn('fit.wav',' '.join(self.preset_infos[0]['Files']))
+
+    def test_a_preset_from_the_comparator_says_what_the_search_decided(self):
+        presets=[]
+        out,_=self.run_main('[1, FR, 0.9, 0, 0, 0, 0, 90, 0, 0, 0.2, 0.15, 0, 0, 0, 1]',
+            ['--optimise-audio','nelder','--optimise-budget','120','--save-preset'],
+            identity=lambda block:.7+.1*(block.get('lp')==8000),presets=presets)
+        self.assertIn('ADOPTED',out)
+        audio=' '.join(self.preset_infos[0]['Audio search'])
+        self.assertIn('result: adopted',audio)
+        self.assertIn('method nelder',audio)
+        tone=' '.join(self.preset_infos[0]['Tone fit'])
+        self.assertIn('Bonjour Elo.',tone)
+        self.assertIn('0.50 s to 1.50 s',tone)
 
     def test_a_failure_after_adoption_still_leaves_the_tone_fit(self):
         out,_=self.run_main('[1, FR, 1, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 1]',

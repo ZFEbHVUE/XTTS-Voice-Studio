@@ -1225,7 +1225,8 @@ def tab_generator(nb):
             _status("No preset selected")
             return
         _restore_preset_refs(d)
-        _insert(f"{d['xtts']}\n{d['audio']}")
+        # A comment line (ignored by the generator) names the voice above the blocks.
+        _insert(VP.insert_text(d))
 
     def _delete_preset():
         if not VP or v_preset.get() not in VP.load():
@@ -1244,6 +1245,19 @@ def tab_generator(nb):
               width=7).pack(side='left', padx=2)
     tk.Button(preset_bar, text="Save current", command=_save_preset,
               width=12).pack(side='left', padx=2)
+    def _preset_details():
+        """The whole commentary of the selected preset: the blocks in words and
+        how the run that produced them went."""
+        if not VP or not v_preset.get():
+            return
+        text = VP.info_text(v_preset.get())
+        if not text:
+            _status("No preset selected")
+            return
+        messagebox.showinfo(f"Voice preset: {v_preset.get()}", text, parent=f)
+
+    tk.Button(preset_bar, text="Info", command=_preset_details,
+              width=6).pack(side='left', padx=2)
     tk.Button(preset_bar, text="Delete", command=_delete_preset,
               width=7).pack(side='left', padx=2)
     def _browse_preset():
@@ -1264,7 +1278,7 @@ def tab_generator(nb):
             _status(f"No {{}} / [] pair in {os.path.basename(p)}")
             return
         _restore_preset_refs(e)
-        _insert(f"{e['xtts']}\n{e['audio']}")
+        _insert(VP.insert_text(e))
         bits = [e.get('source', ''), e.get('date', ''), e.get('scores_text', '')]
         _status(f"{e.get('name', os.path.basename(p))} - "
                 + '  |  '.join(b for b in bits if b))
@@ -1813,6 +1827,11 @@ def tab_auto(nb):
     # Opt-in: the ECAPA search of [] is a long run whose result has to be heard.
     v_a_optaud = tk.StringVar(value='none')
     v_a_audbudget = tk.StringVar(value='400')
+    v_a_audio_objective = tk.StringVar(value='fidelity')
+    v_a_advanced_conditioning = tk.BooleanVar(value=False)
+    v_a_joint_sampling = tk.BooleanVar(value=False)
+    v_a_eq_limit = tk.StringVar(value='4')
+    v_a_beam_width = tk.StringVar(value='3')
     v_a_all_fields = tk.BooleanVar(value=False)
     def _enable_full_audio_search(*_):
         if v_a_all_fields.get() and v_a_optaud.get() == 'none':
@@ -1871,6 +1890,7 @@ def tab_auto(nb):
         if seeds is None:
             return
         need = SP.pipeline_sampling_budget(seeds, v_a_beams.get())
+        need += SP.joint_sampling_plan(12, 2) if v_a_joint_sampling.get() else 0
         v_a_budget.set(str(need))
         log(console, f"[*] Budget set to {need}: the whole sampling plan for "
                      f"{len(set(seeds))} seed(s)"
@@ -2090,7 +2110,8 @@ def tab_auto(nb):
             return None
         return SP.pipeline_conditioning_budget(
             SP.find_ints(_field(v_a_gcl, 'gcl')), SP.find_ints(_field(v_a_chunks, 'chunks')),
-            ref_lengths, max_ref, [s for _p, s, _w in secs])
+            ref_lengths, max_ref, [s for _p, s, _w in secs],
+            extension_trials=SP.conditioning_extension_trials() if v_a_advanced_conditioning.get() else 0)
 
     def _auto_cond():
         """Conditioning budget that runs every stage in full, for every voice."""
@@ -2158,6 +2179,37 @@ def tab_auto(nb):
     tk.Label(extra, text="Checking includes every numeric [] field and enables nelder if needed. "
                          "Changes below the tolerance are pruned.", fg='grey', wraplength=580,
              justify='left', font=("Arial", 8)).grid(row=8, column=0, columnspan=3, sticky='w')
+    tk.Label(extra, text='Audio objective').grid(row=9, column=0, sticky='w')
+    ttk.Combobox(extra, textvariable=v_a_audio_objective, values=['fidelity', 'identity'],
+                 width=12, state='readonly').grid(row=9, column=1, sticky='w', padx=4)
+    tk.Label(extra, text='fidelity: ECAPA + acoustic profile, finalists checked on three other '
+                         'sentences. identity: the Objective menu above decides (ECAPA, timbre or both).',
+             fg='grey', wraplength=580, justify='left', font=('Arial', 8)).grid(
+        row=15, column=0, columnspan=3, sticky='w')
+    tk.Checkbutton(extra, text='Advanced XTTS conditioning (speaker cap, silence trim)',
+                   variable=v_a_advanced_conditioning).grid(row=10, column=0, columnspan=3, sticky='w')
+    tk.Checkbutton(extra, text='Joint XTTS sampling (12 Sobol candidates, paired seeds)',
+                   variable=v_a_joint_sampling).grid(row=11, column=0, columnspan=3, sticky='w')
+    def _fidelity_setup():
+        v_a_prio.set('Resemblance')
+        v_a_obj.set('both')
+        v_a_audio_objective.set('fidelity')
+        v_a_optaud.set('de')
+        v_a_advanced_conditioning.set(True)
+        v_a_joint_sampling.set(True)
+        v_a_eq_limit.set('8')
+        v_a_beams.set(True)
+        v_a_beam_width.set('2')
+        _auto_all()
+        log(console, '[*] Fidelity setup: identity+timbre {}, advanced conditioning, joint sampling, '
+                     'acoustic [] search and paired multi-text validation. Speed, pan and limiter '
+                     'keep following "Include speed, pan and limiter" (not ticked by this button).')
+    tk.Button(extra, text='Fidelity setup + auto budgets', command=_fidelity_setup, name='fidelity_setup').grid(
+        row=12, column=0, columnspan=3, sticky='w', pady=4)
+    tk.Label(extra, text='EQ limit (dB)').grid(row=13, column=0, sticky='w')
+    tk.Entry(extra, textvariable=v_a_eq_limit, width=8).grid(row=13, column=1, sticky='w', padx=4)
+    tk.Label(extra, text='Beam width (when enabled)').grid(row=14, column=0, sticky='w')
+    tk.Entry(extra, textvariable=v_a_beam_width, width=8).grid(row=14, column=1, sticky='w', padx=4)
 
     sent = tk.Frame(f)
     sent.grid(row=8, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
@@ -2168,8 +2220,8 @@ def tab_auto(nb):
         tk.Button(sent, text="Browse", width=8,
                   command=lambda v=var: browse_file(v, [("Text", "*.txt"), ("All", "*.*")])
                   ).grid(row=i, column=2, sticky='w')
-    tk.Label(sent, text="Optional, one sentence per line (# lines skipped); the first two "
-                        "of each file are used. Empty = the built-in sentences. Lines from "
+    tk.Label(sent, text="Optional, one sentence per line (# lines skipped). Native search uses two; "
+                        "audio fidelity selects three and fills from built-ins if needed. Lines from "
                         "your own script make the search and the hold-out speak like it.",
              fg='grey', font=("Arial", 8), justify='left', wraplength=560).grid(
         row=2, column=0, columnspan=3, sticky='w')
@@ -2184,6 +2236,7 @@ def tab_auto(nb):
                 log(console, f"[!] Seed {' '.join(map(str, odd))} is far above the others: "
                              f"a missing space? It runs as one seed.")
             need = SP.pipeline_sampling_budget(seeds, v_a_beams.get())
+            need += SP.joint_sampling_plan(12, 2) if v_a_joint_sampling.get() else 0
             have = int(_field(v_a_budget, 'budget'))
             if have < need:
                 log(console, f"[!] Budget {have} is below the whole sampling plan ({need}): "
@@ -2198,7 +2251,8 @@ def tab_auto(nb):
             need = SP.pipeline_conditioning_budget(
                 SP.find_ints(_field(v_a_gcl, 'gcl')), SP.find_ints(_field(v_a_chunks, 'chunks')),
                 SP.parse_ints(v_a_mrls.get()), int(float(_field(v_a_maxref, 'maxref'))),
-                [s for _p, s, _w in secs])
+                [s for _p, s, _w in secs],
+                extension_trials=SP.conditioning_extension_trials() if v_a_advanced_conditioning.get() else 0)
             if have < need:
                 log(console, f"[!] Conditioning budget {have} is below the whole "
                              f"conditioning plan ({need}): its last stages will try fewer "
@@ -2218,6 +2272,17 @@ def tab_auto(nb):
         cmd += ['--budget', _field(v_a_budget, 'budget')]
         cmd += ['--cond-budget', _field(v_a_cond, 'cond')]
         cmd += ['--gpt-chunks', _field(v_a_chunks, 'chunks')]
+        try:
+            eq_limit = float(v_a_eq_limit.get())
+            if not math.isfinite(eq_limit) or eq_limit <= 0:
+                raise ValueError
+        except ValueError:
+            log(console, '[ERR] EQ limit must be finite and positive.'); return
+        cmd += ['--eq-limit', str(eq_limit)]
+        if v_a_advanced_conditioning.get():
+            cmd += ['--advanced-conditioning']
+        if v_a_joint_sampling.get():
+            cmd += ['--joint-sampling', '12']
         cmd += ['--max-ref-len', _field(v_a_maxref, 'maxref')]
         if v_a_mrls.get().strip():
             cmd += ['--max-ref-lens', v_a_mrls.get().strip()]
@@ -2236,7 +2301,13 @@ def tab_auto(nb):
         if not v_a_autotx.get():
             cmd += ['--no-auto-text']
         if v_a_beams.get():
-            cmd += ['--probe-beams']
+            try:
+                beam_width = int(v_a_beam_width.get())
+                if beam_width < 2:
+                    raise ValueError
+            except ValueError:
+                log(console, '[ERR] Beam width must be an integer >= 2.'); return
+            cmd += ['--probe-beams', '--beam-width', str(beam_width)]
         if not v_a_prec.get():
             cmd += ['--fast']
         if v_a_f0.get() != 'pyin':
@@ -2251,14 +2322,15 @@ def tab_auto(nb):
         if v_a_optaud.get() != 'none':
             from audio_parameter_search import EDITORIAL_FIELDS, worst_case_budget
             held = {} if v_a_all_fields.get() else EDITORIAL_FIELDS
-            minimum = max(64, worst_case_budget(4., bool(v_a_target.get().strip()), held))
+            minimum = max(64, worst_case_budget(eq_limit, bool(v_a_target.get().strip()), held))
             try:
                 audio_budget = int(v_a_audbudget.get().strip() or '400')
                 if audio_budget < minimum:
                     raise ValueError
             except ValueError:
                 log(console, f"[ERR] Audio search budget must be an integer >= {minimum}."); return
-            cmd += ['--optimise-budget', str(audio_budget)]
+            cmd += ['--optimise-budget', str(audio_budget),
+                    '--audio-objective', v_a_audio_objective.get()]
             if v_a_all_fields.get():
                 cmd += ['--search-all-fields']
         if v_a_target.get().strip():
@@ -3280,7 +3352,7 @@ def tab_validator(nb):
     row += 1
     tk.Entry(f, textvariable=v_val_audio).grid(row=row, column=1, sticky='ew', padx=4)
 
-    ALL_PARAMS = ['gpt_cond_chunk_len', 'sound_norm_refs', 'num_beams', 'do_sample',
+    ALL_PARAMS = ['speaker_ref_len', 'ref_trim_db', 'typical_p', 'gpt_cond_chunk_len', 'sound_norm_refs', 'num_beams', 'do_sample',
                   'max_ref_len', 'trim_start', 'trim_end', 'fade_in', 'fade_out', 'limiter', 'seed','temp','top_k','top_p','rep_pen','len_pen','gpt_cond_len',
                   'speed','vol','eq_low','eq_mid','eq_high','hp','lp','NR','comp','de-ess','reverb','noise_gate','pan']
 
@@ -3298,6 +3370,8 @@ def tab_validator(nb):
     lbl_total = tk.Label(f, text="Total: 1 combination", fg='gray', font=('Arial',8))
 
     VAL_DEFAULTS = {
+        'speaker_ref_len': 0, 'ref_trim_db': 0,
+        'typical_p': 1.,
         'gpt_cond_chunk_len': 4, 'sound_norm_refs': 0, 'num_beams': 1,
         'do_sample': 1, 'max_ref_len': 30, 'trim_start': 0, 'trim_end': 0,
         'fade_in': 100, 'fade_out': 250, 'limiter': 1,
@@ -3573,6 +3647,12 @@ def tab_optimize(nb):
     ttk.Combobox(advanced, textvariable=v_opt_method, values=['rsm', 'coord'],
                  width=7, state='readonly').pack(side='left', padx=4)
     tk.Checkbutton(advanced, text='Test beam/greedy (RSM)', variable=v_opt_beams).pack(side='left')
+    v_opt_advanced_conditioning = tk.BooleanVar(value=False)
+    v_opt_joint_sampling = tk.BooleanVar(value=False)
+    tk.Checkbutton(advanced, text='Speaker cap / ref trim',
+                   variable=v_opt_advanced_conditioning).pack(side='left')
+    tk.Checkbutton(advanced, text='Joint sampling (12)',
+                   variable=v_opt_joint_sampling).pack(side='left')
     tk.Label(f, text='Budget = sampling only; conditioning and validation add generations. '
                     'Leave reference lengths empty to keep max_ref_len. Scores help shortlist; listen to the finalists.',
              wraplength=600, justify='left', fg='gray').grid(
@@ -3604,6 +3684,10 @@ def tab_optimize(nb):
             cmd += ['--max-ref-lens', v_opt_mrls.get().strip()]
         if v_opt_beams.get():
             cmd += ['--probe-beams']
+        if v_opt_advanced_conditioning.get():
+            cmd += ['--advanced-conditioning']
+        if v_opt_joint_sampling.get():
+            cmd += ['--joint-sampling', '12']
         cmd += ['--w-accent', v_opt_wacc.get().strip() or '0.6']
         cmd += ['--w-identity', v_opt_wid.get().strip() or '0.4']
         cmd += ['--max-ref-len', v_opt_maxref.get().strip() or '30']
@@ -3917,15 +4001,33 @@ def tab_comparator(nb):
     tk.Label(frm_search, text="Target dBFS (optional)").pack(side='left', padx=(8, 2))
     v_cmp_target = tk.StringVar(value='')
     tk.Entry(frm_search, textvariable=v_cmp_target, width=6).pack(side='left')
+    tk.Label(frm_search, text='EQ limit dB').pack(side='left', padx=(8, 2))
+    v_cmp_eq_limit = tk.StringVar(value='4')
+    tk.Entry(frm_search, textvariable=v_cmp_eq_limit, width=4).pack(side='left')
 
     row += 1
+    frm_fields = tk.Frame(f)
+    frm_fields.grid(row=row, column=0, columnspan=2, sticky='w', padx=6)
     v_cmp_all_fields = tk.BooleanVar(value=False)
     def _enable_full_audio_search(*_):
         if v_cmp_all_fields.get() and v_cmp_search.get() == 'none':
             v_cmp_search.set('nelder')
     v_cmp_all_fields.trace_add('write', _enable_full_audio_search)
-    tk.Checkbutton(f, text="Include speed, pan and limiter", variable=v_cmp_all_fields).grid(
-        row=row, column=0, columnspan=2, sticky='w', padx=6)
+    tk.Checkbutton(frm_fields, text="Include speed, pan and limiter",
+                   variable=v_cmp_all_fields).pack(side='left')
+    # What the [] search scores. ECAPA identity cannot see most effects (an EQ
+    # or a filter moves it by less than its noise); the timbre and the acoustic
+    # profile can. fidelity is its own search (finalists checked on three
+    # sentences); the other three are the identity search of 3.9 with a
+    # different second term.
+    tk.Label(frm_fields, text="  Search target").pack(side='left', padx=(12, 2))
+    v_cmp_objective = tk.StringVar(value='fidelity')
+    ttk.Combobox(frm_fields, textvariable=v_cmp_objective,
+                 values=['fidelity', 'identity', 'timbre', 'both'],
+                 width=8, state='readonly').pack(side='left')
+    tk.Label(frm_fields, text="(fidelity = ECAPA + acoustic profile; identity = ECAPA only; "
+                              "timbre/both add pitch, brightness and HNR)",
+             fg='gray', font=('Arial', 8)).pack(side='left', padx=6)
 
     row += 1
     console = add_console(foot, 0)
@@ -3952,10 +4054,13 @@ def tab_comparator(nb):
             n_iter = int(v_cmp_iter.get() or 3)
             conv_thr = float(v_cmp_conv.get() or .5)
             audio_budget = int(v_cmp_budget.get().strip() or '400')
+            eq_limit = float(v_cmp_eq_limit.get())
+            if not math.isfinite(eq_limit) or eq_limit <= 0:
+                raise ValueError('EQ limit must be finite and positive')
             if v_cmp_search.get() != 'none':
                 from audio_parameter_search import EDITORIAL_FIELDS, worst_case_budget
                 held = {} if v_cmp_all_fields.get() else EDITORIAL_FIELDS
-                minimum = max(64, worst_case_budget(4., bool(v_cmp_target.get().strip()), held))
+                minimum = max(64, worst_case_budget(eq_limit, bool(v_cmp_target.get().strip()), held))
                 if audio_budget < minimum:
                     raise ValueError(f'audio budget must be >= {minimum}')
             if v_cmp_target.get().strip():
@@ -3984,8 +4089,16 @@ def tab_comparator(nb):
             cmd += ["--iterations", str(max_iter)]
             cmd += ["--conv-threshold", str(conv)]
             cmd += ['--optimise-audio', v_cmp_search.get(), '--optimise-budget', str(audio_budget)]
+            cmd += ['--eq-limit', str(eq_limit)]
             if v_cmp_search.get() != 'none' and v_cmp_all_fields.get():
                 cmd += ['--search-all-fields']
+            if v_cmp_search.get() != 'none':
+                # Said either way, so that the tab never leans on the script's
+                # default. timbre and both are the identity search's second term.
+                target = v_cmp_objective.get()
+                cmd += ['--audio-objective', 'fidelity' if target == 'fidelity' else 'identity']
+                if target in ('timbre', 'both'):
+                    cmd += ['--objective', target]
             if v_cmp_target.get().strip():
                 cmd += ['--target-dbfs', v_cmp_target.get().strip()]
             if v_cmp_eqw.get() != 'a':

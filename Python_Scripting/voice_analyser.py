@@ -872,10 +872,20 @@ def display_results(params, stats, voice_num=1, wav_file=None, language='FR', se
             _ac = (f"{s['voice_type']} | F0 {s['f0_median']:.0f} Hz | "
                    f"{s['voiced_ratio']:.0%} voiced | {s['rms_db']:.1f} dBFS | "
                    f"SNR {s['snr']:.0f} dB")
+            _info = {'Analysis': [
+                f"analysis: {_analysis} | seed {seed}",
+                f"F0 median {s['f0_median']:.0f} Hz | F0 variation {s['f0_jitter']:.3f} "
+                f"(std/median) | voiced {s['voiced_ratio']:.0%}",
+                f"level {s['rms_db']:.1f} dBFS | SNR {s['snr']:.1f} dB | "
+                f"crest factor {s['crest_factor_db']:.1f} dB",
+                f"sibilance {s['sib_ratio']:.3f} | breathiness {s['breathiness']:.3f} "
+                f"(0 tonal, 1 noisy)",
+                "priors only: the audio block is neutral, not fitted to the reference. "
+                "Run voice_comparator.py (or the pipeline) to fit it."]}
             nm = VP.save(_nm,
                          '{' + xtts_str + '}', '[' + audio_str + ']',
                          reference=wav_file, source='analyser', acoustics=_ac,
-                         note='priors only — audio block not fitted yet')
+                         note='priors only - audio block not fitted yet', info=_info)
             print(f"  [*] Preset '{nm}' saved (priors; run the comparator to fit [])")
         except Exception as e:
             print(f"  [!] Preset save failed: {e}")

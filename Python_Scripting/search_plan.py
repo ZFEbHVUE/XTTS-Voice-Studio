@@ -31,6 +31,17 @@ S3_AXES = (("rep_pen", [4., 5., 7., 10.]),
            ("top_k", [30, 50, 70]))
 S4_LENGTH_PENALTIES = [0.8, 0.9, 1.0, 1.1, 1.2]
 
+
+def joint_sampling_plan(candidates=12, n_texts=2):
+    """Sobol screening plus two finalists/base on two extra matched seeds."""
+    return (int(candidates)+6)*int(n_texts) if candidates else 0
+
+
+def conditioning_extension_trials(speaker_lengths=(0, 10, 20, 45), trim_dbs=(0, 30, 45, 60)):
+    """Safe extra stage slots, including cap/trim pairs and outside incumbents."""
+    a, b = len(set(speaker_lengths)), len(set(trim_dbs))
+    return a+b+((a+1)*(b+1) if a and b else 0)
+
 # ── Conditioning schedule ─────────────────────────────────────────────────────
 NOISE_PROBES = 4         # extra seeds rendered at the base conditioning; C6
                          # renders its finalists on the same seeds
@@ -137,7 +148,7 @@ def sampling_plan(n_seeds, keep_seeds, n_texts, start, method="rsm",
     return candidates * n_texts
 
 
-def pipeline_sampling_budget(seeds, probe_beams=False):
+def pipeline_sampling_budget(seeds, probe_beams=False, n_texts=None):
     """--budget that runs the pipeline's whole sampling plan, whatever the voice.
 
     The analyser's temperature is not known before the run, so it is taken as
@@ -148,7 +159,7 @@ def pipeline_sampling_budget(seeds, probe_beams=False):
     if n < 1:
         raise ValueError("At least one seed is required")
     start = dict(ANALYSER_SAMPLING, temp=float("nan"))
-    return sampling_plan(n, PIPELINE_KEEP_SEEDS, PIPELINE_PROBE_TEXTS, start,
+    return sampling_plan(n, PIPELINE_KEEP_SEEDS, PIPELINE_PROBE_TEXTS if n_texts is None else n_texts, start,
                          "rsm", 2, probe_beams)
 
 
@@ -194,7 +205,7 @@ def conditioning_candidates(gcl_lens, chunks, ref_lengths, base_gcl, base_chunk,
 
 
 def conditioning_plan(gcl_lens, chunks, ref_lengths, base_gcl, base_chunk, base_max_ref,
-                      n_refs=1, n_texts=1, ref_sets=0):
+                      n_refs=1, n_texts=1, ref_sets=0, extension_trials=0):
     """--cond-budget that runs every conditioning stage in full, whatever wins.
 
     An upper bound on the generations (every candidate the stages can render,
@@ -231,7 +242,10 @@ def conditioning_plan(gcl_lens, chunks, ref_lengths, base_gcl, base_chunk, base_
              + len(_unique([c for c in chunks if c >= 1]))
              + C2B_PAIRS + 1 + (ref_sets if n_refs > 1 else 0) + C5_SCREEN)
     confirm = CONFIRM_FINALISTS * NOISE_PROBES
-    need = (min(total, slots) + NOISE_PROBES + confirm) * n_texts + C2B_RESERVE
+    # Extra axes can make a previously seen GPT/cap tuple a new render.
+    # Count stage slots instead of the old four-axis universe in that case.
+    screening = slots + extension_trials if extension_trials else min(total, slots)
+    need = (screening + NOISE_PROBES + confirm) * n_texts + C2B_RESERVE
     return max(need, (1 + NOISE_PROBES + NOISE_PROBE_MARGIN) * n_texts)
 
 
@@ -304,7 +318,8 @@ def chunk_candidates(gcl_lens, max_ref, n_refs=1):
     return [c for c in CHUNK_LADDER if c <= shortest] or [shortest]
 
 
-def pipeline_conditioning_budget(gcl_lens, chunks, ref_lengths, max_ref, seconds):
+def pipeline_conditioning_budget(gcl_lens, chunks, ref_lengths, max_ref, seconds,
+                                 extension_trials=0):
     """--cond-budget that runs every conditioning stage for every voice.
 
     The pipeline gives the optimiser one reference per voice, and the
@@ -312,5 +327,6 @@ def pipeline_conditioning_budget(gcl_lens, chunks, ref_lengths, max_ref, seconds
     length, so each voice has its own plan: the largest one decides.
     """
     return max(conditioning_plan(gcl_lens, chunks, ref_lengths, analyser_gcl_prior(s),
-                                 ANALYSER_CHUNK, max_ref, 1, PIPELINE_COND_TEXTS)
+                                 ANALYSER_CHUNK, max_ref, 1, PIPELINE_COND_TEXTS,
+                                 extension_trials=extension_trials)
                for s in seconds)

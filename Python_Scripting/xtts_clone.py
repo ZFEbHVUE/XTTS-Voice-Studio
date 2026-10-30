@@ -23,6 +23,7 @@ API:
 """
 
 import os
+import tempfile
 import numpy as np
 from xtts_settings import validate
 
@@ -38,7 +39,8 @@ def load_xtts(device=None):
 
 
 def compute_latents(model, speaker_wav, gpt_cond_len=30, gpt_cond_chunk_len=4,
-                    max_ref_len=30, sound_norm_refs=False):
+                    max_ref_len=30, sound_norm_refs=False, speaker_ref_len=0,
+                    ref_trim_db=0):
     """Precompute (gpt_cond_latent, speaker_embedding), honouring every knob.
 
     gpt_cond_chunk_len must be <= gpt_cond_len (XTTS asserts this).
@@ -52,14 +54,52 @@ def compute_latents(model, speaker_wav, gpt_cond_len=30, gpt_cond_chunk_len=4,
             raise FileNotFoundError(f'Voice reference not found: {path}')
     p = validate(dict(gpt_cond_len=gpt_cond_len,
                       gpt_cond_chunk_len=gpt_cond_chunk_len,
-                      max_ref_len=max_ref_len, sound_norm_refs=sound_norm_refs))
-    return model.get_conditioning_latents(
+                      max_ref_len=max_ref_len, sound_norm_refs=sound_norm_refs,
+                      speaker_ref_len=speaker_ref_len, ref_trim_db=ref_trim_db))
+    options = dict(
         audio_path=list(paths),
         gpt_cond_len=p['gpt_cond_len'],
         gpt_cond_chunk_len=p['gpt_cond_chunk_len'],
         max_ref_length=p['max_ref_len'],
         sound_norm_refs=bool(p['sound_norm_refs']),
     )
+    # Coqui's source moves audio to the GPU before calling librosa.trim.
+    # Prepare this documented operation on CPU instead, cap THEN trim as in
+    # the native path, and let XTTS load the resulting float WAV normally.
+    with tempfile.TemporaryDirectory(prefix='xtts_conditioning_') as directory:
+        def prepared(call_options):
+            if not p['ref_trim_db']:
+                return call_options
+            import librosa
+            import soundfile as sf
+            from scipy.signal import resample_poly
+            from math import gcd
+            result = []
+            cap = call_options['max_ref_length']
+            for index, path in enumerate(paths):
+                y, sr = sf.read(path, always_2d=False, dtype='float32')
+                if y.ndim == 2:
+                    y = y.mean(axis=1)
+                if sr != 22050:
+                    divisor = gcd(int(sr), 22050)
+                    y = resample_poly(y, 22050//divisor, int(sr)//divisor)
+                y = y[:int(cap*22050)]
+                y, _ = librosa.effects.trim(y, top_db=p['ref_trim_db'])
+                if len(y) < 22050/3 or not np.isfinite(y).all() or np.max(np.abs(y)) < 1e-6:
+                    raise ValueError('Reference trimming left no usable conditioning audio')
+                out = os.path.join(directory, f'ref_{cap}_{index}.wav')
+                sf.write(out, y, 22050, subtype='FLOAT')
+                result.append(out)
+            return dict(call_options, audio_path=result)
+
+        latents = model.get_conditioning_latents(**prepared(options))
+        if p['speaker_ref_len'] and p['speaker_ref_len'] != p['max_ref_len']:
+            # Replace ONLY the speaker embedding; GPT prosody stays identical.
+            speaker_options = dict(options, max_ref_length=p['speaker_ref_len'],
+                                   gpt_cond_len=1, gpt_cond_chunk_len=1)
+            speaker = model.get_conditioning_latents(**prepared(speaker_options))[1]
+            return latents[0], speaker
+        return latents
 
 
 def set_seed(seed):
@@ -83,14 +123,14 @@ def set_seed(seed):
 def generate(model, text, lang, latents, out_path,
              temperature=0.65, length_penalty=1.0, repetition_penalty=5.0,
              top_k=50, top_p=0.85, speed=1.0, enable_text_splitting=True,
-             seed=None, num_beams=1, do_sample=True):
+             seed=None, num_beams=1, do_sample=True, typical_p=1.):
     """Generate one clip from precomputed latents and write a 24 kHz WAV.
     num_beams>1 uses deterministic beam search. With one beam,
     do_sample=False selects greedy decoding. Text splitting is enabled by
     default to keep long texts within XTTS's token limit."""
     p = validate(dict(seed=seed, temp=temperature, len_pen=length_penalty,
                       rep_pen=repetition_penalty, top_k=top_k, top_p=top_p,
-                      num_beams=num_beams, do_sample=do_sample))
+                      num_beams=num_beams, do_sample=do_sample, typical_p=typical_p))
     if not isinstance(text, str) or not text.strip():
         raise ValueError('Text to generate must not be empty')
     if not np.isfinite(float(speed)) or float(speed) <= 0:
@@ -108,6 +148,7 @@ def generate(model, text, lang, latents, out_path,
         # Beam search is meaningful DETERMINISTIC anyway — that is the only mode
         # where length_penalty does anything — so force it.
         ds = False
+    hf_options = {'typical_p': p['typical_p']} if ds and p['typical_p'] < 1 else {}
     out = model.inference(
         text, lang.lower().split('-')[0],
         gpt_cond_latent, speaker_embedding,
@@ -120,6 +161,7 @@ def generate(model, text, lang, latents, out_path,
         num_beams=nb,
         speed=float(speed),
         enable_text_splitting=bool(enable_text_splitting),
+        **hf_options,
     )
     wav = np.asarray(out['wav'], dtype=np.float32).squeeze()
     if wav.ndim != 1 or not wav.size or not np.isfinite(wav).all():

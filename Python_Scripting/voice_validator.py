@@ -63,6 +63,8 @@ DEFAULT_PARAMS = {
     'num_beams': 1,
     'do_sample': 1,
     'max_ref_len': 30,
+    'speaker_ref_len': 0, 'ref_trim_db': 0,
+    'typical_p': 1.,
     'trim_start': 0, 'trim_end': 0, 'fade_in': 100, 'fade_out': 250,
     # Audio params
     'speed'       : 1.0,
@@ -302,11 +304,14 @@ def main():
         key = (int(params.get('gpt_cond_len', args.gpt_cond_len)),
                int(params.get('gpt_cond_chunk_len', 4)),
                int(params.get('max_ref_len', 30)),
-               bool(int(params.get('sound_norm_refs', 0))))
+               bool(int(params.get('sound_norm_refs', 0))),
+               int(params.get('speaker_ref_len', 0)), float(params.get('ref_trim_db', 0)))
         if key not in _lat_cache:
             _lat_cache[key] = XC.compute_latents(
                 model, speaker_wav, gpt_cond_len=key[0], gpt_cond_chunk_len=key[1],
-                max_ref_len=key[2], sound_norm_refs=key[3])
+                max_ref_len=key[2], sound_norm_refs=key[3],
+                **{k: params[k] for k in ('speaker_ref_len', 'ref_trim_db')
+                   if params.get(k, 0)})
         return _lat_cache[key]
 
     # The text XTTS actually receives. The generator strips the final
@@ -325,6 +330,7 @@ def main():
                     top_p=float(params.get('top_p', 0.85)),
                     num_beams=int(params.get('num_beams', 1)),
                     do_sample=bool(params.get('do_sample', 1)),
+                    **({'typical_p': params['typical_p']} if params.get('typical_p', 1.) < 1 else {}),
                     speed=1.0, seed=params.get('seed'))
 
     silence = AudioSegment.silent(duration=SILENCE_MS)

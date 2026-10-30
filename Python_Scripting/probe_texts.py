@@ -65,6 +65,29 @@ _HOLDOUT = {
 
 _WARNED = set()
 
+# Reserved for the new fidelity check: never used by the native search or by
+# the post-processing shortlist's built-in selection pool.
+_FINAL = {
+    'fr': ["La lumière du matin traverse doucement les rideaux de la pièce.",
+           "Un sentier tranquille longe la rivière avant de rejoindre le village."],
+    'en': ["Morning light falls softly through the curtains of the quiet room.",
+           "A peaceful path follows the river before reaching the village."],
+    'es': ["La luz de la mañana atraviesa suavemente las cortinas de la habitación.",
+           "Un sendero tranquilo sigue el río antes de llegar al pueblo."],
+    'de': ["Das Morgenlicht fällt sanft durch die Vorhänge des ruhigen Zimmers.",
+           "Ein ruhiger Weg führt am Fluss entlang bis zum Dorf."],
+    'it': ["La luce del mattino attraversa dolcemente le tende della stanza.",
+           "Un sentiero tranquillo segue il fiume prima di raggiungere il paese."],
+    'pt': ["A luz da manhã atravessa suavemente as cortinas do quarto.",
+           "Um caminho tranquilo acompanha o rio antes de chegar à aldeia."],
+    'nl': ["Het ochtendlicht valt zacht door de gordijnen van de stille kamer.",
+           "Een rustig pad volgt de rivier tot aan het dorp."],
+}
+
+
+def final_check_texts(lang):
+    return list(_resolve(_FINAL, lang, 'final-check sentences'))
+
 
 def _key(lang):
     return (lang or 'en').lower().split('-')[0].split('_')[0]

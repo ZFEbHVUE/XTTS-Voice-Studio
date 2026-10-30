@@ -12,10 +12,24 @@ reference. Each pass renders the full chain (hp/lp/NR/comp/limiter), re-measures
 and adds the LS correction — closing the loop on the post-chain colouring.
 
 With --optimise-audio, every free [] field gets explicit trials (including
-off/on), followed by joint ECAPA refinement, pruning of the changes worth less
-than the heuristic tolerance, and validation on two other texts. Speed, pan and
-limiter are held unless --search-all-fields: ECAPA cannot judge them. The
-search budget includes the trials and the pruning. A JSON audit and validation
+off/on), followed by joint refinement, pruning of the changes worth less
+than the heuristic tolerance, and validation on two other texts. What is
+scored is --objective: ECAPA identity (default), the timbre of the {} search
+(pitch, brightness, HNR of the voiced frames) or both. The refinement is
+skipped when the trials found nothing above the tolerance or the best change
+does not carry over to the other two texts.
+
+--audio-objective fidelity is another search, not another weighting: it scores
+0.5 * ECAPA + 0.5 * an acoustic profile of the voiced speech (voice_fidelity.py:
+spectral envelope, pitch, periodicity, sibilance, dynamics, noise floor), starts
+from the tone fit, also scores the input [] and a neutral one as whole blocks,
+and checks up to --audio-finalists candidates on three other texts (paired
+gains, ASR and identity guards, fidelity_search.py). Nothing proven better
+leaves the tone fit. A last text kept out of every search checks the result.
+
+Speed, pan and limiter are held
+unless --search-all-fields: neither score judges them. The search budget
+includes the trials and the pruning. A JSON audit and validation
 WAVs are kept; a failed search leaves the tone fit. N and LANG are
 routing/language choices. Generation knobs in {} stay
 frozen here and are searched upstream. Generation goes through xtts_clone.py so the cloning knobs
@@ -53,6 +67,7 @@ import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
+from audio_parameter_search import FIDELITY     # the name a fidelity search report carries
 
 LANGS = {'FR','EN','ES','DE','IT','PT','PL','TR','RU','NL','CS','AR','ZH-CN','HU','KO','JA','HI'}
 
@@ -216,10 +231,15 @@ def _quiet_post(raw_path, out_path, audio, xtts, lang, gen_path):
     return result
 
 
-def _halves_tolerance(enc, ref_emb, path, floor=0.004):
+def _halves_tolerance(enc, ref_emb, path, floor=0.004, timbre=None):
     """Heuristic tolerance from the identity spread between two clip halves.
     Their words also differ: this is not an independent noise estimate or a
     statistical confidence interval.
+
+    `timbre` = (objective, reference timbre) measures the spread of the score
+    the search maximises instead (identity+timbre or timbre), so the tolerance
+    is in the units of the gains it judges. A half whose timbre cannot be
+    measured leaves the identity spread.
     """
     if not np.isfinite(floor) or floor < 0:
         raise ValueError('Invalid identity tolerance floor')
@@ -231,7 +251,34 @@ def _halves_tolerance(enc, ref_emb, path, floor=0.004):
     second = float(enc.cosine(ref_emb, enc.embed(y[half:], sr=sr)))
     if not (np.isfinite(first) and np.isfinite(second)):
         raise ValueError('Non-finite split-half identity score')
+    if timbre is not None:
+        objective, reference = timbre
+        from xtts_optimize import timbre_features_array, timbre_score
+        z, zr = load_mono(path, target_sr=22050)
+        cut = len(z) // 2
+        parts = [timbre_score(reference, timbre_features_array(
+                     piece, zr, hnr_method=reference.get('hnr_method')))
+                 for piece in (z[:cut], z[cut:])]
+        if all(part is not None for part in parts):
+            mix = (lambda ident, tim: tim) if objective == 'timbre' \
+                else (lambda ident, tim: .5 * ident + .5 * tim)
+            first, second = mix(first, parts[0]), mix(second, parts[1])
     return max(floor, abs(first - second) / 2.)
+
+
+def _timbre_candidate_score(reference, meter, path, block, baseline):
+    """Reuse a pitch track only when the known playback speed is unchanged.
+
+    Length alone cannot distinguish an echo tail from a small time stretch:
+    an eight-second render at speed .99 gains only 81 ms, within the meter's
+    echo allowance, although its voiced frames have moved. The caller knows
+    the blocks that produced both files, including on the checking sentences.
+    """
+    if float(block.get('speed', 1.)) != float(baseline.get('speed', 1.)):
+        from xtts_optimize import timbre_features, timbre_score
+        return timbre_score(reference, timbre_features(
+            path, hnr_method=reference.get('hnr_method')))
+    return meter.score(path)
 
 
 _GEN_CACHE = {}
@@ -296,17 +343,21 @@ def apply_post(raw_path, out_path, audio, xtts, lang, gen_path):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def unseen_sentence(lang, fit_text, hold_text=None, explicit=None):
+def unseen_sentence(lang, fit_text, hold_text=None, explicit=None, excluded_texts=(), dedicated=False):
     """A final check must use neither the fitting text nor the selection text."""
     held = [hold_text] if isinstance(hold_text, str) else list(hold_text or [])
-    excluded = {t.strip().casefold() for t in [fit_text, *held] if t}
+    excluded = {t.strip().casefold() for t in [fit_text, *held, *excluded_texts] if t}
     if explicit:
         candidate = clean_text(explicit, lang)
         if candidate.casefold() in excluded:
             raise ValueError("unseen-text must differ from fitting and hold-out sentences")
         return candidate
     from probe_texts import holdout_texts, probe_texts
-    candidates = holdout_texts(lang, 2) + probe_texts(lang, 3)
+    if dedicated:
+        from probe_texts import final_check_texts
+        candidates = final_check_texts(lang)
+    else:
+        candidates = holdout_texts(lang, 2) + probe_texts(lang, 3)
     for candidate in candidates:
         if candidate.strip().casefold() not in excluded:
             return candidate
@@ -322,6 +373,22 @@ def transcript_excerpt(segments, limit=240):
     """
     if limit <= 0:
         raise ValueError('Transcription text limit must be positive')
+
+    # ASR can split "s'adapter" into "s" and "'adapter", or into three
+    # timed tokens. Keep an elision as one selectable unit, across segment
+    # boundaries too. Never remove text while leaving its audio in the fit.
+    prefix = r'(?:[cdjlmnst]|qu|jusqu|lorsqu|puisqu)'
+    elision = re.compile(rf"\b({prefix})\s*(['’])\s*(?=\w|$)", re.I)
+
+    def joined(text):
+        return elision.sub(r'\1\2', text)
+
+    def same_elision(left, right):
+        return bool(
+            (re.search(rf'\b{prefix}$', left, re.I)
+             and re.match(r"^['’](?:\s*\w|$)", right))
+            or (re.search(rf"\b{prefix}['’]$", left, re.I)
+                and re.match(r'^\w', right)))
 
     def interval(entry):
         try:
@@ -350,7 +417,7 @@ def transcript_excerpt(segments, limit=240):
         if diagnostic_count > len(diagnostics):
             print(f'[INFO] ASR: {diagnostic_count - len(diagnostics)} further timestamp issue(s).')
 
-    parts, first, last, count = [], None, None, 0
+    parts, spans, first, last, count = [], [], None, None, 0
     repaired, fallback, skipped = 0, 0, 0
     for segment_number, segment in enumerate(segments, 1):
         words = list(getattr(segment, 'words', None) or [])
@@ -399,6 +466,16 @@ def transcript_excerpt(segments, limit=240):
 
         stop = False
         for text, start, end in units:
+            text = joined(text)
+            if parts and same_elision(parts[-1], text):
+                text = joined(parts.pop() + ' ' + text)
+                previous_start, previous_end = spans.pop()
+                start, end = min(start, previous_start), max(end, previous_end)
+                # If the completed word no longer fits, its prefix must go
+                # as well, along with the audio interval belonging to it.
+                count = len(' '.join(parts))
+                first = spans[0][0] if spans else None
+                last = max(bounds[1] for bounds in spans) if spans else None
             if count + len(text) + bool(parts) > limit:
                 # A later segment may have usable word alignment. Before the
                 # excerpt starts, skip an indivisible overlong segment safely.
@@ -410,6 +487,7 @@ def transcript_excerpt(segments, limit=240):
                 stop = True
                 break
             parts.append(text)
+            spans.append((float(start), float(end)))
             first = float(start) if first is None else first
             last = float(end) if last is None else max(last, float(end))
             count += len(text) + (1 if len(parts)>1 else 0)
@@ -540,20 +618,28 @@ def fit_rendered_tone(reference, reference_sr, render_sr, initial, render,
     return current,history
 
 
-def audio_holdouts(lang, fit_text, explicit=None):
-    """Two selection sentences; neither can be the fitting sentence."""
+def audio_holdouts(lang, fit_text, explicit=None, count=2, text_file=None):
+    """Distinct post-processing selection sentences, excluding the fit text."""
     from probe_texts import holdout_texts, probe_texts
     candidates = ([clean_text(explicit, lang)] if explicit else [])
-    candidates += holdout_texts(lang, 2) + probe_texts(lang, 3)
+    if text_file:
+        with open(text_file, encoding='utf-8-sig') as handle:
+            candidates += [clean_text(line.strip(), lang) for line in handle
+                           if line.strip() and not line.lstrip().startswith('#')]
+    try:
+        candidates += holdout_texts(lang, 2) + probe_texts(lang, 3)
+    except ValueError:
+        if not text_file:
+            raise
     selected, seen = [], {fit_text.strip().casefold()}
     for candidate in candidates:
         key = candidate.strip().casefold()
         if key not in seen:
             selected.append(candidate)
             seen.add(key)
-        if len(selected) == 2:
+        if len(selected) == count:
             return selected
-    raise ValueError('Two independent audio-selection sentences are required')
+    raise ValueError(f'{count} independent audio-selection sentences are required')
 
 
 def fit_audio_level(raw_path, out_path, block, xtts, lang, gen_path, target_dbfs=None):
@@ -583,6 +669,47 @@ def fit_audio_level(raw_path, out_path, block, xtts, lang, gen_path, target_dbfs
             return block
         block['vol'] = round(float(np.clip(block.get('vol', 0) + correction, -36, 24)), 3)
     raise ValueError('Requested RMS target was not reached within 0.35 dB')
+
+
+def preset_info(args, text, interval, report, adopted, base_clone=None, final_clone=None,
+                timbre=None):
+    """Commentary written under the two blocks of a comparator preset. Built
+    from what the run knows; a failure here must never cost the preset."""
+    try:
+        import audio_parameter_search as APS
+        tone = [f"EQ weighting '{getattr(args, 'eq_weighting', 'a')}'"]
+        if getattr(args, 'target_dbfs', None) is not None:
+            tone.append(f"volume computed for a {args.target_dbfs:g} dBFS target")
+        if text:
+            flat = ' '.join(str(text).split())
+            tone.append('fitted sentence: ' + (flat if len(flat) <= 140 else flat[:137] + '...'))
+        if interval:
+            tone.append('fitted on the reference from %.2f s to %.2f s' % tuple(interval))
+        info = {'Tone fit': tone}
+        if getattr(args, 'optimise_audio', 'none') == 'none':
+            info['Audio search'] = ['off (--optimise-audio none): the [] is the tone fit']
+        else:
+            name = (report or {}).get('objective') or APS.report_objective(
+                getattr(args, 'audio_objective', 'identity'), getattr(args, 'objective', 'identity'))
+            lines = [f"method {args.optimise_audio} | budget {args.optimise_budget}",
+                     APS.objective_line(name)]
+            if report and report.get('error'):
+                lines.append(f"FAILED: {report['error']}; the [] is the tone fit")
+            elif report:
+                lines.append('result: ' + ('adopted' if adopted else 'rejected, the tone fit is kept'))
+                if report.get('baseline_score') is not None and report.get('best_score') is not None:
+                    lines.append(f"fit sentence {APS.score_label(name)} "
+                                 f"{report['baseline_score']:.4f} -> {report['best_score']:.4f}")
+                if APS.stop_line(report):
+                    lines.append(APS.stop_line(report))
+            info['Audio search'] = lines
+        if timbre:
+            import voice_presets as VP
+            info['Timbre'] = VP.explain_timbre(timbre)
+        info['Files'] = [f"base clone      : {base_clone}", f"optimised clone : {final_clone}"]
+        return info
+    except Exception:
+        return None
 
 
 def main():
@@ -654,11 +781,36 @@ def main():
     p.add_argument('--optimise-budget', type=int, default=400,
                    help='Strict maximum fit evaluations including all-field trials and '
                         'pruning (default: 400; independent validation is reported separately)')
+    p.add_argument('--audio-objective', choices=['identity', 'fidelity'], default='identity',
+                   help='Which --optimise-audio search runs. identity (default, the calls of 3.9 '
+                        'unchanged): scores ECAPA, or the timbre term chosen by --objective, and '
+                        'validates on two texts. fidelity: scores ECAPA + an acoustic profile and '
+                        'checks a shortlist on three texts with ASR and identity guards; '
+                        '--objective does not apply to it')
+    p.add_argument('--audio-min-gain', type=float, default=.005,
+                   help='fidelity search: smallest paired gain on the checking texts that can '
+                        'adopt a candidate; an engineering threshold, not a confidence interval '
+                        '(default .005)')
+    p.add_argument('--audio-finalists', type=int, default=3,
+                   help='fidelity search: candidates checked on the other texts (1..5, default 3)')
+    p.add_argument('--audio-holdout-file',
+                   help='Your own checking texts for the audio search, one per line; the built-in '
+                        'ones fill up to the number needed (two, or three for fidelity)')
+    p.add_argument('--exclude-unseen-texts-json', default='[]',
+                   help='The texts every search of the {} block used (the pipeline passes them), '
+                        'so that the final check of the fidelity search is a text none has seen')
     p.add_argument('--search-all-fields', action='store_true',
                    help='Let --optimise-audio also change speed, pan and limiter. Held '
                         'by default: ECAPA does not measure the pace of a meditation, '
                         'hears pan as a mere gain (it averages both channels), and the '
                         'limiter protects against clipping.')
+    p.add_argument('--objective', default='identity', choices=['identity', 'timbre', 'both'],
+                   help="What --optimise-audio scores with --audio-objective identity. identity (default): ECAPA cosine, "
+                        "which cannot see most effects (an EQ or a filter moves it by less "
+                        "than its noise). timbre: pitch, brightness and HNR of the voiced "
+                        "frames, what the ear notices and ECAPA forgives. both: the mean "
+                        "of the two, the second term of the {} search with --objective both. "
+                        "The accent is not scored here: effects do not change what is said.")
     p.add_argument('--eq-weighting', default='a', choices=['a', 'voice', 'blend'],
                    help="Where EQ errors count. 'a' = equal-loudness (default), "
                         "'voice' = the reference's own spectrum, 'blend' = both. "
@@ -674,6 +826,16 @@ def main():
                         'text (the figure that matches real usage)')
     p.set_defaults(fit_dynamics=True)
     args = p.parse_args()
+    try:
+        excluded_texts = json.loads(args.exclude_unseen_texts_json)
+        if not isinstance(excluded_texts, list) or not all(isinstance(x, str) for x in excluded_texts):
+            raise ValueError('expected a list of texts')
+    except (ValueError, TypeError) as exc:
+        p.error('invalid exclude-unseen-texts-json: '+str(exc))
+    if not np.isfinite(args.audio_min_gain) or args.audio_min_gain <= 0:
+        p.error('audio-min-gain must be finite and positive')
+    if not 1 <= args.audio_finalists <= 5:
+        p.error('audio-finalists must be in 1..5')
 
     # Separate trailing lang from refs
     refs = list(args.voice_refs)
@@ -756,7 +918,9 @@ def main():
         if args.holdout_text and clean_text(args.holdout_text, lang).casefold() == text.casefold():
             p.error("holdout-text must differ from the fitting sentence")
         try:
-            selection_texts = audio_holdouts(lang, text, args.holdout_text)
+            selection_texts = audio_holdouts(lang, text, args.holdout_text,
+                count=3 if args.audio_objective == 'fidelity' else 2,
+                text_file=args.audio_holdout_file)
         except ValueError as exc:
             p.error(str(exc))
         hold_text = selection_texts
@@ -800,7 +964,9 @@ def main():
                   f"max_ref_len={args.max_ref_len}s  sound_norm_refs={snorm}")
             latents = XC.compute_latents(model, speaker_wav, gpt_cond_len=gpt_cl,
                                          gpt_cond_chunk_len=gpt_ccl,
-                                         max_ref_len=args.max_ref_len, sound_norm_refs=snorm)
+                                         max_ref_len=args.max_ref_len, sound_norm_refs=snorm,
+                                         **{k: xtts[k] for k in ('speaker_ref_len', 'ref_trim_db')
+                                            if xtts.get(k, 0)})
 
         import ltas_match as L
 
@@ -821,7 +987,8 @@ def main():
                         top_p=xtts.get('top_p', 0.85),
                         num_beams=int(xtts.get('num_beams', 1)),
                         do_sample=bool(xtts.get('do_sample', 1)),
-                        speed=1.0, seed=seed)
+                        speed=1.0, seed=seed,
+                        **({'typical_p': xtts['typical_p']} if xtts.get('typical_p', 1.) < 1 else {}))
             print("[OK] Clone generated")
 
         ref_y, ref_sr  = load_mono(args.reference)
@@ -957,9 +1124,8 @@ def main():
                 else:
                     print(f"\n  No post-processing setting raises identity beyond the noise "
                           f"floor (best {best_id:.4f} vs baseline {base_id:.4f}).")
-                    print(f"  Conclusion for this voice: post-processing shapes TONE, not "
-                          f"IDENTITY — the zero fields are zero because nothing they can do")
-                    print(f"  makes the clone measurably more like the person.")
+                    print('  The ECAPA-only stage retained no change. Acoustic fidelity '
+                          'can still improve; this is not a perceptual quality verdict.')
                 apply_post(raw, cand, opt, xtts, lang, gen_path)   # restore chosen block
             except Exception as e:
                 print(f"  [!] Identity search unavailable ({e})")
@@ -1038,41 +1204,260 @@ def main():
         # refinement, and the tone-fitted block above is a complete result.
         audio_search_report = None
         audio_validation_renders = []
-        if args.optimise_audio != 'none':
+        ref_timbre = None
+        if args.optimise_audio != 'none' and args.audio_objective == 'fidelity':
             print(f"\n{'-'*64}\n  Audio-block search ({args.optimise_audio}) — "
-                  f"target: ECAPA identity\n{'-'*64}")
+                  f"target: identity + acoustic fidelity; paired ASR validation\n{'-'*64}")
+            tone_block = dict(opt)
+            try:
+                import hashlib
+                from voice_fidelity import acoustic_profile, compare_profiles
+                from fidelity_search import optimise_fidelity
+                from audio_parameter_search import AUDIO_KEYS, DEFAULTS
+                from pron_score import PronScorer
+                enc = _encoder('cpu')
+                ref_emb = enc.embed(args.reference)
+                reference_profile = acoustic_profile(ref_y, ref_sr)
+                baseline_rendered, holdouts, recognition = [], {}, {}
+                pron = []
+
+                def metrics(path):
+                    samples, rate = load_mono(path, target_sr=16000)
+                    return compare_profiles(reference_profile, acoustic_profile(samples, rate),
+                        float(enc.cosine(ref_emb, enc.embed(path))))
+
+                def measure_fidelity(block):
+                    rendered = fit_audio_level(raw, cand, block, xtts, lang, gen_path,
+                                               args.target_dbfs)
+                    if not baseline_rendered:
+                        baseline_rendered.append(dict(rendered))
+                    return metrics(cand), rendered
+
+                def recognise(path, sentence):
+                    with open(path, 'rb') as handle:
+                        key = (hashlib.sha256(handle.read()).hexdigest(), sentence)
+                    if key not in recognition:
+                        if not pron:
+                            pron.append(PronScorer(device='cpu', model=args.whisper_model))
+                        recognition[key] = pron[0].score(path, lang=lang, target_text=sentence)
+                    return recognition[key]
+
+                def validate_fidelity(block, rank):
+                    rows, paths = [], []
+                    for number, sentence in enumerate(selection_texts, 1):
+                        if number not in holdouts:
+                            raw2 = os.path.join(tmpdir, f'fidelity_raw_{number}.wav')
+                            base2 = os.path.join(tmpdir, f'fidelity_base_{number}.wav')
+                            XC.generate(model, sentence, lang, latents, raw2,
+                                temperature=xtts.get('temp', .65), length_penalty=xtts.get('len_pen', 1.),
+                                repetition_penalty=xtts.get('rep_pen', 5.), top_k=int(xtts.get('top_k', 50)),
+                                top_p=xtts.get('top_p', .85), num_beams=int(xtts.get('num_beams', 1)),
+                                do_sample=bool(xtts.get('do_sample', 1)), speed=1., seed=seed,
+                                **({'typical_p': xtts['typical_p']} if xtts.get('typical_p', 1.) < 1 else {}))
+                            _quiet_post(raw2, base2, baseline_rendered[0], xtts, lang, gen_path)
+                            holdouts[number] = (raw2, base2, metrics(base2), recognise(base2, sentence))
+                        raw2, base2, before, base_asr = holdouts[number]
+                        cand2 = os.path.join(tmpdir, f'fidelity_candidate_{rank}_{number}.wav')
+                        _quiet_post(raw2, cand2, block, xtts, lang, gen_path)
+                        after = metrics(cand2)
+                        rows.append(dict(text=sentence, base_metrics=before, candidate_metrics=after,
+                                         base_asr=base_asr, candidate_asr=recognise(cand2, sentence)))
+                        paths.append((raw2, base2, cand2))
+                        print(f"  Fidelity hold-out {number}: {before['score']:.4f} -> "
+                              f"{after['score']:.4f}; identity {before['identity']:.4f} -> "
+                              f"{after['identity']:.4f}")
+                    return rows, paths
+
+                neutral = dict(audio, eq_low=0., eq_mid=0., eq_high=0., hp=0., lp=0.,
+                    NR=0., comp=0., reverb=0., noise_gate=0., **{'de-ess': 0.})
+                # The tone fit is the baseline, as in the identity search: it is what is
+                # delivered when nothing is proven better. The input [] and the neutral
+                # block compete against it, so a tone fit that hurts cannot shelter itself.
+                opt, audio_search_report, audio_validation_renders = optimise_fidelity(
+                    tone_block, measure_fidelity, validate_fidelity, method=args.optimise_audio,
+                    budget=args.optimise_budget, eq_limit=args.eq_limit,
+                    freeze_vol=args.target_dbfs is not None, held=held_fields,
+                    min_gain=args.audio_min_gain, finalists=args.audio_finalists,
+                    progress=lambda message: print('  '+message, flush=True),
+                    anchors=[dict(audio), neutral], anchor_labels=['input []', 'neutral []'])
+                _adopted[0] = audio_search_report['adopted']
+                print('  ADOPTED: paired fidelity and ASR/identity guards passed.' if _adopted[0]
+                      else '  REJECTED: no finalist passed paired fidelity and ASR/identity guards; '
+                           'keeping the tone-fitted effects.')
+                audio_search_report['reference_profile'] = reference_profile
+                audio_search_report['tone_fitted_block'] = tone_block
+                audio_search_report['reference_interval'] = reference_interval
+                audio_search_report['fixed_fields'] = dict(voice_number='routing identifier', lang=lang)
+                unscored = audio_search_report['fields_without_scored_alternative']
+                if audio_search_report['failures']:
+                    print(f"  [!] {len(audio_search_report['failures'])} failed render/score trial(s); see JSON.")
+                if unscored:
+                    print('  [!] No successfully scored alternative for: '+', '.join(unscored))
+                for key in AUDIO_KEYS:
+                    tested = audio_search_report['tested_values'].get(key, [])
+                    reason = audio_search_report['held'].get(key,
+                        'alternatives failed; see report' if key in unscored else 'scored with the fidelity objective')
+                    print(f"  {key}: tone fit {tone_block.get(key, DEFAULTS[key])} -> final {opt[key]}; "
+                          f"{reason}; explicit trials {tested}")
+                apply_post(raw, cand, opt, xtts, lang, gen_path)
+            except Exception as exc:
+                opt = tone_block
+                _adopted[0] = False
+                audio_search_report = dict(audio_search_report or {}, objective=FIDELITY,
+                    adopted=False, error=str(exc), final_block=dict(opt))
+                print(f'  [!] Audio search failed: {exc}')
+                print('      The tone-fitted block is kept; details in the audio-search report.')
+
+        if args.optimise_audio != 'none' and args.audio_objective == 'identity':
+            objective = args.objective
+            if objective != 'identity':
+                from xtts_optimize import timbre_features
+                ref_timbre = timbre_features(args.reference)
+                if ref_timbre is None:
+                    print("  [!] The reference timbre could not be measured (librosa, "
+                          "parselmouth, or no voiced audio): the search scores ECAPA identity only.")
+                    objective = 'identity'
+                else:
+                    print(f"  Reference timbre (voiced frames): F0 {ref_timbre['f0']:.0f} Hz, "
+                          f"centroid {ref_timbre['centroid']:.0f} Hz, HNR {ref_timbre['hnr']:.1f} dB "
+                          f"({'Praat' if ref_timbre['hnr_method'] == 'praat' else 'HPSS fallback'})")
+            target_name = {'identity': 'ECAPA identity', 'timbre': 'timbre',
+                           'both': 'identity + timbre'}[objective]
+            report_name = {'identity': 'ecapa_identity', 'timbre': 'timbre',
+                           'both': 'identity+timbre'}[objective]
+            score_name = 'identity' if objective == 'identity' else 'score'
+            print(f"\n{'-'*64}\n  Audio-block search ({args.optimise_audio}) — "
+                  f"target: {target_name}\n{'-'*64}")
             tone_block = dict(opt)
             try:
                 from audio_parameter_search import search_audio, AUDIO_KEYS, DEFAULTS
                 enc = _encoder(args.device)
                 ref_emb = enc.embed(args.reference)
+                fit_meter = None
+                if objective != 'identity':
+                    # The pitch of the tone-fitted render is tracked once: the
+                    # effects searched here colour a render, they do not move it.
+                    from xtts_optimize import TimbreMeter
+                    fit_audio_level(raw, cand, opt, xtts, lang, gen_path, args.target_dbfs)
+                    fit_meter = TimbreMeter(ref_timbre, cand)
+
+                def criterion(path, meter=None, block=None, baseline=None):
+                    """What the search maximises, on a rendered file: ECAPA identity,
+                    or the timbre score (0 for a render with no measurable voice,
+                    like the {} search), or their mean."""
+                    ident = float(enc.cosine(ref_emb, enc.embed(path)))
+                    if objective == 'identity':
+                        return ident
+                    got = _timbre_candidate_score(ref_timbre, meter or fit_meter, path,
+                        tone_block if block is None else block,
+                        tone_block if baseline is None else baseline)
+                    tim = 0.0 if got is None else got
+                    return tim if objective == 'timbre' else .5 * ident + .5 * tim
 
                 def evaluate_audio(block):
                     rendered = fit_audio_level(raw, cand, block, xtts, lang, gen_path,
                                                args.target_dbfs)
-                    return float(enc.cosine(ref_emb, enc.embed(cand))), rendered
+                    return criterion(cand, block=rendered), rendered
 
                 # Pruning tolerance: the screening's when it ran, otherwise
-                # measured the same way on the tone-fitted render.
+                # measured the same way on the tone-fitted render. With a timbre
+                # in the score it is the spread of that score between the halves.
                 tolerance = _measured_noise[0]
-                if tolerance is None:
+                if objective != 'identity' or tolerance is None:
                     fit_audio_level(raw, cand, opt, xtts, lang, gen_path, args.target_dbfs)
-                    tolerance = _halves_tolerance(enc, ref_emb, cand)
-                print(f"  pruning tolerance {tolerance:.4f} (identity spread between "
+                    tolerance = _halves_tolerance(
+                        enc, ref_emb, cand,
+                        timbre=None if objective == 'identity' else (objective, ref_timbre))
+                print(f"  pruning tolerance {tolerance:.4f} ({score_name} spread between "
                       f"the two halves of the tone-fitted render)")
+                need = max(.02, 2. * tolerance)
+
+                # The unseen sentences that must confirm a candidate. Generated
+                # the first time they are needed (the checkpoint or the final
+                # validation, whichever comes first), then reused.
+                holdouts = []
+
+                def holdout_sets():
+                    if holdouts:
+                        return holdouts
+                    for number, selection_text in enumerate(selection_texts, 1):
+                        print(f"\n  Audio hold-out {number}: {selection_text}")
+                        raw2 = os.path.join(tmpdir, f'clone_raw_holdout_{number}.wav')
+                        XC.generate(model, selection_text, lang, latents, raw2,
+                                    temperature=xtts.get('temp', .65),
+                                    length_penalty=xtts.get('len_pen', 1.),
+                                    repetition_penalty=xtts.get('rep_pen', 5.),
+                                    top_k=int(xtts.get('top_k', 50)),
+                                    top_p=xtts.get('top_p', .85),
+                                    num_beams=int(xtts.get('num_beams', 1)),
+                                    do_sample=bool(xtts.get('do_sample', 1)), speed=1., seed=seed,
+                                    **({'typical_p': xtts['typical_p']} if xtts.get('typical_p', 1.) < 1 else {}))
+                        holdouts.append(dict(
+                            number=number, text=selection_text, raw=raw2,
+                            base=os.path.join(tmpdir, f'base_holdout_{number}.wav'),
+                            cand=os.path.join(tmpdir, f'cand_holdout_{number}.wav'),
+                            base_score=None, meter=None))
+                    return holdouts
+
+                def holdout_validation(base_blk, cand_blk):
+                    """(rows, renders): the candidate against the baseline on every
+                    hold-out sentence, scored as the search scores."""
+                    rows, renders = [], []
+                    for h in holdout_sets():
+                        if h['base_score'] is None:
+                            _quiet_post(h['raw'], h['base'], base_blk, xtts, lang, gen_path)
+                            if objective != 'identity':
+                                from xtts_optimize import TimbreMeter
+                                h['meter'] = TimbreMeter(ref_timbre, h['base'])
+                            h['base_score'] = criterion(h['base'], h['meter'], base_blk, base_blk)
+                        _quiet_post(h['raw'], h['cand'], cand_blk, xtts, lang, gen_path)
+                        h_base, h_best = h['base_score'], criterion(h['cand'], h['meter'], cand_blk, base_blk)
+                        if not (np.isfinite(h_base) and np.isfinite(h_best)):
+                            raise ValueError('Non-finite independent identity score')
+                        rows.append({'text': h['text'], 'base': h_base,
+                                     'candidate': h_best, 'gain': h_best - h_base})
+                        renders.append((h['raw'], h['base'], h['cand']))
+                        print(f"  held-out clone {h['number']}: {h_base:.4f} -> {h_best:.4f} "
+                              f"({h_best - h_base:+.4f})")
+                    return rows, renders
+
+                early_state = {}
+
+                def checkpoint(candidate, baseline_block):
+                    """Before the joint refinement: does the best change so far
+                    carry over to the other sentences? It works on the one
+                    sentence of the trials, so it cannot make a change transfer."""
+                    print("\n  Checkpoint: the best change so far, on the other sentences")
+                    rows, renders = holdout_validation(baseline_block, candidate)
+                    early_state['renders'] = renders
+                    gains = [row['gain'] for row in rows]
+                    proceed = (len(gains) == 2 and min(gains) > 0
+                               and float(np.mean(gains)) >= .5 * need)
+                    reason = ('held-out gains ' + ' and '.join(f'{g:+.4f}' for g in gains)
+                              + f' (mean {float(np.mean(gains)):+.4f}): '
+                              + ('enough to refine it' if proceed else
+                                 f'a gain on both sentences, averaging at least half the '
+                                 f'bar ({.5 * need:.4f}), is needed to refine it'))
+                    return dict(proceed=proceed, reason=reason, validation=rows)
+
                 best_blk, audio_search_report = search_audio(
                     opt, evaluate_audio, method=args.optimise_audio,
                     budget=args.optimise_budget, eq_limit=args.eq_limit,
                     freeze_vol=args.target_dbfs is not None, held=held_fields,
-                    tolerance=tolerance,
+                    tolerance=tolerance, objective=report_name, checkpoint=checkpoint,
                     progress=lambda message: print('  ' + message, flush=True))
                 base_blk = audio_search_report['baseline_block']
                 base_id = audio_search_report['baseline_score']
                 best_id = audio_search_report['best_score']
                 pruning = audio_search_report['pruning']
-                print(f"  identity on fitting text: {base_id:.4f} -> "
+                stopped = audio_search_report.get('stopped')
+                print(f"  {score_name} on fitting text: {base_id:.4f} -> "
                       f"{audio_search_report['search_best_score']:.4f} found, "
                       f"{best_id:.4f} after pruning")
+                if stopped:
+                    print(f"  Stopped after {stopped['evaluations']} of "
+                          f"{audio_search_report['budget']} evaluations, before the joint "
+                          f"refinement: {stopped['reason']}.")
                 if pruning['steps']:
                     print(f"  pruned back to their start: "
                           f"{', '.join(pruning['reverted']) or 'nothing'}; "
@@ -1097,36 +1482,17 @@ def main():
                 # Do not round them again AFTER their held-out validation.
                 gain_fit = best_id - base_id
                 validation = []
-                if gain_fit > 1e-9:
-                    for number, selection_text in enumerate(selection_texts, 1):
-                        print(f"\n  Audio hold-out {number}: {selection_text}")
-                        raw2 = os.path.join(tmpdir, f'clone_raw_holdout_{number}.wav')
-                        base2 = os.path.join(tmpdir, f'base_holdout_{number}.wav')
-                        cand2 = os.path.join(tmpdir, f'cand_holdout_{number}.wav')
-                        XC.generate(model, selection_text, lang, latents, raw2,
-                                    temperature=xtts.get('temp', .65),
-                                    length_penalty=xtts.get('len_pen', 1.),
-                                    repetition_penalty=xtts.get('rep_pen', 5.),
-                                    top_k=int(xtts.get('top_k', 50)),
-                                    top_p=xtts.get('top_p', .85),
-                                    num_beams=int(xtts.get('num_beams', 1)),
-                                    do_sample=bool(xtts.get('do_sample', 1)), speed=1., seed=seed)
-                        _quiet_post(raw2, base2, base_blk, xtts, lang, gen_path)
-                        h_base = float(enc.cosine(ref_emb, enc.embed(base2)))
-                        _quiet_post(raw2, cand2, best_blk, xtts, lang, gen_path)
-                        h_best = float(enc.cosine(ref_emb, enc.embed(cand2)))
-                        if not (np.isfinite(h_base) and np.isfinite(h_best)):
-                            raise ValueError('Non-finite independent identity score')
-                        validation.append({'text': selection_text, 'base': h_base,
-                                           'candidate': h_best, 'gain': h_best - h_base})
-                        audio_validation_renders.append((raw2, base2, cand2))
-                        print(f"  held-out clone {number}: {h_base:.4f} -> {h_best:.4f} "
-                              f"({h_best - h_base:+.4f})")
+                if stopped and audio_search_report.get('early_validation'):
+                    # The checkpoint already validated this very candidate.
+                    validation = audio_search_report['early_validation']
+                    audio_validation_renders.extend(early_state.get('renders', []))
+                elif gain_fit > 1e-9:
+                    validation, renders = holdout_validation(base_blk, best_blk)
+                    audio_validation_renders.extend(renders)
                 gains = [row['gain'] for row in validation]
                 # Screen is diagnostic: enabling it must not change adoption.
                 # Use the measured pruning tolerance in both cases, keeping
                 # the existing 0.02 minimum for a held-out mean gain.
-                need = max(.02, 2. * tolerance)
                 adopted = (len(gains) == 2 and min(gains) > 0
                            and float(np.mean(gains)) > max(need, .4 * gain_fit))
                 if adopted:
@@ -1150,6 +1516,8 @@ def main():
                     adoption_tolerance_rule='max(0.02, 2 * pruning_tolerance)',
                     validation_evaluations=2 * len(validation), final_block=dict(opt),
                     fixed_fields={'voice_number': 'routing identifier', 'lang': lang})
+                if ref_timbre is not None:
+                    audio_search_report['reference_timbre'] = ref_timbre
                 print("  Final decision per field:")
                 held = audio_search_report['held']
                 for key in AUDIO_KEYS:
@@ -1213,6 +1581,24 @@ def main():
 
         if audio_search_report is not None:
             report_path = os.path.splitext(out_opt)[0] + '_audio_search.json'
+            audio_search_report['render_blocks'] = [
+                dict(file=out_raw, role='raw XTTS', xtts_block=xtts_str, audio_block=None,
+                     post_processing_applied=False, note='No [] effects or {} trims/fades applied'),
+                dict(file=out_clone, role='input []', xtts_block=xtts_str,
+                     audio_block=format_blocks(1, xtts, audio, lang)[1], post_processing_applied=True),
+                dict(file=out_opt, role='final []', xtts_block=xtts_str,
+                     audio_block=opt_audio_str, post_processing_applied=True)]
+            if audio_search_report.get('objective') == FIDELITY and audio_search_report.get('tone_fitted_block'):
+                tone_out = os.path.splitext(out_opt)[0]+'_tone.wav'
+                protected = {os.path.realpath(p) for p in [args.reference, *refs, out_raw, out_clone, out_opt]}
+                if os.path.realpath(tone_out) in protected:
+                    raise ValueError('Tone-only output collides with an existing voice/reference output')
+                apply_post(raw, tone_out, audio_search_report['tone_fitted_block'], xtts, lang, gen_path)
+                audio_search_report['render_blocks'].append(dict(file=tone_out,
+                    role='tone fit before fidelity search', xtts_block=xtts_str,
+                    audio_block=format_blocks(1, xtts, audio_search_report['tone_fitted_block'], lang)[1],
+                    post_processing_applied=True))
+                print(f'[*] Tone-only candidate: {tone_out}')
             saved = []
             for number, paths in enumerate(audio_validation_renders, 1):
                 stem = os.path.splitext(out_opt)[0] + f'_audio_holdout{number}'
@@ -1278,8 +1664,9 @@ def main():
                     'HNR (dB)': _hnr(y, sr),
                 }
 
-            ry, _ = load_mono(args.reference, target_sr=ref_sr)
-            pr, pc = _probe(ry, ref_sr), _probe(oy, ref_sr)
+            # Use precisely the material fitted above. Reloading the full
+            # reference mixes other words/pauses into a paired comparison.
+            pr, pc = _probe(ref_y, ref_sr), _probe(oy, ref_sr)
             print(f"\n  {'':<20}{'reference':>11}{'clone':>10}{'delta':>10}")
             for k in pr:
                 if pr[k] != pr[k] or pc[k] != pc[k]:        # nan: Praat missing
@@ -1289,10 +1676,56 @@ def main():
                 if k == 'HNR (dB)' and d > 3.0:
                     flag = '   <- clone is SMOOTHER: a husky voice loses its grain here'
                 print(f"  {k:<20}{pr[k]:>11.1f}{pc[k]:>10.1f}{d:>+10.1f}{flag}")
-            _which = ("identity-optimised" if _adopted[0] else "tone-fitted")
-            print(f"  (clone measured after the {_which} [] -- delta is what remains)")
+            _which = (('fidelity-optimised' if args.audio_objective == 'fidelity' else 'identity-optimised')
+                      if _adopted[0] else 'tone-fitted')
+            scope = (f'reference interval {reference_interval[0]:.2f}-'
+                     f'{reference_interval[1]:.2f} s' if reference_interval
+                     else 'full reference')
+            print(f"  (clone measured after the {_which} []; {scope} -- delta is what remains)")
         except Exception as _e:
             print(f"  [!] Comparison table unavailable ({_e})")
+
+        # ── Timbre, term by term ──────────────────────────────────────────────────
+        # The {} search maximises a timbre score of ~0.30 on some voices whatever
+        # it changes. A score does not say which of its three terms costs: pitch
+        # (nothing in [] moves it), brightness (the EQ does) or HNR (barely
+        # movable). Measured on the raw XTTS render, on the render with the
+        # given [] and on the final one, against the whole reference.
+        _timbre = None
+        try:
+            from xtts_optimize import (timbre_features, timbre_breakdown, timbre_lines,
+                                       timbre_score)
+            _tref = ref_timbre or timbre_features(args.reference)
+            if _tref is None:
+                print("\n  Timbre: not measured (librosa, parselmouth, or no voiced audio "
+                      "in the reference).")
+            else:
+                _stages = {}
+                for _label, _path in (('raw XTTS', out_raw), ('base []', out_clone),
+                                      ('final []', out_opt)):
+                    _stages[_label] = timbre_features(_path, hnr_method=_tref['hnr_method'])
+                _final = _stages['final []']
+                _bd = timbre_breakdown(_tref, _final)
+                if _bd is None:
+                    print("\n  Timbre: the final clone has no measurable voiced audio.")
+                else:
+                    print("\n  Timbre of the final clone, term by term (voiced frames, whole "
+                          "reference; the score of the {} search with --objective timbre/both)")
+                    for _line in timbre_lines(_tref, _final):
+                        print(_line)
+                    _scores = {k: timbre_score(_tref, v) for k, v in _stages.items()}
+                    print('  timbre score by stage: ' + ' | '.join(
+                        f"{k} {v:.2f}" if v is not None else f"{k} n/a"
+                        for k, v in _scores.items()))
+                    _timbre = {'reference': _tref, 'final': _final, 'stages': _scores,
+                               'terms': _bd['terms'], 'gaps': _bd['gaps'],
+                               'distance': _bd['distance'], 'score': _bd['score'],
+                               'largest': _bd['largest']}
+                    # GUI/pipeline hook: one parsable line.
+                    print('[*] Timbre: ' + json.dumps(_timbre, ensure_ascii=False,
+                                                       allow_nan=False))
+        except Exception as _e:
+            print(f"  [!] Timbre table unavailable ({_e})")
 
         # ── Identity on UNSEEN text — the figure that matches real usage ──────────
         # With --auto-text the fit runs on the reference's OWN words, and identity
@@ -1316,7 +1749,9 @@ def main():
                     _t.cuda.empty_cache()          # the 4 GB card OOMs here otherwise
                 except Exception:
                     pass
-                UNSEEN = unseen_sentence(lang, text, hold_text, args.unseen_text)
+                UNSEEN = unseen_sentence(lang, text, hold_text, args.unseen_text,
+                    excluded_texts=excluded_texts,
+                    dedicated=args.optimise_audio != 'none' and args.audio_objective == 'fidelity')
                 _raw2 = os.path.join(tmpdir, 'clone_unseen_raw.wav')
                 _out2 = os.path.join(tmpdir, 'clone_unseen.wav')
                 XC.generate(model, UNSEEN, lang, latents, _raw2,
@@ -1327,11 +1762,47 @@ def main():
                             top_p=xtts.get('top_p', 0.85),
                             num_beams=int(xtts.get('num_beams', 1)),
                             do_sample=bool(xtts.get('do_sample', 1)),
-                            speed=1.0, seed=seed)
+                            speed=1.0, seed=seed,
+                            **({'typical_p': xtts['typical_p']} if xtts.get('typical_p', 1.) < 1 else {}))
                 apply_post(_raw2, _out2, opt, xtts, lang, gen_path)
                 _unseen_id = float(_enc.cosine(_ref, _enc.embed(_out2)))
                 print(f"  Identity: {_fit_id:.4f} on the fitted sentence, "
                       f"{_unseen_id:.4f} on UNSEEN text ({_unseen_id - _fit_id:+.4f})")
+                print(f'  Unseen sentence: {UNSEEN}')
+                if (args.audio_objective == 'fidelity' and audio_search_report
+                        and not audio_search_report.get('error')):
+                    _base2 = os.path.join(tmpdir, 'fidelity_unseen_base.wav')
+                    _quiet_post(_raw2, _base2, audio_search_report['baseline_block'], xtts, lang, gen_path)
+                    check = dict(text=UNSEEN, used_for_selection=False,
+                        base_metrics=metrics(_base2), final_metrics=metrics(_out2),
+                        base_asr=recognise(_base2, UNSEEN), final_asr=recognise(_out2, UNSEEN))
+                    check['excluded_native_texts'] = excluded_texts
+                    check['warnings'] = []
+                    if (check['final_asr'].get('wer') is None or check['base_asr'].get('wer') is None
+                            or check['final_asr']['wer'] > check['base_asr']['wer']+.02
+                            or check['final_asr']['score'] < check['base_asr']['score']-.03):
+                        check['warnings'].append('ASR regression on the independent final check')
+                    if check['final_metrics']['identity'] < check['base_metrics']['identity']-.015:
+                        check['warnings'].append('Identity regression on the independent final check')
+                    for warning in check['warnings']:
+                        print('  [!] '+warning+'; compare the saved base/final WAVs.')
+                    stem = os.path.splitext(out_opt)[0] + '_fidelity_unseen'
+                    destinations = [stem+suffix for suffix in ('_raw.wav', '_base.wav', '_final.wav')]
+                    protected = {os.path.realpath(p) for p in [args.reference, *refs, out_raw, out_clone, out_opt]}
+                    if any(os.path.realpath(p) in protected for p in destinations):
+                        raise ValueError('Unseen diagnostic output collides with a voice/reference output')
+                    for source, destination in zip((_raw2, _base2, _out2), destinations):
+                        shutil.copyfile(source, destination)
+                    check['files'] = dict(zip(('raw', 'base', 'final'), destinations))
+                    check['xtts_block'] = xtts_str
+                    check['final_audio_block'] = opt_audio_str
+                    check['baseline_audio_block'] = format_blocks(1, xtts,
+                        audio_search_report['baseline_block'], lang)[1]
+                    audio_search_report['unseen_check'] = check
+                    with open(report_path, 'w', encoding='utf-8') as handle:
+                        json.dump(audio_search_report, handle, ensure_ascii=False, indent=2, allow_nan=False)
+                    print(f"  Unseen fidelity: {check['base_metrics']['score']:.4f} -> "
+                          f"{check['final_metrics']['score']:.4f}; WAV: {destinations[2]}")
                 if _fit_id - _unseen_id > 0.05:
                     print("  ^ Identity drops on this unseen sentence. Compare several unseen "
                           "renders by ear; one ECAPA score does not predict an entire meditation.")
@@ -1352,7 +1823,10 @@ def main():
                 nm = VP.save(args.preset_name or VP.name_from_reference(args.reference),
                              xtts_str, opt_audio_str,
                              reference=args.reference, source='comparator',
-                             scores=_sc or None, references=refs)
+                             scores=_sc or None, references=refs,
+                             info=preset_info(args, text, reference_interval,
+                                              audio_search_report, _adopted[0],
+                                              out_clone, out_opt, timbre=_timbre))
                 print(f"  Preset '{nm}' saved to {os.path.basename(VP.PRESET_DIR)}/")
             except Exception as e:
                 print(f"  [!] Preset save failed: {e}")

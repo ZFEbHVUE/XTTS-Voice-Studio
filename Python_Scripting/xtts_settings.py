@@ -9,14 +9,14 @@ import math
 FIELDS = ('seed', 'trim_start', 'trim_end', 'fade_in', 'fade_out',
           'temp', 'top_k', 'top_p', 'rep_pen', 'len_pen', 'gpt_cond_len',
           'gpt_cond_chunk_len', 'sound_norm_refs', 'num_beams', 'do_sample',
-          'max_ref_len')
+          'max_ref_len', 'speaker_ref_len', 'ref_trim_db', 'typical_p')
 DEFAULTS = dict(zip(FIELDS, (None, 0, 0, 100, 250, .65, 50, .85, 5., 1.,
-                            30, 4, 0, 1, 1, 30)))
+                            30, 4, 0, 1, 1, 30, 0, 0, 1.)))
 ALIASES = {'temperature': 'temp', 'repetition_penalty': 'rep_pen',
            'length_penalty': 'len_pen', 'max_ref_length': 'max_ref_len'}
 LONG_NAMES = {v: k for k, v in ALIASES.items() if k != 'max_ref_length'}
 INTEGERS = {'seed', 'top_k', 'gpt_cond_len', 'gpt_cond_chunk_len',
-            'num_beams', 'max_ref_len'}
+            'num_beams', 'max_ref_len', 'speaker_ref_len'}
 BOOLEANS = {'sound_norm_refs', 'do_sample'}
 # Historical zero placeholders retain the inherited value for positive knobs.
 ZERO_PLACEHOLDERS = {'temp', 'top_p', 'rep_pen', 'len_pen', 'gpt_cond_len',
@@ -57,7 +57,10 @@ def validate(params):
             raise ValueError(f'{key}: must be greater than zero')
     if not 0 < out['top_p'] <= 1:
         raise ValueError('top_p: expected a value in (0, 1]')
-    for key in ('trim_start', 'trim_end', 'fade_in', 'fade_out', 'top_k'):
+    if not 0 < out['typical_p'] <= 1:
+        raise ValueError('typical_p: expected a value in (0, 1]')
+    for key in ('trim_start', 'trim_end', 'fade_in', 'fade_out', 'top_k',
+                'speaker_ref_len', 'ref_trim_db'):
         if out[key] < 0:
             raise ValueError(f'{key}: must be nonnegative')
     if out['seed'] is not None and not 0 <= out['seed'] < 2**32:
@@ -77,7 +80,7 @@ def parse_block(block):
         raise ValueError('XTTS block must be enclosed in braces')
     parts = [p.strip() for p in raw[1:-1].split(',')]
     if not 2 <= len(parts) <= len(FIELDS) + 1:
-        raise ValueError('XTTS block: expected a voice number and up to 16 parameters')
+        raise ValueError('XTTS block: expected a voice number and up to 19 parameters')
     voice = _number('num_beams', parts[0])
     if voice < 1:
         raise ValueError('voice number must be positive')
@@ -101,7 +104,12 @@ def format_block(params, voice=1):
         if v is None:
             return 'none'
         return str(int(v)) if float(v).is_integer() else format(v, '.10g')
-    return '{' + ', '.join([str(voice)] + [fmt(p[k]) for k in FIELDS]) + '}'
+    # Keep the historical 17-field representation when both extensions are
+    # off. New values are appended; no existing position changes meaning.
+    last = len(FIELDS)
+    while last > 16 and p[FIELDS[last - 1]] == DEFAULTS[FIELDS[last - 1]]:
+        last -= 1
+    return '{' + ', '.join([str(voice)] + [fmt(p[k]) for k in FIELDS[:last]]) + '}'
 
 
 def generator_params(block, base):

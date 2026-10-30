@@ -11,6 +11,483 @@ measured. The [README](README.md) describes how the tools work now.
 
 ---
 
+## 3.10.1 — 2026-10-30 — a review of 3.10.0 (ChatGPT): two defects, both confirmed
+
+ChatGPT reviewed 3.10.0 (`XTTS_3.10.0_corrige.zip`) and reported two
+reproducible defects. Both are real, in code written for 3.9.0 and 3.10.0, and
+both were reproduced here before and after the fix. Its two corrections are
+kept as written; this release adds what its own tests left unchecked.
+
+### Fixed
+
+- **`--fidelity` overwrote what the command line said.** Its help text and
+  [FIDELITY.md](FIDELITY.md) promised that every value given explicitly is kept,
+  but `--objective`, `--audio-objective` and `--optimise-audio none` were
+  replaced by the profile (`both`, `fidelity`, `de`), and `--optimise-audio none`
+  with a small `--optimise-budget` stopped on the budget check of the search it
+  had just switched back on. Each is now kept, as `--option value` and as
+  `--option=value`. The GUI never passes `--fidelity` (its *Fidelity setup*
+  button sets the fields), so only the command line was affected.
+- **A small slowdown reused the pitch track of the wrong render.** The timbre
+  meter of the `[]` search tracks the pitch once and reuses it on every
+  candidate whose length is the baseline's, or longer by at most 125 ms (the
+  tail of a reverb). A slowdown of 1 % turns 8 s into 8.08 s: inside that window
+  although every vowel has moved. On a synthetic voiced signal of 8 s, a
+  speed of 0.99 read a centroid 86 Hz higher than the same file measured from
+  scratch, which is 0.127 on the timbre score (its scale is 300 Hz); 0.995 read
+  12 Hz lower; 0.98 was outside the window and exact. The comparator now
+  passes the speed of the block that produced each file (the trials and the
+  checking sentences alike) and measures a candidate whose speed differs from
+  the baseline's from scratch, at the cost of about a second of pitch tracking
+  per such render. Colour-only changes keep the fast path. It concerned
+  `--audio-objective identity` with `--objective timbre` or `both` and speed
+  free (`--search-all-fields`, or *Include speed, pan and limiter*): the
+  `fidelity` search measures every render by itself and never used this cache.
+
+### Added
+
+- **Abbreviated option names are refused by `xtts_pipeline.py`.** `--fidelity`
+  decides what you chose by reading the option names on the command line;
+  argparse also accepts `--obj identity` for `--objective`, which the profile
+  then overwrote without a word. A shortened name is now an error.
+- `test_3101_regressions.py` (7 tests): the explicit values of the other
+  profile settings (weights, EQ limit, beam width, joint sampling, both budgets),
+  the refusal of abbreviations, and the speed routing on a real pitch track.
+- `fidelity_vs_timbre.py`, the benchmark behind the figures of
+  [FIDELITY.md](FIDELITY.md), so that they can be checked. ChatGPT could not
+  reproduce them because its archive does not hold the recordings; they are
+  `Voices_Cloning/` in the repository, and re-running the script gives the
+  same numbers (area under the curve 1.000 against 0.988; standard deviation
+  0.031 against 0.133; a +4 dB high shelf at 2.2 against 0.6; a 6 kHz low-pass
+  at 4.0 against 0.2).
+
+### Checked
+
+- ChatGPT's 8 tests (`test_3100_review_regressions.py`) fail on 3.10.0 as it was
+  (7 failures, 5 errors counting sub-tests; the eighth is a non-regression) and
+  pass after its corrections.
+- A mutation check of the rules touched (each broken in turn, the new tests must
+  fail) killed 17 of 18 mutants; the survivor measures the baseline of a
+  checking sentence the slow way, which gives the same score and only costs
+  time. Against ChatGPT's tests alone, 4 of the first 14 mutants survived (3
+  once the older fidelity and budget tests are counted): no test covered the
+  explicit weights and EQ limit of the profile, nor its beam width, joint
+  sampling and conditioning budget.
+- The whole suite: 502 tests on 3.10.0, 510 with ChatGPT's corrections, and
+  517 here, with librosa, soundfile, pydub, parselmouth and tkinter present.
+  ChatGPT's 51 skipped tests were skipped for want of those libraries.
+- Not checked: no real XTTS, Whisper or ECAPA model was run, and nothing was
+  listened to. These two defects made the `[]` search measure the wrong thing in
+  one configuration and ignore an option in another; fixing them does not make a
+  clone sound closer.
+
+---
+
+## 3.10.0 — 2026-10-30 — 3.9.0 plus ChatGPT's fidelity patch, without its two traps
+
+ChatGPT wrote a fidelity extension on top of 3.8.1 (`XTTS_3.8.1_fidelite.zip`)
+while 3.9.0 was being built. Laid over 3.9.0 it would have replaced the `[]`
+search of 3.9 and lost its early stop, its timbre breakdown and their tests, so
+3.10.0 merges the two histories (three-way, against 3.8.1). The conflicts were
+resolved by hand in `audio_parameter_search.py`, `voice_comparator.py`,
+`xtts_pipeline.py` and `xtts_studio.py`; the other files merged cleanly and
+were read afterwards. The guide that came with the patch is rewritten in
+English as [FIDELITY.md](FIDELITY.md).
+
+### Added (ChatGPT's work, kept)
+
+- **A new `[]` search target, `fidelity`** (`--audio-objective fidelity`). The
+  score is half the ECAPA cosine and half an acoustic score of the voiced
+  speech: envelope, pitch, a periodicity measure (not the Praat HNR),
+  sibilance, dynamics and the level of the quiet passages, in
+  `voice_fidelity.py`, NumPy and SciPy only. Up to `--audio-finalists` (3)
+  candidates are checked on three other sentences by a paired decision: a mean
+  gain above `--audio-min-gain` (0.005) and one paired standard error, no
+  sentence losing more than 0.02, identity within tolerance, no rise of the
+  word error rate (0.02), of the ASR score (0.03), no change of the detected
+  language, no added clipping. A last reserved sentence is rendered for
+  diagnosis and ranks nothing. It is the default of the pipeline and of the
+  tabs when an audio search is on.
+- **Three optional trailing `{}` fields**, positions 18 to 20:
+  `speaker_ref_len` (a cap of its own for the speaker embedding, through a
+  second call of the public API), `ref_trim_db` (silence cut at the edges of
+  each reference, on the CPU) and `typical_p`. A block that does not use them
+  keeps its 17 positions, and old blocks read as before. The settings module,
+  the clone and generator engines, the validator, the optimiser, the
+  comparator and the [Val] tab all carry them.
+- **The optimiser searches them**: `--advanced-conditioning` adds stages C4b to
+  C4d (`--speaker-ref-lens`, `--ref-trim-dbs`), and `--joint-sampling N` adds
+  S5, a Sobol search of `temp`, `rep_pen`, `top_k`, `top_p` and `typical_p`
+  whose two best candidates are compared with the current setting on the same
+  three seeds.
+- **`--fidelity`** (and the [Auto] button *Fidelity setup + auto budgets*) sets
+  the options above, the `de` audio search, an EQ limit of 8 dB and the budgets
+  in one go; every value given explicitly is kept. `--eq-limit` was a
+  Comparator option only; the pipeline and the [Auto] and [Cmp] tabs have it now.
+- Files: `*_tone.wav` (the tone fit alone), `*_audio_holdout<n>_*.wav` and
+  `*_fidelity_unseen_*.wav`, and `render_blocks` in the search report, which ties
+  each render to its `{}` and `[]`.
+
+### Corrected in the patch
+
+- **A refused search dropped the tone fit.** Its baseline was the input `[]`,
+  so when no finalist passed, the pipeline delivered the block the user started
+  from and the EQ fit that had just been computed was lost, where the 3.9
+  search, on a refusal or a failure, keeps it. The baseline is now the tone fit,
+  in the search and in the diagnostics, and it is what comes back when nothing
+  is proven better. The input `[]` and a neutral block (EQ, filters, noise
+  reduction, compression, de-esser, reverb and gate at zero) are scored as
+  they stand and compete with it as finalists, so a tone fit that hurts cannot
+  shelter behind itself.
+- **The shortcut and the button freed speed, pan and limiter.** `--fidelity` and
+  *Fidelity setup* turned `--search-all-fields` on, and with it the pace of a
+  meditation, a pan and a limiter became things an acoustic score could
+  "improve". Neither ECAPA nor the profile can judge them (3.7.3 held them for
+  that reason). They stay held unless you ask: the box and the flag are unchanged
+  and are honoured when given. The anchors respect that too: a held field keeps
+  the tone fit's value in every block the search scores.
+- **Two selectors in [Cmp].** The tab had 3.9's *Search target* menu and, beside
+  it, an *Audio objective* menu. There is one menu now: `fidelity` (the
+  default), `identity`, `timbre`, `both`; it is sent as `--audio-objective` plus,
+  for `timbre` and `both`, `--objective`, and only to a search that runs. [Auto]
+  and the pipeline likewise send `--audio-objective` only when an audio search
+  is on, and `--objective` only to the `identity` search, since the fidelity
+  search would ignore it.
+- **`typical_p` did not reach the hold-out sentences of the 3.9 search.** The
+  patch knew nothing of that search, and the merge left its generation without
+  the new field: a candidate would have been judged on another sampling than the
+  one delivered. Every generation of the comparator, the optimiser, the
+  validator and the generator now carries it (a test reads the sources for it).
+- **The dedicated final sentence** (`final_check_texts`) is taken only when the
+  fidelity search ran; the 3.9 search and a run without a search keep the
+  sentence they had.
+- Small: when a block the joint search ends on is also an anchor, the report
+  names the anchor (`anchor: neutral []`) rather than "pruned joint search"; the
+  report name `fidelity_v1` is one constant, shared with `voice_fidelity`.
+
+### Behaviour changes to know about
+
+- With an audio search on, the pipeline and the tabs now use the **fidelity**
+  search unless told `--audio-objective identity`. `--objective both` no longer
+  steers the `[]` search by itself (it still steers the `{}` search): add
+  `--audio-objective identity` to get 3.9's. The Comparator's own default stays
+  `identity`, so an old call to `voice_comparator.py` runs the search it ran.
+- A search is off by default as before; nothing here turns one on without
+  `--fidelity` or an explicit choice.
+
+### Not changed, on purpose
+
+- The weights and scales of the acoustic score are the patch's. On the four
+  reference voices of the repository (three 12 s excerpts each) the score put
+  every pair of excerpts of one speaker above every pair of two speakers (area
+  under the curve 1.00, against 0.988 for 3.9's timbre score), varied less
+  within a speaker (standard deviation 0.031 against 0.133), and reacted to
+  what a post-processing chain does: a +4 dB high shelf moves it by 2.2 of those
+  standard deviations (timbre: 0.6), a 6 kHz low-pass by 4.0 (timbre: 0.2). That
+  is a measure of the measure, not a proof that the clone it prefers sounds
+  closer.
+- S5 compares its finalists with the current setting on matched seeds. In a
+  simulation where every setting has the same true score, with a draw-to-draw
+  spread around 0.03, it adopted a candidate in about 3 to 7 % of the runs; the
+  other stages of the optimiser keep their own `--adopt-alpha`.
+- The 3.9 search, its early stop and its timbre breakdown are untouched.
+
+### Not measured
+
+No real XTTS, Whisper or ECAPA model was run for this version, on any voice,
+and nothing was judged by ear. The tests use synthetic signals, real signal
+processing and stand-in models. Whether the fidelity search finds, on your
+voices, a block that is better by ear and that other sentences confirm, is not
+known until a real run says so: compare the `*_tone.wav`, `*_base.wav` and the
+final clone blind, on sentences the search did not use.
+
+### Tests
+
+- **85 new tests (502 in all; 3.9.0 had 418)**: 77 in `test_fidelity_regressions.py`
+  (the patch's 28 and 49 added here) and 8 in `test_bracket_criterion_regressions.py`.
+  One test of 3.9.0, the one on the old menu, is replaced by the one on the new
+  menu. The 57 added here cover: the tone fit as the baseline, the anchors, the
+  report and its names; `typical_p` on every generation (a test reads the sources
+  of all the scripts); the two `[]` searches driven end to end through
+  `voice_comparator.main()` on real signals, with the model, the speaker encoder
+  and the ASR replaced; the options each search receives from the pipeline and
+  the tabs; and, on both sides of its value, each number stated above for the
+  paired decision, each part and weight of the acoustic score, the guards of the
+  fit, and the choice of finalists and of the winner.
+- **Checked by putting each rule back wrong**, one change at a time, with the whole
+  suite as judge: 103 changes in three series (41 on the rules of the merge, 53
+  on the decision, the score, the selection and the validation, 9 on 3.9 rules
+  that the merge moved). **25 passed unnoticed** and were closed with a test.
+  Four were in the first series: the neutral block keeping its de-esser, the
+  dedicated sentence taken with the search off, the pipeline not handing the
+  used sentences to the Comparator, the bar worded as the identity search's.
+  Twenty-one were in the second, where the patch's tests had only used gross
+  faults (a word error rate rising by 0.3, not by 0.03): the margins of 0.02,
+  0.03 and one standard error, the identity and per-text limits, the guards of
+  the fit, the weights of the score, the ASR transcription of the candidate and
+  a failed search delivering the input `[]` were pinned by nothing. Two changes
+  are equivalent to the code (`adopted=bool(winner)` against `bool(eligible)`,
+  and a re-render of a scratch file that nothing reads afterwards), so no test
+  can tell them apart.
+- The 95 changes of the 3.9 series whose anchors still exist were run again on the
+  merged code: 93 are noticed. The two others are not noticed on the 3.9.0 tree
+  either (checked): the checkpoint's `len(gains) == 2` (equivalent, as 3.9.0
+  says), and the `'terms' in data` test on the timbre line, behind which the
+  recap and the preset section already tolerate a malformed timbre.
+- **Not checked that way**: the joint sampling (S5), the conditioning stages C4b
+  to C4d, `compute_latents` and `format_block`, which rest on the patch's own
+  tests, and the real models, which no test uses.
+- A defect found by a test while it was written: the anchors bypassed the held
+  fields (corrected above). Two traps of the harness, kept in mind by the
+  comments: every test that drives `comparator.main()` must keep real timbre
+  analysis out (`tone_tests.no_real_timbre_analysis()`, or librosa imported
+  under a stand-in aborts the process), and a stand-in encoder must accept a
+  path as well as an array.
+- Run on five interpreters: Python 3.11 with every optional library, 502 tests,
+  all pass; Python 3.11 and Python 3.10 with fewer, 502 run, 28 skipped, all
+  pass; Python 3.13 in two environments, 460 run, none fails, and the 42 tests
+  of `test_complements_regressions.py` are not run there because those two lack
+  tkinter, as before.
+
+---
+
+## 3.9.0 — 2026-10-30 — the `[]` search scores what the `{}` search scores, and stops when it cannot pay
+
+3.8.1 left one thing alone, which ChatGPT's last review also pointed out: the
+criterion of the `[]` search is still ECAPA identity alone. The logs of a real
+voice show what that costs. Every one-factor trial moved ECAPA by 0.004 or less (below
+its own noise), except a noise gate at −30 dB: +0.054 on the sentence of the
+trials, −0.003 on a held-out one. The tolerance was 0.0345, the adoption bar
+0.0689; about 240 evaluations then went to a joint refinement of that one
+sentence, and the candidate was rejected on two others. Meanwhile the `{}`
+search, with `--objective both`, scored a timbre of about 0.30 whatever it
+changed, and nothing said which of its three terms cost.
+
+### Changed
+
+- **The `[]` search can score the timbre.** `--objective identity|timbre|both`
+  (default `identity`, as before) is now also what `--optimise-audio`
+  maximises: `timbre` is the timbre score of the `{}` search (pitch,
+  brightness and HNR of the voiced frames against the whole reference,
+  `1 / (1 + distance)`, 0 for a render with no measurable voice) and `both`
+  is its mean with ECAPA. The accent is not scored: effects do not change
+  what is said. The pipeline forwards its `--objective` to every comparator
+  run when the search is on, so the [Auto] tab's Resemblance (`both`) covers
+  the `[]` too; the Comparator tab has a *Search target* menu (`identity`
+  unless changed). When the reference timbre cannot be measured (no librosa
+  or parselmouth, no voiced audio) the search says so and scores ECAPA alone.
+- **The tolerance is in the units of the score.** The pruning tolerance is
+  the spread of the searched score between the two halves of the tone-fitted
+  render; the screening's ECAPA tolerance is not reused when a timbre is in
+  the score. The adoption rule is untouched: positive on both other
+  sentences, a mean above `max(0.02, 2 x tolerance)` and above 40 % of the
+  gain on the fitting sentence, now in the units of the same score.
+- **The pitch is tracked once.** Tracking the pitch is the slow part of a
+  timbre measure: 0.35 s for the whole measure of a few seconds of speech,
+  0.14 s without it. The EQ, the filters, the gate, the noise reduction, the
+  pan and the level do not move the pitch, so the tone-fitted render is
+  tracked once and each candidate is measured against that voicing, within
+  0.0005 of a full measure for every `[]` field on a synthetic voice. A
+  candidate not laid out in time like the baseline (a speed change, with
+  `--search-all-fields`; a reverb adds 80 ms at the end and still counts as
+  aligned) is measured from scratch.
+- **The search stops when it cannot pay.** After the one-factor trials and
+  the anchored sweeps (about 70 to 80 evaluations) and before the joint
+  refinement, which takes the rest of the budget: if the best change gained
+  less than the pruning tolerance, the pruning would revert all of it, so the
+  search stops and keeps the starting block; otherwise the best candidate is
+  checked on the two other sentences, and the refinement runs only if both
+  gain and their mean reaches half the adoption bar. The other sentences are
+  generated at that point, once, and the checkpoint's validation is the
+  report's when the search stops there. The final rule is the same, so this
+  saves evaluations; it does not create gains. A search with nothing to
+  refine no longer generates the other sentences at all.
+- **The timbre, term by term.** The Comparator prints, for the final clone,
+  pitch, brightness and HNR against the reference (value, gap, cost), the
+  largest cost, what in the studio can move it, and the timbre score of the
+  raw render, of the base `[]` and of the final one. The pipeline's recap
+  carries one line of it, the preset file a *Timbre* section, and the
+  *Audio search* section says which objective was used and where the search
+  stopped. `timbre_report.py REFERENCE.wav CLONE.wav [...]` prints the same
+  for any WAV already on disk, with no model and no GPU.
+
+### Not changed, on purpose
+
+- **No pitch field in `[]`.** The breakdown comes first. In the logs a timbre
+  of 0.30 is a distance of about 2.3, of which the HNR gap (about 1.6 dB)
+  explains roughly 0.55; pitch and brightness hold the other 1.8, and which
+  of the two it is has not been measured. If it is pitch, nothing in `[]`
+  can help and a pitch field is the next step; if it is brightness, the EQ
+  bound `--eq-limit` (4 dB, there to stop drift) is what limits.
+- Noise reduction hardly moves the Praat HNR (+0.2 to +0.6 dB at its
+  strongest), and compression and de-essing can only reduce, so the HNR term
+  has no knob in `[]`.
+- The zero-shot ECAPA ceiling of XTTS (about 0.67 to 0.72) is untouched. A
+  trained RVC model is the structural way past it.
+
+### Not measured
+
+All of this was tested on synthetic voices and a stand-in encoder. Whether
+`both` finds, on a real voice, a block that is better by ear and that other
+sentences confirm, is not known until a real run says so. Run
+`timbre_report.py` on the Vivienne WAVs first: it says which term to work on.
+Listen to the renders blind.
+
+### Tests
+
+- **72 new tests (418 in all)**, in `test_bracket_criterion_regressions.py`:
+  the breakdown and its wording, the measure (array and file, the meter
+  against a full measure, the alignment window), the early stop (both rules,
+  with and without the checkpoint), the criterion and the tolerance in the
+  comparator, the other sentences generated once, the pipeline (forwarding,
+  the recap, the preset sections, malformed lines), the Comparator tab driven
+  with stand-in widgets, and `timbre_report.py`.
+- Two defects of the test setup were found on the way and fixed. The
+  comparator harness imported librosa under a stand-in `soundfile` in three
+  modules, and a library first imported under a stand-in is imported a
+  second time afterwards: its native extension aborts the process. The
+  harness now keeps real audio analysis out of these runs. And a test module
+  importing a test class by name runs its tests twice; modules are imported
+  instead.
+- Checked by breaking each rule, one at a time: 97 changes in two passes. The
+  first pass, of 77, missed twelve. One is equivalent (the checkpoint also
+  requires `len(gains) == 2`, and the search always has exactly two other
+  sentences). One was a length check that the alignment window made
+  redundant, and was removed. The other ten were holes in the tests, nine in
+  code new in 3.9 and one older: the adoption rule's 40 % of the fit gain
+  (3.7) had no test. All ten have one now; a second pass of 30 changes (those
+  ten, the alignment window, the Comparator tab, malformed lines) missed
+  none.
+
+---
+
+## 3.8.1 — 2026-10-29 — a review of 3.8.0 (ChatGPT): provenance and alignment
+
+ChatGPT reviewed 3.8.0 and corrected three things; all three are real and are
+kept. Its notes (`LISEZ_MOI_OPTIMISATION_AUDIO.md` and a patch) are folded in
+here rather than shipped as files.
+
+### Corrected
+
+- **An alternative preset named the wrong clone.** Under `--eq-weighting
+  a+blend`, the *Files* section of the `blend` preset pointed to the main
+  clone. It now points to its own WAV (a mistake of 3.8.0).
+- **The final acoustic table used the whole reference.** The fit works on a
+  stretch of the reference (`--reference-interval`, or the part transcribed
+  by `--auto-text`), but the table reloaded the entire file, so levels and
+  spectral proportions compared the clone with other words and pauses. It is
+  now computed on the fitted stretch, and the table says which: `reference
+  interval 0.00-14.98 s`.
+- **The transcribed text could end on half a French word.** Whisper can
+  split `s'adapter` into `s` and `'adapter`, and the character limit could
+  then keep `pour s` with the audio of the whole word missing. An elision is
+  now one unit, across segment and token boundaries; when the completed word
+  does not fit, the prefix goes too, together with its audio interval, so the
+  text and the interval stay paired. Other languages' apostrophes are left
+  alone. This does not make the end of every transcript a grammatical end of
+  sentence.
+
+### Wording in the preset files
+
+- *Audio search* now says that its criterion is ECAPA identity only (the
+  `{}` objective applies to XTTS generation) and that the adoption bar is a
+  heuristic threshold, not a statistical confidence interval.
+- The hold-out WAVs are labelled *raw XTTS, before the []*.
+- The curation length reads *keep target 45 s*: it is what was asked for, not
+  necessarily what a shorter recording gave.
+
+### Not changed
+
+The `[]` search is still guided by ECAPA identity alone, which is why every
+candidate is rejected on voices where post-processing barely moves it. A
+return to zero does not show that zero is the best setting by ear. Changing
+the criterion needs several texts, real renders and a check of intelligibility,
+timbre and artefacts; making the values non-zero would prove nothing.
+
+### Tests
+
+- 12 new tests (346 in all): ChatGPT's six (the blend preset's WAV, the table
+  on the fitted stretch, four elision cases) and six added here (a spaced
+  elision inside one timed unit, an elision opening the excerpt keeps its
+  prefix's start time, other languages' apostrophes, and three on the
+  wordings above: the search criterion and its threshold, the raw hold-out
+  renders, the curation target).
+- Checked by putting each change back: 14 of ChatGPT's modifications, 13
+  fail a test. The 14th (`first` recomputed after a merge) gives the same
+  value either way, since the merged start equals the prefix's.
+
+---
+
+## 3.8.0 — 2026-10-29 — a voice preset says how it was made
+
+Asked for: the preset files hold more than `{}` and `[]` — comments such as
+the voice's name, and other information.
+
+### What a preset now holds
+
+- **Header** (as before): name, source and date, reference, clone
+  references, one-line voice description, scores, note.
+- **The two blocks**, directly under the header.
+- **Commentary below them**, one `# ---- Title ----` section each:
+  - *In words*: the `{}` and `[]` blocks translated field by field. A field a
+    block leaves out reads *not set*, a historical `0` placeholder reads
+    *inherited (0)*, and `hp`, `lp`, `NR`, `comp`, `de-ess`, `reverb` and
+    `noise_gate` at 0 read *off*. This section is added to every preset,
+    whoever saves it.
+  - Pipeline presets: *Run* (seeds, budgets, objective and weights, number of
+    XTTS generations, stages cut short), *Curation*, *Starting point* (the
+    analyser's priors), *Conditioning* (references cloned from, confirmation
+    verdict), *Tone fit* (EQ weighting, fitted sentence, stretch of the
+    reference, target level), *Audio search* (off, adopted, rejected, failed
+    or report unreadable, with the report's path), *Unseen sentences* (scores
+    and text of each, alerts) and *Files*. An alternative EQ-weighting preset
+    gets its own *Tone fit* and *Audio search*.
+  - Comparator presets: *Tone fit*, *Audio search*, *Files*.
+  - Analyser presets: *Analysis* (F0, variation, level, SNR, crest factor,
+    voiced ratio, sibilance, breathiness).
+- `voice_presets.save(..., info={title: lines})` takes the sections;
+  `read_file` returns them as `info`; `info_text(name)` gives the commentary
+  as text and `insert_text(entry)` the `# name - voice` line plus the blocks.
+
+### Safety
+
+- The generator ignores `#` lines, so a preset pasted whole still gives
+  exactly two blocks (tested).
+- Every value written into a comment is flattened to one line. A note, a
+  reference path or a name holding a line break used to be able to leave the
+  comment and add a `{...}` line of its own.
+- A section titled like a header key (`Voice`, `Source`...) does not replace
+  the header's value on reading.
+- Building the commentary is wrapped: if it fails, the pipeline says so and
+  saves the blocks anyway.
+
+### `[Gen]`
+
+- *Insert* and *Browse* add `# name - voice` above the two blocks.
+- New *Info* button: the whole commentary of the selected preset.
+
+### Tests
+
+- 32 new tests (334 in all): the blocks in words, the layout, reading back,
+  old files, line-break injection, the pipeline end to end with its tools
+  replaced (every section, the audio-search outcomes, alternatives with their
+  own report, a reused curated file, a failing commentary), the comparator's
+  and the analyser's sections. The comparator's failed-search test also
+  checks that the file does not read like a searched result.
+- Checked by putting 23 bugs back one at a time (unsanitised values, sections
+  not read or not closed, an unwritten or dropped section, an alternative
+  sharing the main preset's report, a failure that aborts the save, a missing
+  report passed off as fine...): every one makes at least one test fail.
+- Not covered: the two `[Gen]` buttons, which need Tkinter; they only call
+  `insert_text` and `info_text`, which are.
+
+### Upgrading to 3.8.0
+
+Nothing to do: files written before keep opening, and the next save of a voice
+writes the new layout.
+
+---
+
 ## 3.7.5 — 2026-10-28 — a small reverb renders
 
 Prompted by the audio-search report of a real run (Vivienne, every field

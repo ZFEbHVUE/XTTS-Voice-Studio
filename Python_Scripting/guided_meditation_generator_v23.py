@@ -1181,12 +1181,16 @@ def generate_sentence_audio(clean, voice_num, voice_files, tts_instances,
                    int(xtts_params.get('gpt_cond_len', 30)),
                    int(xtts_params.get('gpt_cond_chunk_len', 4)),
                    int(xtts_params.get('max_ref_len', 30)),
-                   bool(xtts_params.get('sound_norm_refs', 0)))
+                   bool(xtts_params.get('sound_norm_refs', 0)),
+                   int(xtts_params.get('speaker_ref_len', 0)),
+                   float(xtts_params.get('ref_trim_db', 0)))
         if lat_key not in _LAT_CACHE:
             _LAT_CACHE[lat_key] = _XC.compute_latents(
                 model, speaker_wav, gpt_cond_len=lat_key[2],
                 gpt_cond_chunk_len=lat_key[3], max_ref_len=lat_key[4],
-                sound_norm_refs=lat_key[5])
+                sound_norm_refs=lat_key[5],
+                **{k: xtts_params[k] for k in ('speaker_ref_len', 'ref_trim_db')
+                   if xtts_params.get(k, 0)})
             print(f"  [*] Voice {voice_num}: conditioning cached "
                   f"(gpt={lat_key[2]}s, chunk={lat_key[3]}s, ref={lat_key[4]}s)")
         _XC.generate(
@@ -1198,7 +1202,8 @@ def generate_sentence_audio(clean, voice_num, voice_files, tts_instances,
             num_beams=int(xtts_params.get('num_beams', 1)),
             do_sample=bool(xtts_params.get('do_sample', 1)),
             enable_text_splitting=True, speed=1.0,
-            seed=xtts_params.get('seed'))
+            seed=xtts_params.get('seed'),
+            **({'typical_p': xtts_params['typical_p']} if xtts_params.get('typical_p', 1.) < 1 else {}))
         audio = AudioSegment.from_wav(temp_file)
         return render_voice_chain(audio, config, xtts_params)
     except FileNotFoundError as e:

@@ -388,7 +388,7 @@ class PipelineRecapTests(unittest.TestCase):
                 pipeline.main()
         self.assertIn('Optimiser stages cut short by the budget: S3 top_k', output.getvalue())
 
-    def run_pipeline(self, td, extra, comparator_reply):
+    def run_pipeline(self, td, extra, comparator_reply, all_commands=False):
         """The pipeline with every tool simulated; returns (commands, saves, recap)."""
         ref = Path(td) / 'a.wav'
         ref.touch()
@@ -415,7 +415,7 @@ class PipelineRecapTests(unittest.TestCase):
                                         '--no-curate', *extra]), \
              contextlib.redirect_stdout(output):
             pipeline.main()
-        return [c for c in commands if 'voice_comparator.py' in c[1]], saves, output.getvalue()
+        return (commands if all_commands else [c for c in commands if 'voice_comparator.py' in c[1]]), saves, output.getvalue()
 
     def test_a_second_weighting_refits_the_same_clone(self):
         fitted = {'a': '[1, FR, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]',
