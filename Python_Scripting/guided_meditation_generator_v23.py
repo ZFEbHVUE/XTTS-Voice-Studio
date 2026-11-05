@@ -1471,7 +1471,54 @@ def count_total_sentences(segments):
 # Main generation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_meditation(text, output_file, voice_files, ambient_file, music_files):
+def output_format(path):
+    """The container written for this output name, from its extension, or None
+    when the extension is not one the generator writes."""
+    ext = os.path.splitext(path)[1].lower()
+    return {'.wav': 'wav', '.mp3': 'mp3', '.flac': 'flac', '.ogg': 'ogg'}.get(ext)
+
+
+def resolve_output_path(path):
+    """Check the output name BEFORE the synthesis, which can take an hour.
+
+    A name without an extension gets '.wav' -- the file used to be written
+    without one, so nothing could open it by its name. An extension the
+    generator does not write stops here, with the list of those it does."""
+    if not os.path.splitext(path)[1]:
+        print(f"[*] Output has no extension: writing {os.path.basename(path)}.wav")
+        return path + '.wav'
+    if output_format(path) is None:
+        raise SystemExit(f"[!] Unsupported output extension "
+                         f"{os.path.splitext(path)[1]!r}: use .wav, .mp3, .flac or .ogg")
+    return path
+
+
+def export_final(audio, path, mp3_bitrate=192, mp3_mode='cbr'):
+    """Write the final mix in the format its extension names.
+
+    Until 3.10.2 every output was written as WAV whatever its name, so an
+    'output.mp3' was a WAV file with an .mp3 name (the size of a WAV) and the
+    MP3 bit rate and mode were read from the command line and never used.
+    VBR uses LAME's -q scale, mapped as in extract_voices.py and the Video tab."""
+    fmt = output_format(path)
+    if fmt is None:
+        raise ValueError(f"unsupported output extension: {path}")
+    if fmt == 'mp3':
+        if mp3_mode == 'vbr':
+            q = {128: 6, 160: 5, 192: 4, 256: 2, 320: 0}.get(int(mp3_bitrate), 4)
+            audio.export(path, format='mp3', codec='libmp3lame', parameters=['-q:a', str(q)])
+            return f"MP3 VBR -q:a {q}"
+        audio.export(path, format='mp3', codec='libmp3lame', bitrate=f"{int(mp3_bitrate)}k")
+        return f"MP3 CBR {int(mp3_bitrate)}k"
+    if fmt == 'ogg':
+        audio.export(path, format='ogg', codec='libvorbis')
+        return "OGG Vorbis"
+    audio.export(path, format=fmt)
+    return fmt.upper()
+
+
+def generate_meditation(text, output_file, voice_files, ambient_file, music_files,
+                        mp3_bitrate=192, mp3_mode='cbr'):
     # Reset per-voice config memory for this generation run
     _voice_last_config.clear()
 
@@ -1810,7 +1857,8 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
     print(f"[PROGRESS={step_done}/{total_steps}]")
 
     print(f"\n[*] Saving...")
-    final_audio.export(output_file, format="wav")
+    written = export_final(final_audio, output_file, mp3_bitrate, mp3_mode)
+    print(f"   [OK] {written}")
     step_done += 1
     print(f"[PROGRESS={step_done}/{total_steps}]")
 
@@ -1828,7 +1876,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
 
 def main():
     if len(sys.argv) < 4:
-        print("Usage: python guided_meditation_generator_v23.py script.txt output.wav voice1.wav [voice2.wav ...] [music...]")
+        print("Usage: python guided_meditation_generator_v23.py script.txt output.(wav|mp3|flac|ogg) voice1.wav [voice2.wav ...] [music...] [--mp3-bitrate 192] [--mp3-mode cbr|vbr]")
         print("\nVERSION 23 - gpt_cond_len/chunk_len/sound_norm_refs + reverb/noise_gate/pan/limiter + parallel overlay")
         print("\nAUDIO bracket syntax:")
         print("  [N, LANG, speed, vol, eq_low, eq_mid, eq_high, hp, lp, NR, comp, de-ess]")
@@ -1882,7 +1930,7 @@ def main():
     mp3_mode    = _known.mp3_mode
 
     input_file  = _other_args[0]
-    output_file = _other_args[1]
+    output_file = resolve_output_path(_other_args[1])
     audio_files = _other_args[2:]
 
     if not audio_files:
@@ -1913,7 +1961,8 @@ def main():
         print("[!] Could not read input file (encoding issue).")
         sys.exit(1)
 
-    generate_meditation(text, output_file, voice_files, ambient_file, music_files)
+    generate_meditation(text, output_file, voice_files, ambient_file, music_files,
+                        mp3_bitrate=mp3_bitrate, mp3_mode=mp3_mode)
 
     # Flush stdout and exit hard: os._exit(0) skips Python's normal teardown,
     # which prevents XTTS/torch/CUDA shutdown logs from scrolling past the

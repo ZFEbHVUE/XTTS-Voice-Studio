@@ -71,6 +71,25 @@ and the global music is written on a last line of the `.seg`:
 global_music = {"music": 'nidra_bed.wav', "music_level": 0.5}
 ```
 
+**A segment's music loops by default.** A file shorter than its segment starts
+again until the segment ends (the seam is blended over 50 ms). Untick **Loop**,
+next to the music's X button, to play it once and then leave silence — the way
+to put a spoken phrase in a segment. It is saved as `"music_loop": False`.
+
+**Crossfade and fades.** Under the segment list, **Crossfade (s)** (2 by default)
+is the overlap between two segments, **Fade (s)** (3) the fade at both ends of
+the session. A crossfade of **0** joins the segments end to end: each one
+starts exactly where the previous one stops, and the total shown follows it.
+With 2 s, a segment starts 2 s before the previous one ends, inside a fade-in.
+Both are saved in the `.seg` when they differ from the defaults:
+
+```python
+session = {"crossfade": 0, "fade": 0.5}
+```
+
+Loading (not adding) a `.seg` sets the two fields; a `.seg` without the line
+gets the defaults.
+
 A music file stored in `Brainwave_Presets/Music/` is written **relative** to
 that folder, so the same `.seg` opens on every machine where the repository is
 cloned. On load a path is looked for as written, then in the Music folder, then

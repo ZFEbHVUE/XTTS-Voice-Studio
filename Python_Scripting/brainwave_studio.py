@@ -121,6 +121,38 @@ def parse_global_music(text):
     return None
 
 
+# Crossfade between segments and fade at both ends of the render, in seconds.
+# They were fixed in the GUI (2 s and 3 s); a .seg can now carry its own.
+SESSION_DEFAULTS = {"crossfade": 2.0, "fade": 3.0}
+
+
+def parse_session_options(text):
+    """Read the optional 'session = {"crossfade": 0, "fade": 0.5}' line of a
+    .seg. Returns only the keys found, as nonnegative floats."""
+    try:
+        tree = ast.parse(text or "")
+    except SyntaxError:
+        return {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "session" for t in node.targets):
+            try:
+                val = ast.literal_eval(node.value)
+            except (ValueError, SyntaxError):
+                return {}
+            if not isinstance(val, dict):
+                return {}
+            out = {}
+            for k in SESSION_DEFAULTS:
+                if k in val:
+                    v = float(val[k])
+                    if not np.isfinite(v) or v < 0:
+                        raise ValueError(f"session {k} must be a nonnegative number of seconds")
+                    out[k] = v
+            return out
+    return {}
+
+
 BANDS = {"Delta": 2.0, "Theta": 6.0, "Alpha": 10.0, "Beta": 18.0, "Gamma": 40.0}
 
 CHAKRAS = ["Root", "Sacral", "Plexus", "Heart", "Throat", "3rd eye", "Crown"]
@@ -947,9 +979,14 @@ def validate_segment(seg):
     if seg.get("music"):
         seg["music"] = resolve_music(str(seg["music"]))
         seg["music_level"] = float(seg.get("music_level", 0.25))
+        loop = seg.get("music_loop", True)
+        if not isinstance(loop, bool):
+            raise ValueError("music_loop must be True or False")
+        seg["music_loop"] = loop
     else:
         seg.pop("music", None)
         seg.pop("music_level", None)
+        seg.pop("music_loop", None)
     for key in ('carrier', 'duration', 'tone_level', 'drone', 'noise', 'music_level',
                 'global_level', 'duck', 'rot_rpm', 'rot_depth', 'stereo_phase'):
         if key in seg:
@@ -974,7 +1011,7 @@ def validate_segment(seg):
     return seg
 
 
-def segments_to_text(segments, global_music=None):
+def segments_to_text(segments, global_music=None, session=None):
     """Serialize a list of segments into copyable Python code.
 
     Everything a segment carries is written, not just the first few fields: a
@@ -1018,6 +1055,8 @@ def segments_to_text(segments, global_music=None):
         if s.get("music"):
             parts.append(f'"music": {music_to_portable(s["music"])!r}')
             parts.append(f'"music_level": {s.get("music_level", 0.25):g}')
+            if s.get("music_loop", True) is False:
+                parts.append('"music_loop": False')
         lines.append("    {" + ", ".join(parts) + "},")
     lines.append("]")
     # The global bed is part of the session: without it a saved session came
@@ -1026,6 +1065,14 @@ def segments_to_text(segments, global_music=None):
         lines.append(f'global_music = {{"music": '
                      f'{music_to_portable(global_music["music"])!r}, '
                      f'"music_level": {float(global_music.get("music_level", 0.25)):g}}}')
+    # Crossfade and fades of the render, written only when they are not the
+    # defaults, so older readers see an unchanged file.
+    if session:
+        opts = {k: float(v) for k, v in session.items()
+                if k in SESSION_DEFAULTS and v is not None
+                and abs(float(v) - SESSION_DEFAULTS[k]) > 1e-9}
+        if opts:
+            lines.append("session = {" + ", ".join(f'"{k}": {v:g}' for k, v in opts.items()) + "}")
     return "\n".join(lines)
 
 
@@ -1305,7 +1352,7 @@ class ToneToolbox:
                noise_color="pink", drone=0.0, fade=2.0, music=None, music_level=0.25,
                duck=0.0, tone_level=1.0, stereo_phase=0.0,
                rot_rpm=0.0, rot_depth=1.0,
-               level_drone=False, level_noise=False, bowl_modes=None):
+               level_drone=False, level_noise=False, bowl_modes=None, music_loop=True):
         gen = getattr(self, mode)
         kw = ({"duty": duty, "stereo_phase": stereo_phase}
               if mode == "isochronic" else
@@ -1337,7 +1384,7 @@ class ToneToolbox:
             audio = self._mix(audio,
                               self.colored_noise(duration, noise, noise_color) * _bn)
         if music is not None and music_level > 0:
-            mm = _MusicStream(music, music_level, self.sr).read(len(audio))
+            mm = _MusicStream(music, music_level, self.sr, loop=music_loop).read(len(audio))
             if duck > 0:
                 mm = mm * _Ducker(duck, self.sr).gains(tones)
             audio = self._mix(audio, mm)
@@ -1390,7 +1437,7 @@ class ToneToolbox:
             arr = music_arrays.get(seg.get("music"))
             if arr is not None:                       # this segment's own music
                 mm = _MusicStream(arr, float(seg.get("music_level", 0.25)),
-                                  self.sr).read(len(part))
+                                  self.sr, loop=seg.get("music_loop", True)).read(len(part))
                 if _dk > 0:
                     mm = mm * _Ducker(_dk, self.sr).gains(part)
                 part = part + mm
@@ -1731,7 +1778,8 @@ class ToneToolbox:
                 rot_n += len(out)
                 yield out
             return
-        mus = _MusicStream(arr, float(seg.get("music_level", 0.25)), self.sr)
+        mus = _MusicStream(arr, float(seg.get("music_level", 0.25)), self.sr,
+                           loop=seg.get("music_loop", True))
         duck = _Ducker(sdk, self.sr) if sdk > 0 else None
         for tones in base:
             if tl != 1.0:
@@ -1987,8 +2035,11 @@ def load_music(path, sr=44100):
 
 
 class _MusicStream:
-    """Serve a stereo music buffer in arbitrary chunks, looped seamlessly."""
-    def __init__(self, audio, level, sr, xfade=0.05):
+    """Serve a stereo music buffer in arbitrary chunks, looped seamlessly.
+
+    loop=False plays it once and then gives silence: a spoken phrase in a
+    segment longer than the file must not start again before the segment ends."""
+    def __init__(self, audio, level, sr, xfade=0.05, loop=True):
         # A COPY: the loop seam is blended in place below, and a view would
         # rewrite the caller's array -- every Play session used to blend the
         # stored global music a little more at its start.
@@ -1997,7 +2048,8 @@ class _MusicStream:
                 or not np.isfinite(self.a).all() or not np.isfinite(level) or level < 0):
             raise ValueError("Music stream needs finite, nonempty stereo audio and a nonnegative level")
         self.level, self.pos, self.n = level, 0, len(self.a)
-        nx = min(int(xfade * sr), self.n // 4)
+        self.loop = bool(loop)
+        nx = min(int(xfade * sr), self.n // 4) if self.loop else 0
         if nx > 0 and self.n > 2 * nx:              # pre-blend the loop seam once
             r = np.linspace(0.0, 1.0, nx)[:, None]
             head = self.a[:nx].copy()
@@ -2008,6 +2060,12 @@ class _MusicStream:
     def read(self, m):
         out = np.empty((m, 2))
         i = 0
+        if not self.loop:
+            take = max(0, min(m, self.n - self.pos))
+            out[:take] = self.a[self.pos:self.pos + take]
+            out[take:] = 0.0
+            self.pos += take
+            return out * self.level
         while i < m:
             take = min(m - i, self.n - self.pos)
             out[i:i + take] = self.a[self.pos:self.pos + take]
@@ -2916,8 +2974,13 @@ class BrainwaveStudio:
         self.music_name = tk.StringVar(value="(none)")
         ttk.Label(frm, textvariable=self.music_name, foreground="#666",
                   width=22).grid(row=r, column=1, columnspan=2, sticky="w", **pad)
-        ttk.Button(frm, text="X", width=2, command=self.clear_music).grid(
-            row=r, column=3, sticky="w", **pad)
+        frm_x = ttk.Frame(frm)
+        frm_x.grid(row=r, column=3, sticky="w", **pad)
+        ttk.Button(frm_x, text="X", width=2, command=self.clear_music).pack(side="left")
+        # Off: the file plays once, then silence (a spoken phrase must not start
+        # again before the segment ends). On: looped, as before.
+        self.music_loop_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm_x, text="Loop", variable=self.music_loop_var).pack(side="left", padx=(6, 0))
         r += 1
         # Music level in dB, to be comparable with Beat level: a mix is judged by
         # the DIFFERENCE between the two, and that difference is only readable
@@ -3006,8 +3069,19 @@ class BrainwaveStudio:
         self.seg_list.bind("<Double-Button-1>", self._load_segment)
 
         self.total_lbl = tk.StringVar(value="Total: 0:00")
-        ttk.Label(frm, textvariable=self.total_lbl).grid(
-            row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        frm_tot = ttk.Frame(frm)
+        frm_tot.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Label(frm_tot, textvariable=self.total_lbl).pack(side="left")
+        # Crossfade between segments and fade at both ends, in seconds. Both
+        # were fixed (2 s and 3 s); 0 s joins the segments end to end. Saved in
+        # the .seg as 'session = {...}' when they differ from the defaults.
+        self.xfade_var = tk.StringVar(value=f"{SESSION_DEFAULTS['crossfade']:g}")
+        self.fade_var = tk.StringVar(value=f"{SESSION_DEFAULTS['fade']:g}")
+        ttk.Label(frm_tot, text="   Crossfade (s)").pack(side="left")
+        ttk.Entry(frm_tot, textvariable=self.xfade_var, width=4).pack(side="left", padx=(2, 0))
+        ttk.Label(frm_tot, text="  Fade (s)").pack(side="left")
+        ttk.Entry(frm_tot, textvariable=self.fade_var, width=4).pack(side="left", padx=(2, 0))
+        self.xfade_var.trace_add("write", lambda *_: self._update_total())
 
         b = ttk.Frame(frm)
         b.grid(row=3, column=0, columnspan=4, pady=6)
@@ -3272,6 +3346,8 @@ class BrainwaveStudio:
         if getattr(self, "music_path", None):
             seg["music"] = self.music_path
             seg["music_level"] = self._dget(self.music_level, 0.25)
+            if not self.music_loop_var.get():
+                seg["music_loop"] = False
         return seg
 
     def _seg_label(self, seg):
@@ -3396,11 +3472,30 @@ class BrainwaveStudio:
         i = getattr(self, "_sel_index", None)
         return i if (i is not None and 0 <= i < len(self.segments)) else None
 
-    def _session_offset(self, i, xfade=2.0):
+    def _session_time(self, key):
+        """Crossfade or fade of the session, in s; the default while the field
+        is empty or not a nonnegative number (being typed)."""
+        var = self.xfade_var if key == "crossfade" else self.fade_var
+        try:
+            v = float(str(var.get()).strip().replace(",", "."))
+        except (ValueError, tk.TclError):
+            return SESSION_DEFAULTS[key]
+        return v if np.isfinite(v) and v >= 0 else SESSION_DEFAULTS[key]
+
+    def _session_dict(self):
+        return {"crossfade": self._session_time("crossfade"), "fade": self._session_time("fade")}
+
+    def _apply_session_options(self, opts):
+        for key, var in (("crossfade", self.xfade_var), ("fade", self.fade_var)):
+            var.set(f"{opts.get(key, SESSION_DEFAULTS[key]):g}")
+
+    def _session_offset(self, i, xfade=None):
         """Sample at which segment i starts in the assembled session (same
         crossfade geometry as the renderer)."""
         if i is None:
             return 0
+        if xfade is None:
+            xfade = self._session_time("crossfade")
         nx = self.tb._n(xfade)
         return sum(self.tb._n(s_["duration"]) - nx for s_ in self.segments[:i])
 
@@ -3589,7 +3684,8 @@ class BrainwaveStudio:
         if not self.segments:
             self.total_lbl.set("Total: 0:00")
             return
-        tot = sum(s["duration"] for s in self.segments) - 2.0 * (len(self.segments) - 1)
+        tot = (sum(s["duration"] for s in self.segments)
+               - self._session_time("crossfade") * (len(self.segments) - 1))
         tot = max(0, int(round(tot)))
         h, rem = divmod(tot, 3600)
         m, s = divmod(rem, 60)
@@ -3650,8 +3746,10 @@ class BrainwaveStudio:
             self._set_music_from_path(seg["music"], announce=False)
             self.music_db.set(20.0 * math.log10(
                 max(float(seg.get("music_level", 0.25)), 1e-6)))
+            self.music_loop_var.set(seg.get("music_loop", True) is not False)
         else:
             self._clear_music(announce=False)
+            self.music_loop_var.set(True)
         self._on_mode()
         self._on_ramp()
         self.status.set(f"Segment {sel[0] + 1} loaded - edit then Update, "
@@ -3680,6 +3778,8 @@ class BrainwaveStudio:
                 and not getattr(self, "_music_removed", False)):
             keep["music"] = old["music"]
             keep["music_level"] = old.get("music_level", 0.25)
+            if old.get("music_loop", True) is False:
+                keep["music_loop"] = False
         if "global_level" in old:          # set with Apply, not by the panel
             keep["global_level"] = old["global_level"]
         seg.update(keep)
@@ -3703,8 +3803,8 @@ class BrainwaveStudio:
         # Build the text BEFORE opening the file: open(path, "w") truncates at
         # once, so a failure while formatting would leave a 0-byte file behind.
         try:
-            body = segments_to_text(self.segments,
-                                    self._global_music_dict()) + "\n"
+            body = segments_to_text(self.segments, self._global_music_dict(),
+                                    self._session_dict()) + "\n"
         except Exception as e:
             self.status.set(f"Could not format the session: {e}")
             return
@@ -3737,6 +3837,11 @@ class BrainwaveStudio:
             if isinstance(s_, dict) and s_.get("music"):
                 s_["music"] = resolve_music(s_["music"], seg_dir)
         gm = parse_global_music(file_txt)
+        try:
+            sess = parse_session_options(file_txt)
+        except ValueError as e:
+            self.status.set(f"Could not read: {e}")
+            return
         if not raw:
             self.status.set("No usable segment in that file.")
             return
@@ -3761,6 +3866,8 @@ class BrainwaveStudio:
                 self.seg_list.insert("end", self._seg_label(self.segments[-1]))
             except Exception:
                 bad += 1
+        if not append:
+            self._apply_session_options(sess)
         self._update_total()
         note = self._restore_global(gm, append, seg_dir)
         miss = self._missing_music(self.segments)
@@ -3793,6 +3900,7 @@ class BrainwaveStudio:
             raw = parse_segments(text)
             segs = [validate_segment(s) for s in raw]
             gm = parse_global_music(text)
+            sess = parse_session_options(text)
             if not segs:
                 raise ValueError("The list is empty.")
         except Exception as e:
@@ -3817,6 +3925,8 @@ class BrainwaveStudio:
         for s in segs:
             self.segments.append(s)
             self.seg_list.insert("end", self._seg_label(s))
+        if not append:
+            self._apply_session_options(sess)
         self._update_total()
         note = self._restore_global(gm, append)
         miss = self._missing_music(segs)
@@ -3831,8 +3941,8 @@ class BrainwaveStudio:
             messagebox.showinfo("Empty session", "No segment to export.")
             return
         self._text_dialog("Copy the session (Ctrl+C)",
-                          segments_to_text(self.segments,
-                                           self._global_music_dict()), None)
+                          segments_to_text(self.segments, self._global_music_dict(),
+                                           self._session_dict()), None)
 
     def _text_dialog(self, title, initial, on_ok):
         win = tk.Toplevel(self.root)
@@ -3881,7 +3991,9 @@ class BrainwaveStudio:
         opts = dict(noise=self._dget(self.noise, 0.0),
                     noise_color=self.noise_color.get(),
                     drone=self._dget(self.drone_level, 0.0),
-                    fade=3.0 if len(segments) > 1 else 2.0, xfade=2.0,
+                    fade=self._session_time("fade") if len(segments) > 1
+                    else min(self._session_time("fade"), 2.0),
+                    xfade=self._session_time("crossfade"),
                     # The session bed is the GLOBAL music, not the left panel:
                     # the left panel now belongs to whichever segment is being
                     # edited, and each segment carries its own music inside it.
@@ -3934,7 +4046,8 @@ class BrainwaveStudio:
         segments = [dict(s) for s in self.segments]
         opts = dict(noise=self._dget(self.noise, 0.0),
                     noise_color=self.noise_color.get(),
-                    drone=self._dget(self.drone_level, 0.0), fade=3.0, xfade=2.0,
+                    drone=self._dget(self.drone_level, 0.0), fade=self._session_time("fade"),
+                    xfade=self._session_time("crossfade"),
                     # The session bed is the GLOBAL music, not the left panel:
                     # the left panel now belongs to whichever segment is being
                     # edited, and each segment carries its own music inside it.
@@ -4038,7 +4151,8 @@ class BrainwaveStudio:
             rot_depth=self._dget(self.rot_depth, 1.0),
             level_drone=self.level_drone.get(),
             level_noise=self.level_noise.get(),
-            bowl_modes=self.bowl_modes)
+            bowl_modes=self.bowl_modes,
+            music_loop=self.music_loop_var.get())
 
     def _set_music_from_path(self, path, announce=True):
         """Load a file into the left panel. Shared by the dialog and by segment

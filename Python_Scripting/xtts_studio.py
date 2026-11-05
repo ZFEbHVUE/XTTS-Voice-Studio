@@ -72,106 +72,69 @@ def _ensure_dir(d):
     return os.path.expanduser("~")
 
 # ── File chooser ─────────────────────────────────────────────────────────────
-# Tk's own dialog shows no file sizes, cannot sort, and offers no copy, paste or
-# delete. When zenity is present -- it ships with most GTK desktops -- the real
-# system chooser is used instead, and every Browse button in the app benefits.
-# Falls back to Tk silently when it is not, so nothing breaks elsewhere.
-import shutil as _shutil
+# One Tk/ttk child dialog, sharing this application's theme and event loop.
+# The module-level replacement also covers the embedded Brainwave editors.
+import studio_file_dialog as _studio_dialog
 
-_ZENITY = _shutil.which("zenity")
-
-
-def _zenity_filters(filetypes):
-    """Turn Tk's [(label, "*.wav *.mp3")] into zenity's --file-filter form."""
-    out = []
-    for label, pats in (filetypes or []):
-        pats = " ".join(p for p in str(pats).split() if p)
-        if pats:
-            out += ["--file-filter", f"{label} | {pats}"]
-    return out
-
-
-def _zenity_pick(filetypes=None, initialdir=None, save=False, multiple=False,
-                 title="Choose a file"):
-    """Return a list of paths, or None when zenity is unavailable or cancelled."""
-    if not _ZENITY:
-        return None
-    cmd = [_ZENITY, "--file-selection", f"--title={title}"]
-    if save:
-        cmd += ["--save", "--confirm-overwrite"]
-    if multiple:
-        # \n is impossible in a path on Linux, unlike zenity's default "|".
-        cmd += ["--multiple", "--separator=\n"]
-    if initialdir:
-        d = initialdir if initialdir.endswith(os.sep) else initialdir + os.sep
-        cmd += [f"--filename={d}"]
-    cmd += _zenity_filters(filetypes)
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
-    except Exception:
-        return None
-    if r.returncode != 0:          # cancelled, or zenity failed
-        return [] if r.returncode == 1 else None
-    return [p for p in r.stdout.strip().split("\n") if p]
-
-
-# Replace Tk's three dialogs once, rather than editing every call site: the
-# app opens files from a dozen places (prompt editor, presets, per-row Browse
-# buttons) and they all deserve the better chooser. Each wrapper falls back to
-# the original when zenity is missing or is given positional arguments.
-_TK_OPEN  = filedialog.askopenfilename
-_TK_MULTI = filedialog.askopenfilenames
-_TK_SAVE  = filedialog.asksaveasfilename
-
-
-def _ask_open(*a, **kw):
-    if a:
-        return _TK_OPEN(*a, **kw)
-    p = _zenity_pick(kw.get("filetypes"), kw.get("initialdir"),
-                     title=kw.get("title", "Choose a file"))
-    if p is None:
-        return _TK_OPEN(**kw)
-    return p[0] if p else ""
-
-
-def _ask_multi(*a, **kw):
-    if a:
-        return _TK_MULTI(*a, **kw)
-    p = _zenity_pick(kw.get("filetypes"), kw.get("initialdir"),
-                     multiple=True, title=kw.get("title", "Choose files"))
-    if p is None:
-        return _TK_MULTI(**kw)
-    return tuple(p)
-
-
-def _ask_save(*a, **kw):
-    if a:
-        return _TK_SAVE(*a, **kw)
-    p = _zenity_pick(kw.get("filetypes"), kw.get("initialdir"), save=True,
-                     title=kw.get("title", "Save as"))
-    if p is None:
-        return _TK_SAVE(**kw)
-    if not p:
-        return ""
-    # zenity does not add the extension the filter implies; Tk does.
-    path = p[0]
-    ext = kw.get("defaultextension")
-    if ext and not os.path.splitext(path)[1]:
-        path += ext
-    return path
-
-
-filedialog.askopenfilename  = _ask_open
+_studio_dialog.configure(
+    parent=lambda: _root,
+    shortcuts=lambda: [
+        ('Projet XTTS', XTTS_ROOT), ('Voix de référence', DIR_VOICES),
+        ('Audio généré', DIR_OUTPUT), ('Ambiances', DIR_AMBIENT),
+        ('Prompts', DIR_PROMPTS),
+        ('Brainwave Presets', os.path.join(XTTS_ROOT, 'Brainwave_Presets')),
+    ],
+    before_preview=lambda: _stop_player(),
+)
+_ask_open = _studio_dialog.askopenfilename
+_ask_multi = _studio_dialog.askopenfilenames
+_ask_save = _studio_dialog.asksaveasfilename
+filedialog.askopenfilename = _ask_open
 filedialog.askopenfilenames = _ask_multi
 filedialog.asksaveasfilename = _ask_save
+filedialog.askdirectory = _studio_dialog.askdirectory
 
 
-def browse_file(var, filetypes=None, save=False, initialdir=None):
+GEN_FORMATS = ('mp3', 'wav', 'flac', 'ogg')     # what guided_meditation_generator_v23 writes
+
+
+def output_with_extension(path, fmt):
+    """(path, None) with '.fmt' added when the name has no extension, or
+    (path, message) when its extension is not one the generator writes."""
+    path = path.strip()
+    ext = os.path.splitext(path)[1].lower()
+    if not ext:
+        return path + '.' + fmt, None
+    if ext[1:] not in GEN_FORMATS:
+        return path, (f"Unsupported output extension {ext!r}: use "
+                      + ", ".join('.' + e for e in GEN_FORMATS))
+    return path, None
+
+
+def _single_extension(filetypes):
+    """'.wav' for [("WAV", "*.wav"), ("All", "*.*")]: the one extension a save
+    field accepts, or None when it accepts several (then the choice is made
+    elsewhere -- the Meditation tab has a Format list)."""
+    exts = [pat[1:] for _label, pats in (filetypes or []) for pat in pats.split()
+            if pat.startswith('*.') and pat != '*.*']
+    return exts[0] if len(set(exts)) == 1 else None
+
+
+def browse_file(var, filetypes=None, save=False, initialdir=None, defaultextension=None):
+    """defaultextension: '.mp3', or a function returning one (read at click
+    time, so it follows a Format list). A save dialog adds it to a name typed
+    without an extension; zenity does not do it by itself, and it cannot tell
+    which of its filters was selected."""
     if filetypes is None:
         filetypes = [("All", "*.*")]
     d = _ensure_dir(initialdir) if initialdir else None
-    ask = filedialog.asksaveasfilename if save else filedialog.askopenfilename
-    path = ask(filetypes=filetypes, initialdir=d)
+    if save:
+        ext = defaultextension() if callable(defaultextension) else defaultextension
+        ext = ext or _single_extension(filetypes)
+        kw = {'defaultextension': ext} if ext else {}
+        path = filedialog.asksaveasfilename(filetypes=filetypes, initialdir=d, **kw)
+    else:
+        path = filedialog.askopenfilename(filetypes=filetypes, initialdir=d)
     if path:
         var.set(path)
 
@@ -289,7 +252,8 @@ def split_paths(text):
     return out
 
 
-def add_row(parent, label, var, row, filetypes=None, save=False, multi=False, initialdir=None):
+def add_row(parent, label, var, row, filetypes=None, save=False, multi=False, initialdir=None,
+            defaultextension=None):
     parent.grid_columnconfigure(1, weight=1)
     tk.Label(parent, text=label, anchor='w', width=20).grid(
         row=row, column=0, sticky='w', padx=6, pady=3)
@@ -302,7 +266,7 @@ def add_row(parent, label, var, row, filetypes=None, save=False, multi=False, in
             row=row, column=col, padx=4, pady=3)
     else:
         tk.Button(parent, text="Browse", width=9,
-            command=lambda: browse_file(var, filetypes, save, initialdir)).grid(
+            command=lambda: browse_file(var, filetypes, save, initialdir, defaultextension)).grid(
             row=row, column=col, padx=4, pady=3)
 
 
@@ -696,7 +660,8 @@ def tab_generator(nb):
     v_music   = tk.StringVar()
 
     add_row(f, "Script (.txt)",  v_script,  1, [("Text","*.txt"),("All","*.*")], initialdir=DIR_PROMPTS)
-    add_row(f, "Output (wav/mp3)", v_output, 2, [("WAV","*.wav"),("MP3","*.mp3"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")], save=True, initialdir=DIR_OUTPUT)
+    add_row(f, "Output (wav/mp3)", v_output, 2, [("WAV","*.wav"),("MP3","*.mp3"),("FLAC","*.flac"),("OGG","*.ogg"),("All","*.*")], save=True, initialdir=DIR_OUTPUT,
+            defaultextension=lambda: '.' + v_gen_format.get())
 
     # ── Voices — one row per voice, each with multi-ref support ──────────────
     voices_frame = tk.LabelFrame(f, text="Voices", padx=4, pady=2)
@@ -806,16 +771,21 @@ def tab_generator(nb):
                                for _l, v, _r in music_rows_gen if v.get().strip()))
 
     # ── MP3 output options ────────────────────────────────────────────────────
+    # The Format list gives the extension of an output named without one (Browse
+    # and Run); an extension typed in the name wins.
+    v_gen_format      = tk.StringVar(value='mp3')
     v_gen_mp3_bitrate = tk.StringVar(value='192')
     v_gen_mp3_mode    = tk.StringVar(value='cbr')
-    tk.Label(f, text="MP3 bitrate (kbps)", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
+    tk.Label(f, text="Format / MP3 (kbps)", anchor='w', width=20).grid(row=6, column=0, sticky='w', padx=6, pady=3)
     frm_gen_mp3 = tk.Frame(f)
     frm_gen_mp3.grid(row=6, column=1, sticky='w', padx=4)
+    ttk.Combobox(frm_gen_mp3, textvariable=v_gen_format, width=5, state='readonly',
+        values=list(GEN_FORMATS)).pack(side='left', padx=(0, 10))
     ttk.Combobox(frm_gen_mp3, textvariable=v_gen_mp3_bitrate, width=6, state='readonly',
         values=['128','160','192','256','320']).pack(side='left')
     ttk.Combobox(frm_gen_mp3, textvariable=v_gen_mp3_mode, width=5, state='readonly',
         values=['cbr','vbr']).pack(side='left', padx=6)
-    tk.Label(frm_gen_mp3, text="(only used if output is .mp3)", fg='grey').pack(side='left')
+    tk.Label(frm_gen_mp3, text="(bit rate and mode: .mp3 only)", fg='grey').pack(side='left')
 
     # Project files, on the right of the MP3 row: a prompt on its own says
     # nothing about which voices and which sounds went with it, so reopening a
@@ -851,6 +821,7 @@ def tab_generator(nb):
                 + voice_block
                 + f"ambient     = {v_ambient.get().strip()}\n"
                 + f"sounds      = {' ; '.join(sounds)}\n"
+                + f"format      = {v_gen_format.get()}\n"
                 + f"mp3_bitrate = {v_gen_mp3_bitrate.get()}\n"
                 + f"mp3_mode    = {v_gen_mp3_mode.get()}\n"
                 + "--- script ---\n"
@@ -901,6 +872,8 @@ def tab_generator(nb):
         v_script.set(cfg.get('script_path', ''))
         v_output.set(cfg.get('output', ''))
         v_ambient.set(cfg.get('ambient', ''))
+        if cfg.get('format') in GEN_FORMATS:
+            v_gen_format.set(cfg['format'])
         if cfg.get('mp3_bitrate'):
             v_gen_mp3_bitrate.set(cfg['mp3_bitrate'])
         if cfg.get('mp3_mode'):
@@ -1597,6 +1570,12 @@ def tab_generator(nb):
 
         if not v_script.get() or not v_output.get() or not voice_args:
             log(console, "[ERR] Script, output and at least one voice required."); return
+        out, problem = output_with_extension(v_output.get(), v_gen_format.get())
+        if problem:
+            log(console, f"[ERR] {problem}"); return
+        if out != v_output.get().strip():
+            v_output.set(out)
+            log(console, f"[*] Output without extension: {os.path.basename(out)} ({v_gen_format.get()})")
         cmd = [sys.executable,
                os.path.join(SCRIPTS_DIR, 'guided_meditation_generator_v23.py'),
                v_script.get(), v_output.get()]
@@ -3236,6 +3215,10 @@ def tab_convert(nb):
     def lancer(btn, stop_btn=None):
         if not v_input.get() or not v_output.get():
             log(console, "[ERR] Source and output required."); return
+        if not os.path.splitext(v_output.get().strip())[1]:
+            # ffmpeg cannot choose a format for a name without extension.
+            v_output.set(v_output.get().strip() + '.mp3')
+            log(console, f"[*] Output without extension: {os.path.basename(v_output.get())}")
         ext = os.path.splitext(v_output.get())[1].lower()
         ch  = '1' if v_vid_channels.get() == 'mono' else '2'
         sr  = v_vid_samplerate.get()

@@ -11,6 +11,132 @@ measured. The [README](README.md) describes how the tools work now.
 
 ---
 
+## 3.10.3 — 2026-11-03 — Brainwave Studio: music played once, session crossfade
+
+Reported from use: a phrase put as the music of three segments (a sentence
+that resonates, repeated at −6 dB steps) started again before the first
+segment had ended, because the engine loops a segment's music when the file
+is shorter than the segment. The workaround was to pad the file with silence.
+The crossfade (2 s) and the fades (3 s) were also fixed in the GUI, so the
+second phrase started 2 s early, inside a fade-in.
+
+### Added
+
+- **`"music_loop": False` on a segment** plays its music once, then silence.
+  Default `True`, as before, and only written to the `.seg` when `False`. In
+  the GUI, a **Loop** box next to the segment's music; selecting a segment
+  restores it, *Update* keeps it with the music it keeps. It applies to the
+  three render paths: the streamed export, the in-memory session and the
+  single-segment preview. A non-boolean value is refused.
+- **Session crossfade and fade.** Two fields under the segment list,
+  **Crossfade (s)** and **Fade (s)**, defaults 2 and 3, used by *Play session*,
+  *Generate* and the session total and offsets (the global music under a
+  segment starts where it will be in the session). Saved as a last line
+  `session = {"crossfade": 0, "fade": 0.5}`, only when they differ from the
+  defaults, so a `.seg` without it reads as before and older versions ignore
+  the line. Loading a `.seg` sets them; adding one to a session keeps the
+  current values. A negative value is refused; a field left empty while typing
+  uses the default.
+
+### Measured
+
+A 6 s voiced phrase (MP3) as the music of three 15 s segments at levels
+0.065 / 0.0325 / 0.0163, `"music_loop": False`, crossfade 0, then 10 s of
+isochronic bed alone: the session lasts 55.0 s, the phrase is heard from 0.0,
+15.0 and 30.0 s, once each, at −40.6, −46.3 and −52.2 dB (steps of −5.7 and
+−5.9 dB), and nothing above the bed's floor in the last segment.
+
+### Tests
+
+`test_3103_segment_music.py`, 17 tests. The engine ones count the clicks of a
+1 s file in the rendered session: by default it comes back every 0.95 s (the
+seam blend), with `music_loop` off it plays once; with crossfade 0 three 3 s
+segments give exactly 9 s and clicks at 0.1, 3.1 and 6.1 s; with the old 2 s
+the second click falls at 1.1 s, at 5 % of its level; the in-memory render and
+the preview agree. The `.seg` round trip, the defaults that write nothing and
+the refused values are checked, and on a real Tk root: loading a `.seg` sets
+the fields and the Loop box, saving writes them back, the total follows the
+crossfade, and *Update* keeps the flag of kept music. On 3.10.2 the file gives
+7 failures and 8 errors. Whole suite on Python 3.11: 557 tests, all passing on
+a virtual display (13 skipped without one).
+
+---
+
+## 3.10.2 — 2026-11-01 — the meditation output format, and the file chooser
+
+Reported from use: a meditation saved as `name.mp3` came out the size of a
+WAV; a name chosen in the save dialog without typing an extension gave a file
+without one, whatever file type was selected; and since the chooser became
+zenity, its window could open behind the GUI, the GUI stayed frozen until it
+was found and closed, and at times it opened twice in a row.
+
+### Fixed
+
+- **The generator always wrote WAV.** `guided_meditation_generator_v23.py`
+  ended with `export(output_file, format="wav")`, so an `.mp3`, `.flac` or
+  `.ogg` output was a WAV file under that name, and `--mp3-bitrate` /
+  `--mp3-mode`, which the GUI always passes, were parsed and never used. The
+  format now follows the extension: WAV, MP3 (CBR at the bit rate asked for,
+  or VBR on LAME's `-q:a` scale, mapped as in `extract_voices.py` and the
+  Video tab: 128 → 6, 160 → 5, 192 → 4, 256 → 2, 320 → 0), FLAC, or OGG
+  Vorbis. Measured on a real export: a 4 s MP3 is less than a quarter of the
+  WAV, and the CBR bit rate is the one asked for within 5 %.
+- **The output name is checked before the synthesis**, not after it: a name
+  without an extension gets `.wav` (it used to be written without one, so
+  nothing could open it by name) and an extension the generator cannot write
+  (`.m4a`, ...) stops at once, with the list of those it can.
+- **Save dialogs did not add the extension.** zenity, which replaces Tk's
+  dialog when it is installed, neither adds the extension of the selected
+  filter nor says which filter was selected, and `browse_file` passed no
+  default extension. A save field with a single file type now gets that
+  extension. The Meditation output accepts four, so the tab has a **Format**
+  list (`mp3` by default, saved in `.med` projects): it is the extension added
+  by Browse and by Run to a name without one. An extension typed in the name
+  wins over the list.
+- **Video tab:** a name without an extension made ffmpeg fail ("unable to
+  choose an output format"); it now gets `.mp3`, the first type of the field.
+- **The zenity chooser froze the GUI and could open twice.** It was run with
+  `subprocess.run`, which blocks Tk's event loop for as long as it is open: the
+  GUI stopped redrawing, and clicks made on it meanwhile were queued and
+  replayed when the chooser closed, so a Browse click opened it again. Any exit
+  code other than 0 or 1 (window closed by the window manager) also fell back
+  to Tk's dialog, a second chooser. Its window can open behind the GUI
+  (focus-stealing prevention), and zenity 4 cannot be attached to a parent
+  window: its `--attach` "does nothing". Now zenity runs while Tk keeps
+  processing events; a small modal banner takes every click until it closes
+  (nothing replays, nothing else can be started) and offers **Show it** (lowers
+  the GUI again) and **Cancel** (stops the chooser); the window the click came
+  from is lowered while the chooser is open and raised afterwards; a second
+  chooser cannot open while one is; and only a zenity that fails at once
+  (within 0.5 s, not cancelled) falls back to Tk's dialog.
+
+### Tests
+
+`test_3102_file_chooser.py`, 8 tests, on a real Tk root with a stand-in
+zenity (exit code and delay chosen) and with the real zenity 4 when present:
+the GUI keeps running while the chooser is open, the banner holds the grab
+and disappears afterwards, a second chooser returns at once, a window closed
+by the window manager is a cancel and opens no Tk dialog, a zenity failing at
+once still falls back to Tk, and Cancel stops the chooser. On 3.10.1, 5 of
+them fail and the real-zenity one never returns (the GUI loop is blocked). On
+a virtual display with a window manager (Openbox) and the real zenity, the
+stack during the chooser is, bottom to top: GUI, banner, chooser. Focus
+stealing prevention itself (Cinnamon's Muffin) could not be reproduced here.
+
+`test_3102_output_format.py`, 15 tests: the real export through pydub and
+ffmpeg for each extension (container and codec checked with ffprobe), the
+CBR bit rate, the VBR scale, the name checks, `main()` handing the MP3
+settings to the export and refusing a bad extension before any synthesis,
+and the GUI helpers (extension of a single-type field, Browse reading the
+Format list at click time, the zenity name). On 3.10.1 the same file gives 5
+failures and 17 errors. Whole suite on Python 3.11: 540 tests, all passing on a virtual display; the
+8 chooser tests are skipped without one.
+The tab itself was also driven on a virtual display: Browse offers `.mp3`,
+then `.flac` once the list says `flac`; Run turns `/o/flûte` into
+`/o/flûte.flac` and refuses `.m4a` without starting.
+
+---
+
 ## 3.10.1 — 2026-10-30 — a review of 3.10.0 (ChatGPT): two defects, both confirmed
 
 ChatGPT reviewed 3.10.0 (`XTTS_3.10.0_corrige.zip`) and reported two

@@ -31,6 +31,27 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## What's new
 
+**3.10.3 — Brainwave Studio: a segment's music can play once, and the session
+sets its crossfade.** A file shorter than its segment no longer has to loop:
+untick **Loop** next to the segment's music (`"music_loop": False` in the
+`.seg`) and it plays once, then silence — a spoken phrase per segment. The
+crossfade between segments and the fades at both ends, fixed at 2 s and 3 s,
+are now two fields saved in the `.seg` (`session = {"crossfade": 0, "fade": 0.5}`);
+0 joins segments end to end. See [BRAINWAVE.md](BRAINWAVE.md). 17 tests added.
+
+**3.10.2 — the Meditation tab writes the format you ask for.** The generator
+wrote WAV whatever the output name: an `.mp3` was a WAV with an `.mp3` name
+(the size of a WAV), and the MP3 bit rate and mode were never applied. It now
+writes `.wav`, `.mp3` (CBR or VBR, at the bit rate chosen), `.flac` or `.ogg`
+from the extension, checks the name before the synthesis starts, and adds
+`.wav` to a name without one. In the GUI, a **Format** list next to the MP3
+settings gives the extension of a name typed without one, in the Browse dialog
+and at Run; an extension typed in the name wins. Save dialogs with a single
+file type add that extension (the zenity chooser did not). The zenity chooser no
+longer freezes the GUI nor opens twice: while it is open the GUI stays alive,
+moves behind it, and shows a small banner (**Show it**, **Cancel**) in case it
+still ends up hidden. 23 tests added.
+
 **3.10.1 — a review of 3.10.0 by ChatGPT, two defects fixed:** `--fidelity` now
 keeps the `--objective`, `--audio-objective` and `--optimise-audio none` you
 write (it overwrote them), and the timbre `[]` search no longer reuses the pitch
