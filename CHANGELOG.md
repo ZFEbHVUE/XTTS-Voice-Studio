@@ -11,6 +11,49 @@ measured. The [README](README.md) describes how the tools work now.
 
 ---
 
+## 3.10.4 — 2026-11-05 — a file chooser of the studio's own
+
+The zenity chooser of 3.10.2 kept the GUI alive, but on a GNOME/Wayland desktop
+its window still belongs to another program, so the desktop could put it
+behind the GUI. XTTS Studio now uses its own chooser, built in Tk/ttk
+(`studio_file_dialog.py`, standard library only), for open, open several,
+save as and choose a folder, in every tab including the embedded Brainwave
+tab. It is a child window of the GUI: no foreign window, no stacking or focus
+problem on any desktop.
+
+### Added
+
+- Columns Name, Type, Size, Modified, sorted by a click on a heading, folders
+  first; search in the current folder; file-type filters and hidden files;
+  editable path bar, back, forward, parent, refresh; shortcuts to the project
+  folders and personal favourites; new folder.
+- Large folders are scanned in the background and listed in batches; Tk
+  timers keep running.
+- Selecting an audio file shows its duration, sample rate and channels (WAV
+  read directly, other formats through ffprobe when installed); **Listen**
+  plays it with ffplay (aplay as a fallback for WAV), stopped on any change of
+  selection or folder and when the chooser closes.
+- Save keeps an extension typed in the name; when the default extension is
+  added, the overwrite confirmation is about the final name.
+- Favourites, window size and last folders are kept in
+  `~/.config/xtts_studio/file_dialog.json` (or under `$XDG_CONFIG_HOME`).
+
+### Changed
+
+- zenity is no longer used by XTTS Studio. `brainwave_studio.py` started on its
+  own keeps Tk's standard dialog.
+
+### Tests
+
+`test_3105_ttk_file_dialog.py` and the adapted `test_3102_file_chooser.py`:
+30 tests, 18 of them on real Tk windows (modality, Escape, re-entry, an
+editor's grab restored, background scan, multiple names with spaces, braces
+and `|`, extension and overwrite on save). Whole suite on Python 3.11: 579
+tests, all passing, on a virtual display with a window manager and on the
+author's machine.
+
+---
+
 ## 3.10.3 — 2026-11-03 — Brainwave Studio: music played once, session crossfade
 
 Reported from use: a phrase put as the music of three segments (a sentence

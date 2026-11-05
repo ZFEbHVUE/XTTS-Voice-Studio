@@ -31,6 +31,12 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## What's new
 
+**3.10.4 — a file chooser of the studio's own.** Every Browse in XTTS Studio now
+opens a chooser built into the studio (sizes, types, dates, sorting, search,
+favourites, audio duration and a Listen button) instead of zenity, whose window
+a GNOME/Wayland desktop could put behind the GUI. `brainwave_studio.py`
+started on its own keeps Tk's standard dialog.
+
 **3.10.3 — Brainwave Studio: a segment's music can play once, and the session
 sets its crossfade.** A file shorter than its segment no longer has to loop:
 untick **Loop** next to the segment's music (`"music_loop": False` in the
@@ -377,9 +383,9 @@ and it tells you the exact `apt` line instead of asking for your password.
 - Miniconda or Anaconda (recommended)
 - CUDA 12.x + compatible GPU (optional but significantly faster)
 - `ffmpeg` and `rubberband-cli` (system packages)
-- `zenity` (optional) — gives the file dialogs the system chooser, with sizes,
-  sorting, copy/paste and delete. Without it Tk's own dialog is used, which
-  works but shows none of that.
+- `ffprobe` and `ffplay` (shipped with ffmpeg) — the studio's file chooser uses
+  them for the duration and the **Listen** button of audio files; it works
+  without them. zenity is no longer used (3.10.4).
 
 ### Step 1 — Clone the repository
 
@@ -452,10 +458,6 @@ pip install -r requirements.txt
 
 # System tools (ffmpeg for audio/video, rubberband for pitch-preserving tempo):
 sudo apt install ffmpeg rubberband-cli
-
-# Optional: the system file chooser instead of Tk's bare one. Nothing breaks
-# without it -- the app falls back to Tk silently.
-sudo apt install zenity
 ```
 
 Run this in the `xtts` env on EVERY machine you clone the repo to — git syncs
