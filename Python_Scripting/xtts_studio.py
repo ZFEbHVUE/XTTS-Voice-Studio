@@ -787,6 +787,15 @@ def tab_generator(nb):
         values=['cbr','vbr']).pack(side='left', padx=6)
     tk.Label(frm_gen_mp3, text="(bit rate and mode: .mp3 only)", fg='grey').pack(side='left')
 
+    def _format_follows_output(*_):
+        # The type chosen in the file chooser, or an extension typed in the
+        # field, is the one written: the Format list shows it instead of
+        # disagreeing with the name.
+        ext = os.path.splitext(v_output.get().strip())[1].lower().lstrip('.')
+        if ext in GEN_FORMATS and ext != v_gen_format.get():
+            v_gen_format.set(ext)
+    v_output.trace_add('write', _format_follows_output)
+
     # Project files, on the right of the MP3 row: a prompt on its own says
     # nothing about which voices and which sounds went with it, so reopening a
     # session meant remembering. A .med carries the lot, the script text
@@ -869,11 +878,13 @@ def tab_generator(nb):
             else:
                 cfg[k] = v
 
+        # Format first: an extension in the output name then sets the list too,
+        # as it is the one written at Run.
+        if cfg.get('format') in GEN_FORMATS:
+            v_gen_format.set(cfg['format'])
         v_script.set(cfg.get('script_path', ''))
         v_output.set(cfg.get('output', ''))
         v_ambient.set(cfg.get('ambient', ''))
-        if cfg.get('format') in GEN_FORMATS:
-            v_gen_format.set(cfg['format'])
         if cfg.get('mp3_bitrate'):
             v_gen_mp3_bitrate.set(cfg['mp3_bitrate'])
         if cfg.get('mp3_mode'):
@@ -926,8 +937,16 @@ def tab_generator(nb):
         editor.delete('1.0', 'end')
         v_script.set('')
 
+    def _prompt_dir():
+        """The folder of the prompt being edited, else Prompts/. Without it the
+        chooser opened in the last folder used for any .txt (or HOME)."""
+        cur = v_script.get().strip()
+        d = os.path.dirname(cur) if cur else ''
+        return d if d and os.path.isdir(d) else _ensure_dir(DIR_PROMPTS)
+
     def ouvrir_prompt():
-        path = filedialog.askopenfilename(filetypes=[('Text','*.txt'),('All','*.*')])
+        path = filedialog.askopenfilename(title="Open prompt", initialdir=_prompt_dir(),
+                                          filetypes=[('Text','*.txt'),('All','*.*')])
         if path:
             v_script.set(path)
             with open(path, encoding='utf-8') as fh:
@@ -938,7 +957,8 @@ def tab_generator(nb):
         path = v_script.get()
         if not path:
             path = filedialog.asksaveasfilename(
-                filetypes=[('Text','*.txt')], defaultextension='.txt')
+                title="Save prompt", initialdir=_prompt_dir(),
+                filetypes=[('Text','*.txt'),('All','*.*')], defaultextension='.txt')
             if not path: return
             v_script.set(path)
         with open(path, 'w', encoding='utf-8') as fh:
@@ -946,8 +966,11 @@ def tab_generator(nb):
         log_editor(f"Saved: {path}")
 
     def sauvegarder_sous():
+        cur = v_script.get().strip()
         path = filedialog.asksaveasfilename(
-            filetypes=[('Text','*.txt')], defaultextension='.txt')
+            title="Save prompt as", initialdir=_prompt_dir(),
+            initialfile=os.path.basename(cur) if cur else '',
+            filetypes=[('Text','*.txt'),('All','*.*')], defaultextension='.txt')
         if path:
             v_script.set(path)
             with open(path, 'w', encoding='utf-8') as fh:
@@ -1599,7 +1622,7 @@ def tab_auto(nb):
     f, foot = scrollable_tab(nb, "[Auto] Pipeline")
     f.grid_columnconfigure(0, weight=1)
 
-    voices_frame = tk.LabelFrame(f, text="Voices (reference + language)")
+    voices_frame = tk.LabelFrame(f, text="Voices (reference or clips of one speaker + language)")
     voices_frame.grid(row=0, column=0, columnspan=3, sticky='ew', padx=6, pady=4)
     auto_rows = []
     row_probes = []      # each row's readout, re-run when curation settings change
@@ -1613,11 +1636,16 @@ def tab_auto(nb):
         tk.Label(row_f, text=f"V{len(auto_rows)+1}", width=3).pack(side='left')
         tk.Entry(row_f, textvariable=v_path).pack(side='left', fill='x', expand=True, padx=3)
         def browse():
-            p = filedialog.askopenfilename(
+            # Several files are several clips of the SAME speaker (XTTS takes a
+            # list). A second Browse adds to the row; another speaker needs
+            # '+ Add voice'.
+            files = filedialog.askopenfilenames(
                 filetypes=[("Audio", "*.wav *.mp3 *.flac *.ogg"), ("All", "*.*")],
                 initialdir=DIR_VOICES)
-            if p:
-                v_path.set(p)
+            if files:
+                existing = v_path.get().strip()
+                new = " ; ".join(files)
+                v_path.set(f"{existing} ; {new}" if existing else new)
         tk.Button(row_f, text="...", command=browse).pack(side='left', padx=1)
         tk.Label(row_f, text="save as").pack(side='left', padx=(6, 1))
         tk.Entry(row_f, textvariable=v_pname, width=14).pack(side='left', padx=1)
@@ -1638,8 +1666,77 @@ def tab_auto(nb):
         tk.Label(voices_frame, textvariable=info, fg='#555', font=("Arial", 8),
                  anchor='w', justify='left').pack(fill='x', padx=(28, 4))
 
+        def _probe_clips(paths):
+            """The same readout for several clips of one speaker, in one line."""
+            missing = [x for x in paths if not os.path.isfile(x)]
+            if missing:
+                row_suggest[0] = None
+                info.set("not found: " + ", ".join(os.path.basename(x) for x in missing))
+                return
+            info.set("reading...")
+            def work():
+                try:
+                    import soundfile as _sf
+                    import numpy as _np
+                    durations, usable, quiet = [], 0.0, []
+                    for x in paths:
+                        d = _sf.info(x)
+                        y, sr = _sf.read(x, dtype='float32', always_2d=False)
+                        if getattr(y, 'ndim', 1) > 1:
+                            y = y.mean(axis=1)
+                        hop = max(1, int(0.02 * sr))
+                        fr = _np.array([_np.sqrt(_np.mean(y[i:i + hop] ** 2))
+                                        for i in range(0, max(len(y) - hop, 1), hop)])
+                        if len(fr):
+                            db = 20 * _np.log10(fr + 1e-10)
+                            voiced = float(_np.mean(db > _np.percentile(db, 90) - 30))
+                        else:
+                            voiced = 0.0
+                        durations.append(d.duration)
+                        usable += d.duration * voiced
+                        peak = float(_np.max(_np.abs(y))) if len(y) else 0.0
+                        if 20 * _np.log10(peak + 1e-12) < -20:
+                            quiet.append(os.path.basename(x))
+                    total = sum(durations)
+                    sugg = max(5.0, round(usable * 0.8))
+                    row_suggest[0] = sugg
+                    txt = (f"{len(paths)} clips of one speaker, {total:.1f}s in all "
+                           f"(shortest {min(durations):.1f}s, longest {max(durations):.1f}s)  |  "
+                           f"voiced {100 * usable / max(total, 1e-9):.0f}%  |  usable ~{usable:.0f}s"
+                           f"  |  XTTS gets them as separate references")
+                    warn = []
+                    if v_a_curate.get():
+                        short = [os.path.basename(x) for x, s in zip(paths, durations) if s < 4.0]
+                        if short:
+                            warn.append("shorter than the 4 s curation window, dropped by "
+                                        "the curation: " + ", ".join(short))
+                        try:
+                            keep = float(v_a_keep.get())
+                        except Exception:
+                            keep = 45.0
+                        if usable < keep:
+                            warn.append(f"Keep s is {keep:g} for all the clips - use {sugg:g} or less")
+                    if quiet:
+                        warn.append("very quiet: " + ", ".join(quiet))
+                    if warn:
+                        txt += "   [!] " + "; ".join(warn)
+                    curated = [os.path.splitext(x)[0] + '_curated.wav' for x in paths]
+                    if v_a_curate.get() and all(os.path.isfile(c) for c in curated):
+                        txt += ("\ncurated clips exist: "
+                                + ("Re-curate will curate the clips again to Keep s"
+                                   if v_a_recur.get() else
+                                   "reused as they are unless Re-curate is ticked"))
+                    info.set(txt)
+                except Exception as e:
+                    info.set(f"could not read: {e}")
+            threading.Thread(target=work, daemon=True).start()
+
         def _probe(*_a):
-            p = v_path.get().strip()
+            paths = split_paths(v_path.get())
+            if len(paths) > 1:
+                _probe_clips(paths)
+                return
+            p = paths[0] if paths else ''
             if not p or not os.path.isfile(p):
                 info.set("")
                 return
@@ -1714,8 +1811,12 @@ def tab_auto(nb):
         auto_rows.append(entry)
 
     add_auto_row()
-    tk.Button(f, text="+ Add voice", command=add_auto_row).grid(row=1, column=0,
-                                                                sticky='w', padx=8, pady=2)
+    add_f = tk.Frame(f)
+    add_f.grid(row=1, column=0, sticky='w', padx=8, pady=2)
+    tk.Button(add_f, text="+ Add voice", command=add_auto_row).pack(side='left')
+    tk.Label(add_f, text="one row per speaker; several files on a row are clips of that "
+                         "speaker, handed to XTTS together ('...' adds files to the row)",
+             fg='grey', font=("Arial", 8)).pack(side='left', padx=(8, 0))
 
     v_a_seeds  = tk.StringVar(value='0 42 100 180 200')
     v_a_budget = tk.StringVar(value='60')
@@ -1975,10 +2076,24 @@ def tab_auto(nb):
         return '' if _chain[0] else ' ' + hint
 
     def _voice_seconds(quiet=False):
-        """(path, seconds, what) of the audio each voice will hand XTTS."""
-        paths = [v.get().strip() for v, _l, _f, _p, _s in auto_rows]
-        paths = [p for p in paths if p and os.path.isfile(p)]
-        if not paths:
+        """What each voice will hand XTTS: one dict per voice, see
+        search_plan.pipeline_voice_audio (several clips per voice included)."""
+        voices, missing = [], []
+        for v, _l, _f, _p, _s in auto_rows:
+            paths = split_paths(v.get())
+            missing += [x for x in paths if not os.path.isfile(x)]
+            files = [x for x in paths if os.path.isfile(x)]
+            if files:
+                voices.append(files)
+        if missing:
+            # Computed without them, every auto would plan for other audio
+            # than the run gets (and the run refuses a missing file anyway).
+            if not quiet:
+                log(console, "[ERR] Not found: " + "; ".join(missing)
+                    + ("  (several clips on one row: separate them with ' ; ')"
+                       if any(' ' in x for x in missing) else ''))
+            return None
+        if not voices:
             if not quiet:
                 log(console, "[*] Pick a reference first.")
             return None
@@ -1992,8 +2107,8 @@ def tab_auto(nb):
                 return None
         try:
             import soundfile as _sf
-            return SP.pipeline_reference_seconds(
-                paths, v_a_curate.get(), v_a_recur.get(), keep,
+            return SP.pipeline_voice_audio(
+                voices, v_a_curate.get(), v_a_recur.get(), keep,
                 lambda path: _sf.info(path).duration)
         except Exception as e:
             if not quiet:
@@ -2015,10 +2130,14 @@ def tab_auto(nb):
         secs = _voice_seconds()
         if not secs:
             return
-        value = SP.max_reference_for([s for _p, s, _w in secs])
+        # XTTS cuts EACH file to max_ref_len: the longest file decides.
+        files = [(path, s, v['what']) for v in secs for path, s in zip(v['files'], v['seconds'])]
+        value = SP.max_reference_for([s for _p, s, _w in files])
         v_a_maxref.set(str(value))
-        path, seconds, what = max(secs, key=lambda t: t[1])
-        whose = "the audio" if len(secs) == 1 else "all the audio of every voice; longest"
+        path, seconds, what = max(files, key=lambda t: t[1])
+        whose = ("the audio" if len(files) == 1 else
+                 "every clip in full; longest" if len(secs) == 1 else
+                 "all the audio of every voice; longest")
         log(console, f"[*] Max reference s set to {value}: XTTS reads {whose} "
                      f"({os.path.basename(path)}, {seconds:.1f}s, {what})"
                      f"{', capped at 60 s' if value < SP.whole_file_seconds(seconds) else ''}.")
@@ -2029,7 +2148,8 @@ def tab_auto(nb):
                          f"ignored by the search.")
         # The search starts from the analyser's gpt_cond_len, which follows the
         # length of each voice's file, and tests gcl s against it.
-        starts = sorted({min(SP.analyser_gcl_prior(s), value) for _p, s, _w in secs})
+        starts = sorted({min(SP.analyser_gcl_prior(v['joined']), value * len(v['seconds']))
+                         for v in secs})
         if any(g not in gcl for g in starts):
             log(console, f"[*] The search starts from gpt_cond_len "
                          f"{' / '.join(map(str, starts))}, the analysis value for this "
@@ -2040,7 +2160,8 @@ def tab_auto(nb):
         secs = _voice_seconds()
         if not secs:
             return
-        shortest = min(s for _p, s, _w in secs)
+        # Per file, as XTTS cuts: the voice whose longest file is shortest decides.
+        shortest = min(max(v['seconds']) for v in secs)
         values = ' '.join(map(str, SP.reference_lengths_for(shortest)))
         v_a_mrls.set(values)
         log(console, f"[*] Reference lengths to test set to {values}: none longer than the "
@@ -2057,13 +2178,18 @@ def tab_auto(nb):
         max_ref = _int_field(v_a_maxref, 'maxref', "Max reference s")
         if max_ref is None:
             return
-        values = SP.gcl_candidates([s for _p, s, _w in secs], max_ref)
+        # GPT conditioning reads the clips of a voice end to end, each cut to
+        # max_ref_len: what one voice can give is the sum of its capped files.
+        values = SP.gcl_candidates([sum(min(s, max_ref) for s in v['seconds']) for v in secs],
+                                   max_ref, n_refs=max(len(v['seconds']) for v in secs))
         text = ' '.join(map(str, values))
         v_a_gcl.set(text)
         start = (f"from {SP.GCL_FLOOR} s, the floor kept for the accent" if values[0] >= SP.GCL_FLOOR
                  else f"from {values[0]} s, the file being shorter than {SP.GCL_FLOOR} s")
+        of_what = ("of the shortest file" if all(len(v['seconds']) == 1 for v in secs)
+                   else "of the voice with the least audio, its clips together")
         log(console, f"[*] gcl s set to {text}: {start}, up to the {values[-1]} s XTTS reads "
-                     f"of the shortest file; none is ignored or reads the same audio twice."
+                     f"{of_what}; none is ignored or reads the same audio twice."
                      f"{_then('Then press auto next to Chunk lengths and Conditioning budget.')}")
 
     def _auto_chunks():
@@ -2071,8 +2197,10 @@ def tab_auto(nb):
         max_ref = _int_field(v_a_maxref, 'maxref', "Max reference s")
         if max_ref is None:
             return
+        secs = _voice_seconds(quiet=True)
+        n_refs = max((len(v['seconds']) for v in secs), default=1) if secs else 1
         values = ' '.join(map(str, SP.chunk_candidates(SP.find_ints(_field(v_a_gcl, 'gcl')),
-                                                       max_ref)))
+                                                       max_ref, n_refs=n_refs)))
         v_a_chunks.set(values)
         log(console, f"[*] Chunk lengths set to {values}: each one fits the shortest usable "
                      f"gcl s, so it can pair with every gpt_cond_len."
@@ -2089,8 +2217,9 @@ def tab_auto(nb):
             return None
         return SP.pipeline_conditioning_budget(
             SP.find_ints(_field(v_a_gcl, 'gcl')), SP.find_ints(_field(v_a_chunks, 'chunks')),
-            ref_lengths, max_ref, [s for _p, s, _w in secs],
-            extension_trials=SP.conditioning_extension_trials() if v_a_advanced_conditioning.get() else 0)
+            ref_lengths, max_ref, [v['joined'] for v in secs],
+            extension_trials=SP.conditioning_extension_trials() if v_a_advanced_conditioning.get() else 0,
+            n_refs=[len(v['seconds']) for v in secs])
 
     def _auto_cond():
         """Conditioning budget that runs every stage in full, for every voice."""
@@ -2230,8 +2359,9 @@ def tab_auto(nb):
             need = SP.pipeline_conditioning_budget(
                 SP.find_ints(_field(v_a_gcl, 'gcl')), SP.find_ints(_field(v_a_chunks, 'chunks')),
                 SP.parse_ints(v_a_mrls.get()), int(float(_field(v_a_maxref, 'maxref'))),
-                [s for _p, s, _w in secs],
-                extension_trials=SP.conditioning_extension_trials() if v_a_advanced_conditioning.get() else 0)
+                [v['joined'] for v in secs],
+                extension_trials=SP.conditioning_extension_trials() if v_a_advanced_conditioning.get() else 0,
+                n_refs=[len(v['seconds']) for v in secs])
             if have < need:
                 log(console, f"[!] Conditioning budget {have} is below the whole "
                              f"conditioning plan ({need}): its last stages will try fewer "
@@ -2240,13 +2370,20 @@ def tab_auto(nb):
             pass
 
     def lancer(btn, stop_btn=None):
-        voices = [(v.get().strip(), l.get(), p.get().strip())
+        voices = [(split_paths(v.get()), l.get(), p.get().strip())
                   for v, l, _, p, _s in auto_rows if v.get().strip()]
         if not voices:
             log(console, "[ERR] At least one voice required."); return
         cmd = [sys.executable, os.path.join(SCRIPTS_DIR, 'xtts_pipeline.py')]
-        for path, lg, _pn in voices:
-            cmd += ['--voice', path, lg]
+        for paths, lg, _pn in voices:
+            missing = [x for x in paths if not os.path.isfile(x)]
+            if missing:
+                log(console, "[ERR] Not found: " + "; ".join(missing)); return
+            if len({os.path.abspath(x) for x in paths}) != len(paths):
+                log(console, "[ERR] The same file is twice on one voice row: "
+                             + " ; ".join(paths)); return
+            # Several files on one row: clips of one speaker, then the language.
+            cmd += ['--voice', *paths, lg]
         cmd += ['--seeds', _field(v_a_seeds, 'seeds')]
         cmd += ['--budget', _field(v_a_budget, 'budget')]
         cmd += ['--cond-budget', _field(v_a_cond, 'cond')]
@@ -3094,7 +3231,7 @@ def tab_pitch(nb):
     v_tg     = tk.StringVar()
 
     add_row(f, "Generated audio (.wav)", v_clone,  0, [("WAV","*.wav")], initialdir=DIR_OUTPUT)
-    add_row(f, "Annotated prompt (.txt)", v_txt,  1, [("Text","*.txt")])
+    add_row(f, "Annotated prompt (.txt)", v_txt,  1, [("Text","*.txt"),("All","*.*")], initialdir=DIR_PROMPTS)
     add_row(f, "Output (.wav)",          v_output, 2, [("WAV","*.wav")], save=True, initialdir=DIR_OUTPUT)
 
     tk.Label(f, text="Marks", anchor='w', width=20).grid(row=3, column=0, sticky='w', padx=6, pady=3)

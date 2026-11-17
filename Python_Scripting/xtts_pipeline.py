@@ -22,6 +22,14 @@ Usage:
   python xtts_pipeline.py --voice lea.wav FR --voice john.wav EN \\
       [--seeds "0 42 100 180 200"] [--budget 60] [--keep-seconds 45] \\
       [--no-curate] [--no-auto-text] [--start-num 1] [--device cuda]
+
+Several clips of one speaker make one voice: the files, then the language.
+  python xtts_pipeline.py --voice lea_1.wav lea_2.wav lea_3.wav FR
+XTTS gets them as separate references (one speaker embedding each, averaged;
+the GPT conditioning reads them end to end), and the optimiser's C4 stage
+tries subsets of them. Curation scores all the clips together and keeps
+--keep-seconds in all, one <clip>_curated.wav per clip. The analyser and the
+tone fit read the clips joined in one file, <first clip>_clips.wav.
 """
 
 
@@ -134,8 +142,19 @@ def _preset_info(args, r):
     info['Run'] = run
 
     cur = r.get('curation') or {}
-    info['Curation'] = [f"reference : {r['ref']}",
-                        f"curated   : {cur.get('file') or r['ref']}  ({cur.get('status', '?')})"]
+    if r.get('clips'):
+        kept = cur.get('clips') or r['clips']
+        info['Curation'] = ([f"clips     : {len(r['clips'])} of one speaker: "
+                             + ', '.join(os.path.basename(x) for x in r['clips'])]
+                            + ([f"curated   : {len(kept)} kept: "
+                                + ', '.join(os.path.basename(x) for x in kept)
+                                + f"  ({cur.get('status', '?')})"]
+                               if cur.get('clips') else [f"curation  : {cur.get('status', '?')}"])
+                            + [f"joined    : {r.get('target')}  (analysis and tone fit; "
+                               f"XTTS gets the clips)"])
+    else:
+        info['Curation'] = [f"reference : {r['ref']}",
+                            f"curated   : {cur.get('file') or r['ref']}  ({cur.get('status', '?')})"]
 
     start = [f"{{}} prior : {r.get('xtts_prior')}", f"[] prior : {r.get('audio_prior')}"]
     info['Starting point (analyser priors)'] = [x for x in start if 'None' not in x]
@@ -294,6 +313,49 @@ def _free_name(path):
     return f"{stem}_{n}{ext}"
 
 
+def _voice_spec(values):
+    """(files, LANG) from one --voice: one or more files, then the language."""
+    if len(values) < 2:
+        raise ValueError("--voice needs at least one file and a language")
+    *files, lang = values
+    if lang.upper() not in LANGS:
+        raise ValueError(f"--voice {' '.join(values)}: the language comes last "
+                         f"('{lang}' is not one of {', '.join(sorted(LANGS))})")
+    if len(set(map(os.path.abspath, files))) != len(files):
+        raise ValueError(f"--voice {' '.join(values)}: the same file is given twice")
+    return files, lang.upper()
+
+
+JOIN_GAP_S = 0.2   # same as search_plan.JOIN_GAP_S, which plans with it
+
+
+def join_clips(paths, out_path, gap=JOIN_GAP_S):
+    """Write the clips of one voice end to end, mono, at the first clip's rate,
+    with a short silence between them. This is what the analyser and the tone
+    fit read; XTTS gets the clips themselves. It also concatenates them, for the
+    GPT conditioning, so the analysis sees the same material."""
+    import numpy as np
+    import soundfile as sf
+    from math import gcd
+    from scipy.signal import resample_poly
+    parts, rate = [], None
+    for path in paths:
+        y, sr = sf.read(path, dtype='float32', always_2d=True)
+        y = y.mean(axis=1)
+        if rate is None:
+            rate = sr
+        elif sr != rate:
+            g = gcd(int(sr), int(rate))
+            y = resample_poly(y, rate // g, sr // g).astype(np.float32)
+        if parts:
+            parts.append(np.zeros(int(round(gap * rate)), dtype=np.float32))
+        parts.append(y)
+    out = np.concatenate(parts)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    sf.write(out_path, out, rate)
+    return out_path
+
+
 def main():
     # allow_abbrev=False: --fidelity decides what the user chose by reading the
     # option names on the command line. An abbreviation ('--obj identity') would
@@ -301,8 +363,10 @@ def main():
     # then overwrite it. A shortened name is now an error, not a silent override.
     p = argparse.ArgumentParser(description='One-shot XTTS voice pipeline (curate -> analyse -> optimise -> fit)',
                                 allow_abbrev=False)
-    p.add_argument('--voice', nargs=2, action='append', metavar=('WAV', 'LANG'),
-                   required=True, help='Voice reference + language; repeatable')
+    p.add_argument('--voice', nargs='+', action='append', metavar='WAV',
+                   required=True,
+                   help='WAV [WAV ...] LANG: one voice, from one reference or several clips '
+                        'of the same speaker, then its language; repeat for more voices')
     p.add_argument('--start-num', type=int, default=1, help='First voice number (default: 1)')
     p.add_argument('--seeds', default='0 42 100 180 200',
                    help='Seeds screened by the optimiser (default: "0 42 100 180 200")')
@@ -467,19 +531,68 @@ def main():
     S = lambda name: os.path.join(SCRIPT_DIR, name)
     results = []
 
-    for idx, (ref, lang) in enumerate(args.voice):
-        n = args.start_num + idx
-        lang = lang.upper()
-        if lang not in LANGS:
-            sys.exit(f"[ERR] Unknown language '{lang}' for voice {n}")
-        if not os.path.exists(ref):
-            sys.exit(f"[ERR] Not found: {ref}")
+    specs = []
+    for values in args.voice:
+        try:
+            specs.append(_voice_spec(values))
+        except ValueError as exc:
+            p.error(str(exc))
+    for idx, (files, _lang) in enumerate(specs):
+        for path in files:
+            if not os.path.exists(path):
+                sys.exit(f"[ERR] Not found: {path} (voice {args.start_num + idx})")
 
-        print(f"\n{'#'*70}\n#  VOICE {n}  [{lang}]  {os.path.basename(ref)}\n{'#'*70}")
+    for idx, (files, lang) in enumerate(specs):
+        n = args.start_num + idx
+        ref = files[0]           # names the clone, the preset and the recap
+        several = len(files) > 1
+        shown = os.path.basename(ref) + (f"  (+{len(files) - 1} clip(s))" if several else '')
+        print(f"\n{'#'*70}\n#  VOICE {n}  [{lang}]  {shown}\n{'#'*70}")
+        if several:
+            print("[*] " + f"{len(files)} clips of one speaker: "
+                  + ', '.join(os.path.basename(x) for x in files))
 
         # ── 1. Curation ───────────────────────────────────────────────────────
         curation = dict(file=ref, status='skipped (--no-curate)')
-        if args.no_curate:
+        clips = list(files)      # what XTTS clones from; the optimiser picks among them
+        if several:
+            if args.no_curate:
+                print("[*] Curation skipped (--no-curate): the clips are used as they are")
+            else:
+                outputs = [os.path.splitext(x)[0] + '_curated.wav' for x in files]
+                if args.keep_preset_history and args.recurate:
+                    outputs = [_free_name(o) for o in outputs]
+                curation = dict(files=list(files), status=f'new, keep target {args.keep_seconds:g} s in all')
+                if all(os.path.exists(o) for o in outputs) and not args.recurate:
+                    clips = outputs
+                    print("[*] Curated clips already exist -> reusing them (--recurate to redo)")
+                    curation['status'] = 'existing files reused (--recurate to redo)'
+                else:
+                    cmd = [py, S('curate_reference.py'), *files, '--outputs', *outputs,
+                           '--keep-seconds', str(args.keep_seconds)]
+                    if args.device:
+                        cmd += ['--device', args.device]
+                    rc, _out = run_stream(cmd, f'V{n} 1/4 CURATE')
+                    m = re.search(r'^CURATED_JSON: (\[.*\])\s*$', _out or '', re.M)
+                    try:
+                        clips = json.loads(m.group(1)) if m else []
+                    except ValueError:
+                        clips = []
+                    if rc != 0 or not clips or not all(os.path.isfile(c) for c in clips):
+                        sys.exit(f"[ERR] Curation failed for voice {n}")
+                    if len(clips) < len(files):
+                        print(f"[!] {len(files) - len(clips)} clip(s) dropped by the curation "
+                              f"(too little coherent speech left)")
+                curation['clips'] = list(clips)
+            # The analyser and the tone fit read one file: the clips end to end.
+            work = os.path.splitext(ref)[0] + '_clips.wav'
+            if args.keep_preset_history:
+                work = _free_name(work)
+            join_clips(clips, work)
+            curation['file'] = work
+            print(f"[*] {len(clips)} clip(s) joined for the analysis and the tone fit -> "
+                  f"{os.path.basename(work)}; XTTS gets them as separate references")
+        elif args.no_curate:
             work = ref
             print("[*] Curation skipped (--no-curate)")
         else:
@@ -545,7 +658,8 @@ def main():
         print(f"[pipeline] audio : {audio_block}")
 
         # ── 3. Optimisation (seed + temp by measured objective) ───────────────
-        cmd = [py, S('xtts_optimize.py'), work, lang,
+        refs_for_xtts = clips if several else [work]
+        cmd = [py, S('xtts_optimize.py'), *refs_for_xtts, lang,
                '--xtts-block', xtts_prior, '--seeds', args.seeds,
                '--budget', str(args.budget), '--method', 'rsm',
                '--w-accent', str(args.w_accent), '--w-identity', str(args.w_identity),
@@ -739,7 +853,8 @@ def main():
         _mu = re.search(r'([\d.]+) on UNSEEN text', out)
         if _mu:
             _sc['identity_unseen'] = float(_mu.group(1))
-        results.append(dict(n=n, lang=lang, ref=ref, clone=clone_out,
+        results.append(dict(n=n, lang=lang, ref=ref, clips=list(files) if several else None,
+                            target=work, clone=clone_out,
                             xtts=renumber(xtts_win, n),
                             audio=set_lang(renumber(audio_fit, n), lang),
                             scores=_sc, acoustics=_acoustics, references=clone_refs,
@@ -752,7 +867,8 @@ def main():
     # ── Final recap ───────────────────────────────────────────────────────────
     print(f"\n\n{'='*70}\n  [*] PIPELINE COMPLETE — READY TO PASTE\n{'='*70}")
     for r in results:
-        print(f"\n  # Voice {r['n']} [{r['lang']}]  {os.path.basename(r['ref'])}")
+        extra = f"  (+{len(r['clips']) - 1} clip(s))" if r.get('clips') else ''
+        print(f"\n  # Voice {r['n']} [{r['lang']}]  {os.path.basename(r['ref'])}{extra}")
         print(f"  {r['xtts']}")
         print(f"  {r['audio']}")
         print('# Clone references: ' + json.dumps(r['references']))
@@ -788,7 +904,8 @@ def main():
                   f"of '{r['weighting']}': {a['clone']}")
             print(f"  # {a['audio']}")
             print(f"  # Blind A/B: python listening_test.py {shlex.quote(r['clone'])} "
-                  f"{shlex.quote(a['clone'])} --reference {shlex.quote(r['ref'])}")
+                  f"{shlex.quote(a['clone'])} --reference "
+                  f"{shlex.quote(r['target'] if r.get('clips') else r['ref'])}")
     # ── Save each voice into the preset library ──────────────────────────────
     # This is the natural moment: the blocks are complete and the scores are
     # known. Without it the result lives only in a console you will close.
@@ -811,7 +928,8 @@ def main():
                     # Commentary only: the blocks are saved without it.
                     info = None
                     print(f"  [!] Preset information skipped: {exc}")
-                saved = VP.save(nm, r['xtts'], r['audio'], reference=r['ref'],
+                saved = VP.save(nm, r['xtts'], r['audio'],
+                                reference=r['target'] if r.get('clips') else r['ref'],
                                 source='pipeline', scores=r.get('scores'),
                                 acoustics=r.get('acoustics'), references=r['references'],
                                 overwrite=not args.keep_preset_history, info=info)
@@ -821,7 +939,8 @@ def main():
                     scores = {k: v for k, v in (r.get('scores') or {}).items()
                               if k != 'identity_unseen'}
                     alt_saved = VP.save(
-                        f"{nm} {a['weighting']}", r['xtts'], a['audio'], reference=r['ref'],
+                        f"{nm} {a['weighting']}", r['xtts'], a['audio'],
+                        reference=r['target'] if r.get('clips') else r['ref'],
                         source='pipeline', scores=scores, acoustics=r.get('acoustics'),
                         references=r['references'], overwrite=not args.keep_preset_history,
                         info=_alt_info(args, r, a, saved) if info else None,

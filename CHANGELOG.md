@@ -11,6 +11,146 @@ measured. The [README](README.md) describes how the tools work now.
 
 ---
 
+## 3.10.6 — 2026-11-17 — one voice from several clips of the same speaker
+
+Asked from use: XTTS-v2 takes a list of reference files, and three or four
+clean clips of 6 to 10 s are said to clone better than one long file. The
+[Curation], [Optimiser] and Meditation tabs already took several files per
+voice, but the pipeline did not: `--voice` took exactly one file and a
+language, and two paths on a row of the [Auto] tab were read as one path
+("Pick a reference first.").
+
+### Added
+
+- **`xtts_pipeline.py --voice WAV [WAV ...] LANG`**: one voice from one
+  reference or from several clips of the same speaker, the language last
+  (`--voice lea_1.wav lea_2.wav lea_3.wav FR --voice john.wav EN`). With
+  several clips:
+  - **curation** scores the windows of all the clips against one centroid
+    and keeps Keep s *in all*, one `<clip>_curated.wav` per clip. A clip with
+    less than 2 s left is dropped and the run says so; a clip shorter than
+    the 4 s window has no window and is dropped too. Existing curated clips
+    are reused unless Re-curate is ticked, as for one file;
+  - **XTTS gets the clips as separate references**: one speaker embedding
+    per clip, averaged, and the GPT conditioning reads them end to end. Each
+    clip is cut to Max reference s on its own, so four 10 s clips are read in
+    full with Max reference s 10. The optimiser's C4 stage tries all of them,
+    each one alone and every pair (with four clips or fewer), and the winning
+    set goes to the tone fit and into the preset (`# Clone references`);
+  - the analyser and the tone fit read **the clips joined** in one file,
+    `<first clip>_clips.wav` (0.2 s of silence between them, mono, at the
+    first clip's rate): the preset's `# Reference` and the blind A/B command
+    name that file;
+  - the recap and the preset's *Curation* section list the clips and those
+    kept.
+- **[Auto] tab**: a voice row takes several files. **...** now opens a
+  multi-selection and *adds* to the row (a row is cleared by hand); paths
+  typed with spaces between them are read as several files when they all
+  exist or all end in an audio extension, as everywhere in the studio
+  (` ; ` always separates). The readout under a row of clips gives the
+  number of clips, their total and shortest/longest length, the voiced share
+  and the usable seconds, and warns about a clip shorter than the curation
+  window, a Keep s larger than the clips hold together, and very quiet
+  clips.
+- `curate_reference.py --outputs WAV ...`: one output per reference, the
+  selection shared; the files written are printed on a line
+  `CURATED_JSON: [...]`. `-o` (all references in one file) is unchanged.
+
+### Changed
+
+- **The autos count what XTTS reads of every clip** (`search_plan.py`,
+  `pipeline_voice_audio`): Max reference s is set by the longest clip (XTTS
+  cuts each file on its own), Reference lengths by the voice whose longest
+  clip is shortest, gcl s by what the voice with the least audio gives, its
+  clips end to end, each cut to Max reference s; Chunk lengths follow. The
+  conditioning budget counts the C4 stage (`reference_set_count`, the
+  optimiser's own count: 3 sets for 2 clips, 7 for 3, 8 for 4) and the
+  candidates of the winning set: three 8 s clips taken as they are give
+  Max reference s 8, gcl s `20 24` and a budget of 49 (34 for one file).
+- A row whose path cannot be found now says `[ERR] Not found: …` (with a
+  hint about ` ; ` when the path holds spaces) instead of "Pick a reference
+  first.", and the run refuses the same file twice on one row.
+
+### Tests
+
+`test_3106_multi_clip_voice.py`, 30 tests: the `--voice` syntax; the C4 count
+against `xtts_optimize._reference_sets` for 1 to 9 clips; the audio each voice
+hands XTTS (one file unchanged, clips as they are, clips to curate, curated
+clips reused or not); the budget with clips, checked by running the
+optimiser with its models simulated on three clips (no conditioning stage
+cut); the curation of several clips with an ECAPA stand-in (each file keeps
+its own clip's audio, another speaker and a clip shorter than the window are
+dropped, Keep s is the total, the excess comes off the longest clips, the
+command line, the checks); the joined file; the pipeline with stand-ins for
+its four tools (what each tool receives, reuse and `--recurate`,
+`--no-curate`, a one-file voice beside a clip voice, the preset, refused
+voices); the [Auto] tab with fake widgets (the run command, the reported
+space-separated paths, the autos, Keep s and the readout, `...` adding
+files, missing and repeated files) and with real Tk widgets on a display.
+On 3.10.5, 29 of the 30 fail; the one that passes checks that curation into
+one file is unchanged. The [Auto] harness of
+`test_budget_plan_regressions.py` now also loads `split_paths`, which the
+tab uses. Whole suite on Python 3.11: 626 tests, all passing on a virtual
+display with a window manager (34 skipped without one).
+
+---
+
+## 3.10.5 — 2026-11-09 — the type chosen when saving, and the prompt's folder
+
+Reported from use: in the studio's file chooser, a name saved without an
+extension did not take the type selected in the list; and Save / Save as of
+the prompt did not open in the right folder.
+
+### Fixed
+
+- **Save used the caller's default extension, never the selected type.**
+  `studio_file_dialog.py` added `defaultextension` to a name typed without an
+  extension, whatever type was picked in the list, and the list always started
+  on its first type. Now:
+  - an extension typed in the name is kept when it is one of the dialog's
+    types (any of them, whatever type is selected): `séance.wav` stays WAV
+    with MP3 selected;
+  - a name without one gets the extension of the type selected in the list;
+    with "All" selected, the caller's default extension, as before;
+  - a suffix that is none of the types is part of the name: `prise.v2` with
+    MP3 selected is saved as `prise.v2.mp3`;
+  - picking another type with the mouse changes the extension shown in the
+    name at once (`séance.wav` → `séance.flac`), so what is shown is what is
+    saved;
+  - the list starts on the type of the proposed file name, else on the type
+    of the caller's default extension (the Meditation tab's **Format** list,
+    the `.wav` of a Brainwave export, ...), else on the first; a
+    `typevariable` still wins and is still updated.
+  The overwrite question is asked about the final name.
+- **The prompt editor opened the chooser anywhere.** Open, Save (of a new
+  prompt) and Save as passed no folder, so the chooser went back to the last
+  folder used for a `.txt`, or to the folder the studio was started from. They
+  now open in the folder of the prompt being edited, else in `Prompts/`
+  (created when missing); Save as proposes the current file name. The
+  *Annotated prompt (.txt)* field of the alignment tab opens in `Prompts/` too.
+- **Meditation tab:** the **Format** list follows the extension of the output
+  name (chosen in the chooser or typed), since that extension is the one
+  written at Run. A project loads its format before its output name, so the
+  two agree.
+
+### Tests
+
+`test_3105_save_type.py`, 17 tests: the naming rule without a display (no
+extension, typed extensions of any listed type, unknown suffixes, "All", the
+change of type, the starting type), the real chooser on a Tk root (a type
+picked through `<<ComboboxSelected>>` is the one saved, a typed extension
+wins, the name follows the type, the caller's format and a `typevariable`
+set the starting type, the overwrite question names the final file), and the
+Meditation tab itself: Open / Save / Save as of the prompt open in `Prompts/`
+then in the folder of the loaded prompt with its name proposed, the Format
+list follows the output name, and the reported case end to end (Format
+`mp3`, FLAC picked in the chooser, `ma séance` typed → `ma séance.flac`,
+Format `flac`). On 3.10.4 the file gives 16 failures out of 17. Whole suite on
+Python 3.11: 596 tests, all passing on a virtual display with a window
+manager (33 skipped without one).
+
+---
+
 ## 3.10.4 — 2026-11-05 — a file chooser of the studio's own
 
 The zenity chooser of 3.10.2 kept the GUI alive, but on a GNOME/Wayland desktop

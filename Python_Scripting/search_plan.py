@@ -271,6 +271,68 @@ def pipeline_reference_seconds(paths, curate, recurate, keep_seconds, seconds_of
     return out
 
 
+# Silence put between the clips of one voice in the file the pipeline joins for
+# the analysis and the tone fit (XTTS itself gets the clips as separate files).
+JOIN_GAP_S = 0.2
+
+# Same cap as xtts_optimize._reference_sets.
+REFERENCE_SETS_MAX = 8
+
+
+def reference_set_count(n_refs):
+    """How many reference sets the optimiser's C4 stage tries for n_refs
+    clips (0 when it does not run): all of them, each one alone, and every
+    pair when there are four or fewer (with two clips the one pair is all of
+    them, counted once), at most REFERENCE_SETS_MAX."""
+    n = int(n_refs)
+    if n <= 1:
+        return 0
+    pairs = n * (n - 1) // 2 if 2 < n <= 4 else 0
+    return min(REFERENCE_SETS_MAX, 1 + n + pairs)
+
+
+def pipeline_voice_audio(voices, curate, recurate, keep_seconds, seconds_of):
+    """What each voice will hand XTTS, as xtts_pipeline.py builds it, for
+    voices of one or several clips (a list of paths per voice).
+
+    Returns one dict per voice: 'label' (its first file), 'files', 'seconds'
+    (per file: XTTS cuts each one to max_ref_len), 'joined' (the length of
+    what the analyser reads, which sets its gpt_cond_len) and 'what'.
+
+    One file: as pipeline_reference_seconds. Several, curated: the existing
+    <clip>_curated.wav files when all are there and re-curation is off,
+    otherwise an estimate -- each clip at most Keep s, Keep s in all, as the
+    shared selection keeps it.
+    """
+    out = []
+    for files in voices:
+        files = [files] if isinstance(files, (str, os.PathLike)) else list(files)
+        if len(files) == 1:
+            path, seconds, what = pipeline_reference_seconds(
+                files, curate, recurate, keep_seconds, seconds_of)[0]
+            out.append(dict(label=path, files=files, seconds=[seconds], joined=seconds,
+                            what=what))
+            continue
+        curated = [os.path.splitext(f)[0] + '_curated.wav' for f in files]
+        if curate and not recurate and all(os.path.exists(c) for c in curated):
+            seconds = [float(seconds_of(c)) for c in curated]
+            what = f'{len(files)} existing curated clips'
+        elif curate:
+            raw = [float(seconds_of(f)) for f in files]
+            seconds = [min(s, float(keep_seconds)) for s in raw]
+            total = min(sum(raw), float(keep_seconds))
+            joined = total + JOIN_GAP_S * (len(files) - 1)
+            out.append(dict(label=files[0], files=files, seconds=seconds, joined=joined,
+                            what=f'{len(files)} clips, curation to Keep s in all'))
+            continue
+        else:
+            seconds = [float(seconds_of(f)) for f in files]
+            what = f'{len(files)} clips as they are'
+        out.append(dict(label=files[0], files=files, seconds=seconds,
+                        joined=sum(seconds) + JOIN_GAP_S * (len(files) - 1), what=what))
+    return out
+
+
 def whole_file_seconds(seconds):
     """Smallest whole number of seconds that reads all of a file this long.
 
@@ -319,14 +381,20 @@ def chunk_candidates(gcl_lens, max_ref, n_refs=1):
 
 
 def pipeline_conditioning_budget(gcl_lens, chunks, ref_lengths, max_ref, seconds,
-                                 extension_trials=0):
+                                 extension_trials=0, n_refs=None):
     """--cond-budget that runs every conditioning stage for every voice.
 
-    The pipeline gives the optimiser one reference per voice, and the
-    analyser's gpt_cond_len (the search's starting point) follows each file's
-    length, so each voice has its own plan: the largest one decides.
+    The analyser's gpt_cond_len (the search's starting point) follows the
+    length of what it reads (seconds, one value per voice), so each voice has
+    its own plan: the largest one decides. n_refs gives the number of clips
+    of each voice (1 when omitted): several clips add the C4 stage, which tries
+    reference sets, and the candidates of the winning set.
     """
+    n_refs = list(n_refs) if n_refs is not None else [1] * len(seconds)
+    if len(n_refs) != len(seconds):
+        raise ValueError("n_refs needs one value per voice")
     return max(conditioning_plan(gcl_lens, chunks, ref_lengths, analyser_gcl_prior(s),
-                                 ANALYSER_CHUNK, max_ref, 1, PIPELINE_COND_TEXTS,
+                                 ANALYSER_CHUNK, max_ref, max(1, int(k)), PIPELINE_COND_TEXTS,
+                                 ref_sets=reference_set_count(k),
                                  extension_trials=extension_trials)
-               for s in seconds)
+               for s, k in zip(seconds, n_refs))

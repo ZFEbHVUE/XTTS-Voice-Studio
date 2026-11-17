@@ -151,6 +151,85 @@ def _with_extension(path, extension):
     return path
 
 
+def _dotted(extension):
+    if not extension:
+        return None
+    extension = str(extension)
+    return extension if extension.startswith('.') else '.' + extension
+
+
+def _pattern_extension(pattern):
+    """'.wav' for '*.wav'; None for '*' or a pattern that is not one extension."""
+    pattern = str(pattern)
+    if pattern.startswith('*.') and len(pattern) > 2 and not any(c in pattern[2:] for c in '*?[]'):
+        return pattern[1:]
+    return None
+
+
+def _filter_extension(patterns):
+    """The extension a save adds for this type: its first plain '*.ext'."""
+    for pattern in patterns:
+        extension = _pattern_extension(pattern)
+        if extension:
+            return extension
+    return None
+
+
+def _known_extensions(filters):
+    return {e.lower() for _label, patterns in filters for e in map(_pattern_extension, patterns) if e}
+
+
+def _save_name(name, filters, index, defaultextension=None):
+    """The name a save returns, from what was typed and the selected type.
+
+    - An extension typed in the name is kept when it is one of the dialog's
+      types (any of them, not only the selected one), or when the selected type
+      is 'all files': the user wrote it.
+    - Otherwise the selected type's extension is added. With 'all files'
+      selected, the caller's default extension is.
+    A suffix that is none of the types ('take.v2') is part of the name: with
+    MP3 selected it becomes 'take.v2.mp3'.
+    """
+    if name.endswith('.') and not name.endswith(os.sep + '.'):
+        name = name.rstrip('.')
+    extension = os.path.splitext(name)[1]
+    patterns = filters[index][1] if 0 <= index < len(filters) else ('*',)
+    selected = _filter_extension(patterns)
+    if extension and (selected is None or extension.lower() in _known_extensions(filters)):
+        return name
+    added = selected or _dotted(defaultextension)
+    return name + added if added else name
+
+
+def _retyped_name(name, filters, index):
+    """The name after another type is picked in the list: an extension that is
+    one of the dialog's types becomes the new type's one ('flûte.wav' ->
+    'flûte.mp3'); a name without one, or 'all files', is left as it is."""
+    new = _filter_extension(filters[index][1]) if 0 <= index < len(filters) else None
+    if not name or new is None:
+        return name
+    base, extension = os.path.splitext(name)
+    if extension and extension.lower() in _known_extensions(filters):
+        return base + new
+    return name
+
+
+def _initial_filter(filters, chosen=None, initialfile=None, defaultextension=None):
+    """Which type the list shows first: the one a typevariable names, else the
+    type of the proposed file name, else the type of the caller's default
+    extension (the Meditation tab's Format list), else the first."""
+    labels = [label for label, _patterns in filters]
+    if chosen in labels:
+        return labels.index(chosen)
+    for extension in (os.path.splitext(initialfile or '')[1], _dotted(defaultextension)):
+        if not extension:
+            continue
+        for index, (_label, patterns) in enumerate(filters):
+            if any((_pattern_extension(p) or '').lower() == extension.lower() for p in patterns):
+                return index
+    return 0
+
+
 def _audio_info(path):
     """Read headers only. Compressed formats use the app's optional ffprobe."""
     if Path(path).suffix.lower() not in AUDIO_EXTENSIONS:
@@ -278,7 +357,14 @@ class StudioFileDialog(tk.Toplevel):
         self.path_var = tk.StringVar(master=self)
         self.name_var = tk.StringVar(master=self, value=options.get('initialfile', ''))
         self.search_var = tk.StringVar(master=self)
-        self.filter_var = tk.StringVar(master=self, value=self._filter_labels[0])
+        variable = options.get('typevariable')
+        try:
+            chosen = variable.get() if variable is not None else None
+        except (tk.TclError, AttributeError):
+            chosen = None
+        first = _initial_filter(self.filters, chosen, options.get('initialfile'),
+                                options.get('defaultextension')) if mode != 'directory' else 0
+        self.filter_var = tk.StringVar(master=self, value=self._filter_labels[first])
         self.hidden_var = tk.BooleanVar(master=self, value=bool(self.preferences.get('hidden', False)))
         self.status_var = tk.StringVar(master=self)
         self.details_var = tk.StringVar(master=self, value='Sélectionnez un fichier pour afficher ses informations.')
@@ -638,9 +724,17 @@ class StudioFileDialog(tk.Toplevel):
         return 'break'
 
     def _filter_changed(self, event=None):
+        index = max(0, self.filter_box.current())
         variable = self.options.get('typevariable')
         if variable is not None:
-            variable.set(self.filters[max(0, self.filter_box.current())][0])
+            variable.set(self.filters[index][0])
+        if self.mode == 'save':
+            # The type picked with the mouse is the one saved: the extension
+            # shown in the name follows it at once.
+            name = self.name_var.get()
+            retyped = _retyped_name(name, self.filters, index)
+            if retyped != name:
+                self.name_var.set(retyped)
         self._render()
 
     def _focus_address(self, event=None):
@@ -724,7 +818,8 @@ class StudioFileDialog(tk.Toplevel):
             self.navigate(path)
             return 'break'
         if self.mode == 'save':
-            path = _with_extension(path, self.options.get('defaultextension'))
+            path = self._resolve(_save_name(text, self.filters, max(0, self.filter_box.current()),
+                                            self.options.get('defaultextension')))
             if not os.path.isdir(os.path.dirname(path)):
                 self.status_var.set('Le dossier de destination n’existe pas.')
                 return 'break'

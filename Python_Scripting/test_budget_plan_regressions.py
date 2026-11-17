@@ -323,8 +323,10 @@ class AutoTabTests(unittest.TestCase):
                   run_cmd=lambda cmd, *a, **kw: self.commands.append(cmd),
                   LANGS=['FR'], DEFAULT_LANG='FR', DIR_VOICES='/voices', SCRIPTS_DIR=str(ROOT))
         tree = ast.parse((ROOT / 'xtts_studio.py').read_text(encoding='utf-8'))
-        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'tab_auto')
-        exec(compile(ast.Module(body=[node], type_ignores=[]), 'xtts_studio.py', 'exec'), ns)
+        # The tab, and the module helper its rows read paths with (3.10.6).
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name in ('tab_auto', 'split_paths')]
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), 'xtts_studio.py', 'exec'), ns)
         ns['tab_auto'](None)
         self.run_pipeline = lambda: callbacks['>  Run full pipeline'](None, None)
         return Widget.entries, Widget.checks, Widget.buttons

@@ -31,6 +31,21 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## What's new
 
+**3.10.6 — one voice from several clips of the same speaker.** A voice row of
+the [Auto] tab, and `xtts_pipeline.py --voice a.wav b.wav c.wav FR`, take
+several clips of one speaker: curation keeps Keep s in all, one curated file
+per clip; XTTS gets the clips as separate references, each cut to Max
+reference s on its own, and the optimiser's C4 stage tries subsets of them; the
+analyser and the tone fit read them joined. The auto buttons count what XTTS
+reads of every clip. See [[Auto] Pipeline](#auto-pipeline).
+
+**3.10.5 — saving takes the type you pick, and the prompt opens in its folder.**
+In the studio's file chooser, a name typed without an extension now gets the
+type selected in the list (an extension you type yourself is kept when it is
+one of the listed types), and picking another type changes the extension shown
+at once. Open / Save / Save as of the prompt editor open in the prompt's folder,
+else in `Prompts/`. The Meditation tab's Format list follows the output name.
+
 **3.10.4 — a file chooser of the studio's own.** Every Browse in XTTS Studio now
 opens a chooser built into the studio (sizes, types, dates, sorting, search,
 favourites, audio duration and a Listen button) instead of zenity, whose window
@@ -568,6 +583,38 @@ same generation: `*_pipeline_clone_raw.wav` (untouched XTTS output),
 no EQ will make them so — and the scores don't hear naturalness.
 CLI equivalent: `xtts_pipeline.py --voice lea.wav FR --voice john.wav EN`.
 
+**Several clips of one speaker.** A voice row can hold several files of the
+same speaker (**...** adds the files picked to the row; ` ; ` separates them,
+and so do spaces when every piece exists or ends in an audio extension). One
+row per speaker: **+ Add voice** is for another one. CLI:
+`--voice lea_1.wav lea_2.wav lea_3.wav FR`. The clips then go through the run
+like this:
+
+- curation scores the windows of all the clips against one centroid and keeps
+  Keep s **in all**, one `<clip>_curated.wav` per clip; a clip left with less
+  than 2 s, or shorter than the 4 s curation window, is dropped and the run
+  says so;
+- XTTS gets the clips as separate references: one speaker embedding per clip,
+  averaged, and the GPT conditioning reads them end to end. Max reference s
+  cuts each clip on its own, so four 10 s clips are read in full with Max
+  reference s 10, where one 40 s file would need 40;
+- the optimiser's C4 stage tries all the clips, each one alone and every pair
+  (four clips or fewer); the winning set goes to the tone fit and into the
+  preset (`# Clone references`), and the Meditation tab puts it back on the
+  voice row when the preset is inserted;
+- the analyser and the tone fit read the clips joined in one file,
+  `<first clip>_clips.wav` (0.2 s of silence between clips): the preset's
+  `# Reference` and the A/B command name it.
+
+The readout under the row gives the number of clips, their total, the
+shortest and longest, the voiced share and the usable seconds, and warns about
+a clip shorter than the curation window or a Keep s larger than the clips hold
+together. Whether three or four short clips clone a given speaker better than
+one longer file is not something the scores settle: the GPT side reads almost
+the same audio either way, and what changes is the speaker embedding (a mean
+of one per clip instead of one over the whole) and the subsets C4 can try.
+Run both and compare the raw clones blind (`listening_test.py`).
+
 Options (the safeguards below them are always on):
 
 | Control | CLI | Effect |
@@ -596,12 +643,12 @@ in the console what it set and why:
 | Field | auto sets |
 |---|---|
 | Budget | The whole sampling plan: `2 × seeds + 50` from 3 seeds on, `+ 12` with Probe beam/greedy. The analysis decides the starting temperature, so the longest case is counted |
-| Keep s | What the shortest reference can give, when that is less; it never raises the value |
-| Max reference s | The length that reads all the audio XTTS gets: the curated file the run will make, an existing curated file it will reuse, or the reference itself without curation. With several voices, the longest; at most 60 |
-| Reference lengths to test | The 20 / 30 / 45 / 60 ladder below the shortest of those files, plus the length that reads all of it: a longer value would read the same audio again |
-| gcl s | The ladder from 20 s (from 10 s for a shorter file) up to what XTTS reads of the shortest file, the last value: none is ignored or reads the same audio twice |
+| Keep s | What the shortest reference can give, when that is less (for a row of clips, what its clips give together); it never raises the value |
+| Max reference s | The length that reads all the audio XTTS gets: the curated file the run will make, an existing curated file it will reuse, or the reference itself without curation. XTTS cuts every file on its own, so with several voices or clips, the longest file; at most 60 |
+| Reference lengths to test | The 20 / 30 / 45 / 60 ladder below the shortest of those files (for clips, the voice whose longest clip is shortest), plus the length that reads all of it: a longer value would read the same audio again |
+| gcl s | The ladder from 20 s (from 10 s for a shorter file) up to what XTTS reads of the shortest file, the last value: none is ignored or reads the same audio twice. For a row of clips, what its clips give end to end, each cut to Max reference s |
 | Chunk lengths | The 4 / 6 / 8 / 10 ladder up to the shortest usable gcl s, so every chunk pairs with every GPT length |
-| Conditioning budget | Every candidate the conditioning stages can render whichever ones win, plus the noise probe and the confirmation: no stage is cut, C5 screens its 8 nearest new combinations and C6 confirms 3 candidates |
+| Conditioning budget | Every candidate the conditioning stages can render whichever ones win, plus the noise probe and the confirmation: no stage is cut, C5 screens its 8 nearest new combinations and C6 confirms 3 candidates. With clips, the C4 reference sets too (3 for 2 clips, 7 for 3, 8 for 4 or more) and the candidates of the winning set: 49 for three 8 s clips |
 
 A budget larger than its plan is never used, so an auto budget is what the full
 search can spend, not a margin; with reference lengths to test, that is more
@@ -1200,7 +1247,9 @@ The optimiser now **searches over combinations** of those references rather than
 averaging them all and hoping. Which subset works best is not obvious — a
 denoised take can drag a clean one down — and it was never tested before. The
 winning subset, in order, is carried to the Comparator and stored in the
-preset.
+preset. The [Auto] pipeline takes several clips per voice too (see
+[[Auto] Pipeline](#auto-pipeline)), and inserting its preset puts the winning
+clips back on the voice row.
 
 ### Parallel voice overlay
 
@@ -1584,6 +1633,18 @@ reference files, the windows never straddle two of them; a silent stretch never
 counts as speech; and if no window reaches the coherence threshold the tool
 stops with an error instead of silently keeping one. The coherence score is not
 a noise, music or second-speaker detector: listen to the result.
+
+Several clips of one speaker can stay separate files, as XTTS takes them:
+
+```bash
+python curate_reference.py a.wav b.wav c.wav --outputs a_cur.wav b_cur.wav c_cur.wav --keep-seconds 24
+```
+
+The selection is the same (one centroid, `--keep-seconds` in all); each clip
+gets its own file with its kept windows. When the selection overshoots, the
+excess comes off the clips that kept the most audio. A clip left with less
+than 2 s is dropped and named; the files written are listed on a line
+`CURATED_JSON: [...]`. The pipeline uses this for a voice of several clips.
 
 ### Sampling optimiser (`xtts_optimize.py`)
 
