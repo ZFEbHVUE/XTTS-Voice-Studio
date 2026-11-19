@@ -10,11 +10,18 @@
 #
 #   pip install -r requirements.txt
 #
-# torch is NOT pinned here: install it first, matched to your CUDA version, from
-# https://pytorch.org . For CUDA 12.1:
+# Install torch FIRST, matched to your CUDA version, from https://pytorch.org .
+# For CUDA 12.1:
 #   pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 # CPU-only:
 #   pip install torch==2.5.1 torchaudio==2.5.1
+
+# ── torch, held where it is ──────────────────────────────────────────────────
+# Listed so that no dependency below can upgrade it: pip then stops with a
+# conflict instead of replacing it. A local build such as 2.5.1+cu121 matches.
+# TTS 0.22 cannot load XTTS with torch >= 2.6 (torch.load's weights_only).
+torch==2.5.1
+torchaudio==2.5.1
 
 # ── Core TTS ─────────────────────────────────────────────────────────────────
 TTS==0.22.0
@@ -39,7 +46,8 @@ einops>=0.6
 encodec==0.1.1
 
 # ── Speaker identity, separation, denoising ──────────────────────────────────
-speechbrain>=1.0
+# speechbrain 1.1 requires torch >= 2.7.1 and would upgrade it.
+speechbrain>=1.0,<1.1
 demucs>=4.0
 
 # ── Interface and plots ──────────────────────────────────────────────────────

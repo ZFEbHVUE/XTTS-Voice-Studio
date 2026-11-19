@@ -31,6 +31,10 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## What's new
 
+**3.10.9 — torch stays at 2.5.1.** speechbrain 1.1 requires torch >= 2.7.1 and
+made pip upgrade it, which broke the coqui-tts environment on its first
+install. Both requirement files now hold torch and keep speechbrain below 1.1.
+
 **3.10.8 — the coqui-tts fork as a second environment.** `install.sh --coqui`
 and `requirements-coqui-tts.txt` set up coqui-tts 0.28 next to TTS 0.22.0; the
 code runs on both. Beam search, broken on the fork, is worked around; spacy and

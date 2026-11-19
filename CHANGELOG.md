@@ -11,6 +11,44 @@ measured. The [README](README.md) describes how the tools work now.
 
 ---
 
+## 3.10.9 — 2026-11-19 — no dependency may upgrade torch
+
+Seen on the first `install.sh --coqui`: the environment did not import, with
+coqui-tts asking for torchcodec "from PyTorch 2.9". speechbrain 1.1.2, allowed
+by `speechbrain>=1.0`, requires torch >= 2.7.1, so pip replaced the torch 2.5.1
+installed just before with a recent one, and from 2.9 torchaudio needs
+torchcodec. 3.10.8's requirements file had been checked with its packages
+installed one by one, not with `pip install -r` on a fresh environment, which
+is how the installer uses it. `requirements.txt` had the same opening: a fresh
+TTS 0.22 install would have upgraded torch too, and TTS 0.22 cannot load XTTS
+with torch >= 2.6.
+
+### Fixed
+
+- Both requirement files hold `torch==2.5.1` and `torchaudio==2.5.1`. Installed
+  first from the PyTorch index (2.5.1+cu121 matches), torch now stays where it
+  is; a dependency that wants another one makes pip stop with a conflict
+  instead of replacing it.
+- Both keep `speechbrain>=1.0,<1.1`.
+
+Checked with pip on a fresh Python 3.11 environment, torch 2.5.1 installed
+first: `pip install -r requirements-coqui-tts.txt` keeps torch 2.5.1 and takes
+speechbrain 1.0.3, the installer's import check passes, and the whole suite
+passes in it (650 tests). `requirements.txt` resolves the same way next to
+TTS 0.22.0 (torch 2.5.1, speechbrain 1.0.3).
+
+An environment already upgraded is simplest to rebuild:
+`conda env remove -n xtts028`, then `install.sh --coqui` again.
+
+### Tests
+
+`test_3109_requirements.py`, 4 tests: torch and torchaudio held and speechbrain
+below 1.1 in both files, every line parses, a local build such as 2.5.1+cu121
+satisfies the pin, the installer installs torch before the requirements. On
+3.10.8's files the first two fail.
+
+---
+
 ## 3.10.8 — 2026-11-19 — the coqui-tts fork (0.28) as a second environment
 
 The original `TTS` package (0.22.0) is unmaintained; coqui-tts, the fork, is.
