@@ -31,6 +31,18 @@ Every tool is accessible through a single Tkinter interface (`xtts_studio.py`) o
 
 ## What's new
 
+**3.10.8 — the coqui-tts fork as a second environment.** `install.sh --coqui`
+and `requirements-coqui-tts.txt` set up coqui-tts 0.28 next to TTS 0.22.0; the
+code runs on both. Beam search, broken on the fork, is worked around; spacy and
+six, which it no longer installs, are listed; its model download gets its own
+folder, since a failed one deletes TTS 0.22's. `engine_ab.py` renders a voice
+in both environments and says whether the switch changes it. See
+[Moving to coqui-tts](#moving-to-coqui-tts-optional-a-second-environment).
+
+**3.10.7 — gcl s auto for clips to be curated.** For a row of clips with
+curation on, gcl s auto stops at Keep s, the audio curation keeps in all: it
+used to add up the clips, and the longer values read the same audio again.
+
 **3.10.6 — one voice from several clips of the same speaker.** A voice row of
 the [Auto] tab, and `xtts_pipeline.py --voice a.wav b.wav c.wav FR`, take
 several clips of one speaker: curation keeps Keep s in all, one curated file
@@ -488,6 +500,60 @@ python ~/XTTS-Voice-Studio/Python_Scripting/xtts_studio.py
 
 `XTTS_ROOT` is auto-detected from the script location — no hardcoded paths. You can rename or move the directory freely.
 
+### Moving to coqui-tts (optional, a second environment)
+
+The original `TTS` package (0.22.0) is no longer maintained; the community
+fork, [coqui-tts](https://github.com/idiap/coqui-ai-TTS), is. The code runs on
+both, so the fork goes into a second environment and the first one stays as
+it is until the A/B below says the switch changes nothing for your voices.
+
+```bash
+./install.sh --coqui             # env "xtts028": Python 3.11, coqui-tts 0.28,
+                                 # same torch 2.5.1 build; launcher xtts-studio-coqui
+# by hand instead:
+conda create -n xtts028 python=3.11 && conda activate xtts028
+pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements-coqui-tts.txt
+conda env config vars set TTS_HOME=$HOME/.local/share/tts-coqui COQUI_TOS_AGREED=1
+```
+
+What differs, found by running the project's calls on both packages:
+
+- **The model is downloaded again**, from Hugging Face (`tts-hub/XTTS-v2`,
+  XTTS-v2.0.3, about 2 GB, into `~/.cache/huggingface`). If that download
+  fails, coqui-tts 0.28 deletes `<TTS home>/tts/tts_models--multilingual--multi-dataset--xtts_v2`,
+  which by default is where TTS 0.22 keeps *its* copy: hence the separate
+  `TTS_HOME` of the new environment.
+- **spacy and six are no longer installed** with it, although XTTS needs spacy
+  to split sentences and the fork imports six: both are in
+  `requirements-coqui-tts.txt`, and the tools say so before loading the model
+  when spacy is missing.
+- **Beam search (`num_beams` > 1) fails** with the transformers 4.57 the fork
+  requires (`shape '[1, 1216]' is invalid for input of size 2052`): XTTS gives
+  the generation its longest audio sequence (608) as vocabulary size instead
+  of the 1026 audio codes. `xtts_clone.generate` works around it.
+- **Nothing else that this project uses**: the calls are the same, and with
+  the same weights and seed a tiny random XTTS renders the same audio (to one
+  step of 16-bit PCM) in both, beam search included; French text is
+  normalised the same way (the 430 lines of `Prompts/` and a set of numbers,
+  ordinals, times and abbreviations).
+
+Before switching, render one of your voices in both environments and compare:
+
+```bash
+conda activate xtts    && python Python_Scripting/engine_ab.py render --preset elo_new --out ab_022
+conda activate xtts028 && python Python_Scripting/engine_ab.py render --preset elo_new --out ab_028
+python Python_Scripting/engine_ab.py compare ab_022 ab_028 --identity
+```
+
+`render` uses the preset's `{}` block and clone references on four sentences of
+its language it was not tuned on, with its own seed and two more; the
+manifest records the package versions and a fingerprint of every weight
+tensor. `compare` says whether the two installs load the same weights and
+render the same audio. Same weights and same audio: the presets keep working,
+seeds included. Otherwise it scores both sides against the reference and
+prints the `listening_test.py` command for the most different pair.
+
 ---
 
 ## Directory Structure
@@ -527,6 +593,7 @@ XTTS-Voice-Studio/
 │   ├── brainwave_studio.py                 # Beats and singing bowls ([Wav], see BRAINWAVE.md)
 │   ├── chatterbox_ab.py                    # A/B sample vs Chatterbox (own env, see below)
 │   ├── listening_test.py                   # Blind A/B listening test + binomial sign test
+│   ├── engine_ab.py                        # Same voice rendered by TTS 0.22 and coqui-tts, compared
 │   ├── test_truncation.py                  # Diagnostic: words lost at sentence ends
 │   ├── test_max_ref_len.py                 # Diagnostic: speaker-embedding reference length
 │   ├── test_*_regressions.py               # Regression test suites (see Tests)
@@ -540,6 +607,9 @@ XTTS-Voice-Studio/
 ├── Punctual_sounds/                        # One-shot audio cues (bells, chimes)
 ├── MP3toTXT/                               # Audio/video sources for transcription
 ├── Output_Song_files/                      # Generated meditation WAVs
+├── requirements.txt                        # TTS 0.22.0 environment ("xtts")
+├── requirements-coqui-tts.txt              # coqui-tts 0.28 environment ("xtts028")
+├── install.sh                              # Both (--coqui for the second)
 ├── README.md
 ├── FIDELITY.md
 └── CHANGELOG.md
@@ -646,7 +716,7 @@ in the console what it set and why:
 | Keep s | What the shortest reference can give, when that is less (for a row of clips, what its clips give together); it never raises the value |
 | Max reference s | The length that reads all the audio XTTS gets: the curated file the run will make, an existing curated file it will reuse, or the reference itself without curation. XTTS cuts every file on its own, so with several voices or clips, the longest file; at most 60 |
 | Reference lengths to test | The 20 / 30 / 45 / 60 ladder below the shortest of those files (for clips, the voice whose longest clip is shortest), plus the length that reads all of it: a longer value would read the same audio again |
-| gcl s | The ladder from 20 s (from 10 s for a shorter file) up to what XTTS reads of the shortest file, the last value: none is ignored or reads the same audio twice. For a row of clips, what its clips give end to end, each cut to Max reference s |
+| gcl s | The ladder from 20 s (from 10 s for a shorter file) up to what XTTS reads of the shortest file, the last value: none is ignored or reads the same audio twice. For a row of clips, what its clips give end to end, each cut to Max reference s, and no more than Keep s when they are curated together |
 | Chunk lengths | The 4 / 6 / 8 / 10 ladder up to the shortest usable gcl s, so every chunk pairs with every GPT length |
 | Conditioning budget | Every candidate the conditioning stages can render whichever ones win, plus the noise probe and the confirmation: no stage is cut, C5 screens its 8 nearest new combinations and C6 confirms 3 candidates. With clips, the C4 reference sets too (3 for 2 clips, 7 for 3, 8 for 4 or more) and the candidates of the winning set: 49 for three 8 s clips |
 
@@ -2210,8 +2280,9 @@ knowing about:
 ```
 TTS==0.22.0              # the original Coqui package
 transformers==4.33.0     # 4.34+ moves GenerationMixin and breaks TTS 0.22's
-                         # XTTS loader. The coqui-tts FORK needs >=4.46 instead:
-                         # the two packages are not interchangeable.
+                         # XTTS loader. The coqui-tts FORK (0.28) needs >=4.57
+                         # instead: the two packages are not interchangeable
+                         # (requirements-coqui-tts.txt, a second environment).
 numpy>=1.22,<2           # numba and several audio wheels are built against 1.x
 torch==2.5.1             # install first, matched to your CUDA version; 2.9+
                          # pulls torchcodec, which needs the full-shared ffmpeg

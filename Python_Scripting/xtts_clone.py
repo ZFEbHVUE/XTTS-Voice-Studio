@@ -16,6 +16,11 @@ This module uses the documented low-level path instead:
 Benefits: every cloning knob takes effect, max_ref_len is exposed, and the
 latents are computed once per voice (not once per line) — faster and consistent.
 
+It runs on the original TTS 0.22.0 and on the coqui-tts fork (0.28): the calls
+are the same; check_engine() names the package in use and stops early when the
+fork's environment lacks spacy, and generate() works around a beam-search
+regression of the fork's transformers (see _beam_vocabulary).
+
 API:
   tts, model = load_xtts(device)
   lat = compute_latents(model, speaker_wav, gpt_cond_len=30, max_ref_len=30, ...)
@@ -30,8 +35,50 @@ from xtts_settings import validate
 XTTS_SR = 24000   # XTTS v2 output sample rate
 
 
+def engine_versions():
+    """The XTTS package installed, and the libraries its sampling depends on:
+    {'package': 'coqui-tts' | 'TTS' | None, 'version', 'transformers', 'torch'}.
+    The same seed gives other audio when any of these changes."""
+    from importlib import metadata
+
+    def version(name):
+        try:
+            return metadata.version(name)
+        except metadata.PackageNotFoundError:
+            return None
+    info = {'package': None, 'version': None}
+    for dist in ('coqui-tts', 'TTS'):
+        if version(dist):
+            info = {'package': dist, 'version': version(dist)}
+            break
+    info.update(transformers=version('transformers'), torch=version('torch'))
+    return info
+
+
+def engine_label(info=None):
+    info = info or engine_versions()
+    return (f"{info.get('package') or 'no XTTS package'} {info.get('version') or ''}".strip()
+            + f" (transformers {info.get('transformers')}, torch {info.get('torch')})")
+
+
+def check_engine(verbose=True):
+    """Say which XTTS package runs and stop before the model loads when it
+    cannot split sentences: coqui-tts no longer installs spacy, which
+    enable_text_splitting=True (every tool here) needs."""
+    import importlib.util
+    info = engine_versions()
+    if verbose:
+        print(f"[*] XTTS engine: {engine_label(info)}")
+    if importlib.util.find_spec('spacy') is None:
+        raise RuntimeError("spacy is not installed, and XTTS needs it to split sentences "
+                           "(enable_text_splitting). Install it in this environment: "
+                           "pip install spacy")
+    return info
+
+
 def load_xtts(device=None):
     import torch
+    check_engine()
     from TTS.api import TTS
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     tts = TTS('tts_models/multilingual/multi-dataset/xtts_v2').to(device)
@@ -102,6 +149,24 @@ def compute_latents(model, speaker_wav, gpt_cond_len=30, gpt_cond_chunk_len=4,
         return latents
 
 
+def _beam_vocabulary(model):
+    """Size beam search by the audio codes XTTS scores.
+
+    Recent transformers (the 4.57 that coqui-tts 0.28 requires) reshape the
+    beam scores with the generation config's vocab_size. XTTS sets that to its
+    longest audio sequence (605 + 3 = 608), while its head scores 1026 audio
+    codes: num_beams > 1 then stops with "shape '[1, 1216]' is invalid for
+    input of size 2052". transformers 4.33 (with TTS 0.22) took the size from
+    the scores themselves, which is the value given here.
+    """
+    gpt = getattr(model, 'gpt', None)
+    head = getattr(gpt, 'mel_head', None)
+    codes = getattr(head, 'out_features', None)
+    config = getattr(getattr(gpt, 'gpt_inference', None), 'config', None)
+    if codes and config is not None and getattr(config, 'vocab_size', None) != codes:
+        config.vocab_size = int(codes)
+
+
 def set_seed(seed):
     """Seed every RNG involved in generation. Convention: the CALLER passes
     None to leave generation unseeded; any integer — INCLUDING 0 — is a valid
@@ -149,6 +214,8 @@ def generate(model, text, lang, latents, out_path,
         # where length_penalty does anything — so force it.
         ds = False
     hf_options = {'typical_p': p['typical_p']} if ds and p['typical_p'] < 1 else {}
+    if nb > 1:
+        _beam_vocabulary(model)
     out = model.inference(
         text, lang.lower().split('-')[0],
         gpt_cond_latent, speaker_embedding,
@@ -174,4 +241,5 @@ def generate(model, text, lang, latents, out_path,
     return out_path
 
 
-__all__ = ['load_xtts', 'compute_latents', 'generate', 'set_seed', 'XTTS_SR']
+__all__ = ['load_xtts', 'compute_latents', 'generate', 'set_seed', 'XTTS_SR',
+           'engine_versions', 'engine_label', 'check_engine']

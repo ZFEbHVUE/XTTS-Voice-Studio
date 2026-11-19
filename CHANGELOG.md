@@ -11,6 +11,115 @@ measured. The [README](README.md) describes how the tools work now.
 
 ---
 
+## 3.10.8 — 2026-11-19 — the coqui-tts fork (0.28) as a second environment
+
+The original `TTS` package (0.22.0) is unmaintained; coqui-tts, the fork, is.
+Its maintainer: no inference changes since 0.27.5, "a few minor changes" since
+the original package. To find them, the project's own calls were run on both
+packages with the same torch (2.5.1): TTS 0.22.0 with transformers 4.33.0, and
+coqui-tts 0.28.0 with transformers 4.57.6. No model could be downloaded here,
+so XTTS was built in miniature with random weights (XTTS-v2's structure:
+perceiver latents, 1026 audio codes) and driven through `xtts_clone`.
+
+### Found
+
+- **Beam search fails on the fork.** `num_beams` > 1 stops with
+  `RuntimeError: shape '[1, 1216]' is invalid for input of size 2052` (with
+  XTTS-v2's sizes). XTTS gives the generation config its longest audio
+  sequence (605 + 3 = 608) as `vocab_size`; transformers 4.33 sized beam search
+  by the scores (1026 audio codes), 4.57 uses that `vocab_size`.
+- **spacy is no longer installed** with coqui-tts, and every tool here
+  generates with `enable_text_splitting=True`, which needs it.
+- **six is imported but not declared**: `TTS/tts/utils/text/punctuation.py`
+  (still so on the fork's main branch, 16 Nov 2026). python-dateutil 4 no
+  longer brings it in, so a fresh environment fails on `import TTS.tts.models.xtts`.
+- **The model comes from elsewhere**: Hugging Face, `tts-hub/XTTS-v2`
+  (XTTS-v2.0.3), into the Hugging Face cache. When that download fails, the
+  fork deletes `<TTS home>/tts/tts_models--multilingual--multi-dataset--xtts_v2`
+  (reproduced with the download made to fail), by default the folder where
+  TTS 0.22 keeps its own copy of the model.
+- **The rest is the same.** The same weights and seed render the same audio
+  in both, to one step of 16-bit PCM: sampling, beam search (with the fix),
+  greedy and typical-p decoding, conditioning latents identical. French text
+  is normalised the same (430 lines of `Prompts/` and a set of numbers,
+  ordinals, times, percentages and abbreviations).
+
+### Added
+
+- `requirements-coqui-tts.txt`: coqui-tts 0.28.0, transformers 4.57.6, spacy,
+  six, and the rest of the stack; torch 2.5.1 as in the other environment
+  (below 2.9, where torchaudio needs torchcodec).
+- `install.sh --coqui`: a second environment, `xtts028` (Python 3.11), with
+  its own `TTS_HOME` (`~/.local/share/tts-coqui`) and `COQUI_TOS_AGREED=1`, and
+  its own launcher (`xtts-studio-coqui`, "XTTS Voice Studio (coqui-tts)"). The
+  `xtts` environment and its launcher are left as they are.
+- `engine_ab.py`: `render` a voice preset in each environment (its `{}` block
+  and clone references, four sentences it was not tuned on, three seeds, raw
+  XTTS), then `compare` the two folders: same weights (a fingerprint of every
+  tensor), same audio, or not, with ECAPA identity and the blind listening
+  command when they differ.
+- `xtts_clone.engine_versions()`, `engine_label()`, `check_engine()`: the
+  optimiser, comparator, validator and generator print the XTTS package in
+  use (`[*] XTTS engine: coqui-tts 0.28.0 (transformers 4.57.6, torch 2.5.1)`)
+  and stop before loading the model when spacy is missing.
+
+### Fixed
+
+- `xtts_clone.generate` gives beam search the number of audio codes the head
+  scores when they differ from the generation config's `vocab_size`. On
+  TTS 0.22 it changes nothing (beam search already worked there).
+
+### Tests
+
+`test_3108_coqui_tts.py`, 17 tests: the beam workaround on a stand-in model;
+the engine names and the spacy check; the tiny XTTS through the real library
+(conditioning, a seed rendering the same audio again, beam, greedy and
+typical-p decoding); `engine_ab.py` with XTTS simulated (render, a preset,
+same audio, other audio, other weights, identity, bad input); `install.sh`
+with conda, pip and python simulated (`--coqui` and the unchanged default);
+the two requirement files. The three library tests need torch and an XTTS
+package and are skipped otherwise. With 3.10.7's `xtts_clone`, the beam test
+fails on coqui-tts with the RuntimeError above. Whole suite: 646 tests, all
+passing on a virtual display in three environments: Python 3.11 without
+torch (3 skipped), TTS 0.22.0, and coqui-tts 0.28.0 (34 to 37 skipped without
+a display). `engine_ab.py render` was also run in the last two with the tiny
+model: 639 tensors identical, 12 renders identical.
+
+---
+
+## 3.10.7 — 2026-11-18 — gcl s auto stops at Keep s for clips to be curated
+
+Seen on the first run with three clips (9.9, 9.9 and 14.7 s, Curate and
+Re-curate ticked, Keep s 20): **auto all** set gcl s to `20 30 35`. It added up
+the clips (34.5 s), whereas curation keeps 20 s of them in all; the
+optimiser then rendered `gpt_cond_len` 30 and 35 for nothing, both reported
+as `= same audio as [C 1]`, since at 20 the GPT conditioning had already read
+all of it. The conditioning budget counted them (51 instead of 49). The
+run's result is not affected: with 20 s of audio, `gpt_cond_len` 30 or 35
+gives exactly the conditioning of 20, so whichever wins, the clone is the
+same; only the renders spent on them were lost.
+
+### Fixed
+
+- `search_plan.pipeline_voice_audio` gives each voice its audio in all
+  (`total`: Keep s for clips curated together, the files' sum otherwise), and
+  `gpt_readable_seconds` caps what the GPT conditioning can read at it; the
+  [Auto] tab's gcl s auto uses it. The reported run now gets gcl s `20` and a
+  budget of 49. Clips taken as they are, existing curated clips and one-file
+  voices give the same values as before.
+
+### Tests
+
+`test_3107_curated_clip_gcl.py`, 3 tests: the audio in all and what the GPT
+can read for clips to curate, clips as they are, reused curated clips and one
+file; the reported run in the [Auto] tab (Keep s 20, Max reference s 15, gcl s
+`20`, Chunk lengths, a budget of 49, and `20 30 35` once curation is off). On
+3.10.6 all three fail, the tab one with `'20 30 35' != '20'`. Whole suite on
+Python 3.11: 629 tests, all passing on a virtual display with a window
+manager (34 skipped without one).
+
+---
+
 ## 3.10.6 — 2026-11-17 — one voice from several clips of the same speaker
 
 Asked from use: XTTS-v2 takes a list of reference files, and three or four

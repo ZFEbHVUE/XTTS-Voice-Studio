@@ -19,7 +19,8 @@
 # ── Core TTS ─────────────────────────────────────────────────────────────────
 TTS==0.22.0
 # transformers 4.34+ moved GenerationMixin and breaks TTS 0.22's XTTS loader.
-# The coqui-tts fork needs >=4.46 instead — the two are not interchangeable.
+# The coqui-tts fork (0.28) needs >=4.57 instead — the two are not
+# interchangeable: it gets its own environment, requirements-coqui-tts.txt.
 transformers==4.33.0
 
 # ── Numeric core ─────────────────────────────────────────────────────────────

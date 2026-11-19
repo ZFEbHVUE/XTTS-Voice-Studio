@@ -2179,8 +2179,9 @@ def tab_auto(nb):
         if max_ref is None:
             return
         # GPT conditioning reads the clips of a voice end to end, each cut to
-        # max_ref_len: what one voice can give is the sum of its capped files.
-        values = SP.gcl_candidates([sum(min(s, max_ref) for s in v['seconds']) for v in secs],
+        # max_ref_len, and curated together they hold Keep s in all: a longer
+        # gpt_cond_len would read the same audio again (3.10.7).
+        values = SP.gcl_candidates([SP.gpt_readable_seconds(v, max_ref) for v in secs],
                                    max_ref, n_refs=max(len(v['seconds']) for v in secs))
         text = ' '.join(map(str, values))
         v_a_gcl.set(text)

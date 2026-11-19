@@ -1571,6 +1571,7 @@ def generate_meditation(text, output_file, voice_files, ambient_file, music_file
     # ~2 GB of VRAM per additional voice (critical on 4 GB GPUs).
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[*] TTS device: {_device}")
+    _XC.check_engine()     # names the XTTS package; stops here if spacy is missing
     shared_tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(_device)
     _LAT_CACHE.clear()
     print('   [*] Low-level cloning active; reference duration and decode mode '

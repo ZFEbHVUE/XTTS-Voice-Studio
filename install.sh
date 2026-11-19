@@ -9,14 +9,18 @@
 #   ./install.sh --name myenv use another environment name
 #   ./install.sh --cpu        install the CPU-only build of torch
 #   ./install.sh --no-icon    skip the desktop launcher
+#   ./install.sh --coqui      a second env, "xtts028", on the coqui-tts fork
+#                             (0.28) instead of TTS 0.22.0; the "xtts" env and
+#                             its launcher are left as they are
 #
 # It is safe to run twice: an existing environment is reused, not rebuilt.
 
 set -uo pipefail
 
-ENV_NAME="xtts"
+ENV_NAME=""
 TORCH_INDEX="https://download.pytorch.org/whl/cu121"
 MAKE_ICON=1
+COQUI=0
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 while [ $# -gt 0 ]; do
@@ -24,10 +28,32 @@ while [ $# -gt 0 ]; do
         --name)    ENV_NAME="${2:?--name needs a value}"; shift 2 ;;
         --cpu)     TORCH_INDEX=""; shift ;;
         --no-icon) MAKE_ICON=0; shift ;;
-        -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+        --coqui)   COQUI=1; shift ;;
+        -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
         *)         echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if [ "$COQUI" -eq 1 ]; then
+    ENV_NAME="${ENV_NAME:-xtts028}"
+    PYTHON_VERSION="3.11"
+    REQUIREMENTS="requirements-coqui-tts.txt"
+    LAUNCHER="xtts-studio-coqui"
+    APP_NAME="XTTS Voice Studio (coqui-tts)"
+    # Its own model folder: coqui-tts 0.28 deletes <TTS home>/tts/tts_models--
+    # multilingual--multi-dataset--xtts_v2 when its download fails, and by
+    # default that is where TTS 0.22 keeps its copy of the model.
+    TTS_HOME_DIR="$HOME/.local/share/tts-coqui"
+    CHECK_MODULES="numpy scipy librosa soundfile torch TTS transformers parselmouth speechbrain sklearn spacy six"
+else
+    ENV_NAME="${ENV_NAME:-xtts}"
+    PYTHON_VERSION="3.10"
+    REQUIREMENTS="requirements.txt"
+    LAUNCHER="xtts-studio"
+    APP_NAME="XTTS Voice Studio"
+    TTS_HOME_DIR=""
+    CHECK_MODULES="numpy scipy librosa soundfile torch TTS transformers parselmouth speechbrain sklearn"
+fi
 
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m[!] %s\033[0m\n' "$*"; }
@@ -48,8 +74,8 @@ echo "    $(conda --version), base at $(conda info --base)"
 if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
     say "Environment '$ENV_NAME' already exists — reusing it"
 else
-    say "Creating environment '$ENV_NAME' (Python 3.10)"
-    conda create -y -n "$ENV_NAME" python=3.10 || die "could not create the environment"
+    say "Creating environment '$ENV_NAME' (Python $PYTHON_VERSION)"
+    conda create -y -n "$ENV_NAME" python="$PYTHON_VERSION" || die "could not create the environment"
 fi
 conda activate "$ENV_NAME" || die "could not activate '$ENV_NAME'"
 echo "    $(python --version), $(which python)"
@@ -68,12 +94,18 @@ else
 fi
 
 # ── everything else ──────────────────────────────────────────────────────────
-say "Installing the Python dependencies"
-[ -f "$HERE/requirements.txt" ] || die "requirements.txt not found next to this script"
-pip install --quiet -r "$HERE/requirements.txt" || die "dependency install failed"
+say "Installing the Python dependencies ($REQUIREMENTS)"
+[ -f "$HERE/$REQUIREMENTS" ] || die "$REQUIREMENTS not found next to this script"
+pip install --quiet -r "$HERE/$REQUIREMENTS" || die "dependency install failed"
 
 # XTTS asks for this on first run and blocks waiting for an answer otherwise.
 conda env config vars set COQUI_TOS_AGREED=1 -n "$ENV_NAME" >/dev/null 2>&1 || true
+if [ -n "$TTS_HOME_DIR" ]; then
+    mkdir -p "$TTS_HOME_DIR"
+    conda env config vars set TTS_HOME="$TTS_HOME_DIR" -n "$ENV_NAME" >/dev/null 2>&1 \
+        || warn "could not set TTS_HOME for '$ENV_NAME': set it by hand before the first run"
+    echo "    models of this environment: $TTS_HOME_DIR (XTTS-v2 itself goes to ~/.cache/huggingface)"
+fi
 
 # ── system tools pip cannot provide ──────────────────────────────────────────
 say "Checking the tools that are not Python packages"
@@ -108,11 +140,10 @@ fi
 
 # ── does it import? ──────────────────────────────────────────────────────────
 say "Checking the install"
-python - <<'PY' || die "the environment does not import cleanly — see the error above"
-import importlib, sys
+CHECK_MODULES="$CHECK_MODULES" python - <<'PY' || die "the environment does not import cleanly — see the error above"
+import importlib, os, sys
 bad = []
-for mod in ("numpy", "scipy", "librosa", "soundfile", "torch", "TTS",
-            "transformers", "parselmouth", "speechbrain", "sklearn"):
+for mod in os.environ["CHECK_MODULES"].split():
     try:
         importlib.import_module(mod)
     except Exception as e:
@@ -133,7 +164,7 @@ PY
 if [ "$MAKE_ICON" -eq 1 ]; then
     say "Creating the launcher"
     CONDA_BASE="$(conda info --base)"
-    BIN="$HOME/.local/bin/xtts-studio"
+    BIN="$HOME/.local/bin/$LAUNCHER"
     mkdir -p "$HOME/.local/bin"
     cat > "$BIN" <<EOF
 #!/usr/bin/env bash
@@ -147,12 +178,12 @@ EOF
 
     ICON="$HERE/docs/icon.png"
     [ -f "$ICON" ] || ICON="applications-multimedia"
-    DESKTOP="$HOME/.local/share/applications/xtts-studio.desktop"
+    DESKTOP="$HOME/.local/share/applications/$LAUNCHER.desktop"
     mkdir -p "$(dirname "$DESKTOP")"
     cat > "$DESKTOP" <<EOF
 [Desktop Entry]
 Type=Application
-Name=XTTS Voice Studio
+Name=$APP_NAME
 Comment=Voice cloning, guided meditation and brainwave audio
 Exec=$BIN
 Icon=$ICON
@@ -165,13 +196,13 @@ EOF
     # A copy on the desktop too, when there is one.
     for d in "$HOME/Desktop" "$HOME/Bureau"; do
         if [ -d "$d" ]; then
-            cp "$DESKTOP" "$d/" && chmod +x "$d/xtts-studio.desktop"
-            gio set "$d/xtts-studio.desktop" metadata::trusted true >/dev/null 2>&1 || true
+            cp "$DESKTOP" "$d/" && chmod +x "$d/$LAUNCHER.desktop"
+            gio set "$d/$LAUNCHER.desktop" metadata::trusted true >/dev/null 2>&1 || true
             echo "    also on $d"
         fi
     done
     echo "    menu entry: $DESKTOP"
-    echo "    command:    xtts-studio  (if ~/.local/bin is on your PATH)"
+    echo "    command:    $LAUNCHER  (if ~/.local/bin is on your PATH)"
 fi
 
 say "Done"

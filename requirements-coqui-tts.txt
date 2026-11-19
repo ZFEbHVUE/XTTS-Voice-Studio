@@ -1,0 +1,67 @@
+# XTTS Voice Studio — requirements for the coqui-tts fork (0.28)
+#
+# For a SECOND environment, next to the TTS 0.22.0 one of requirements.txt:
+#   ./install.sh --coqui        creates it as "xtts028"
+# The code runs in both; engine_ab.py compares their renders of one voice
+# before you switch (README, "Moving to coqui-tts").
+#
+# Python 3.11 (coqui-tts accepts 3.10 to 3.14; 3.11 has wheels for the whole
+# audio stack).
+#
+#   pip install -r requirements-coqui-tts.txt
+#
+# torch is NOT listed. Install the SAME build as in the TTS 0.22 environment,
+# so that an A/B between the two measures the XTTS package and nothing else:
+#   pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+# Stay below torch 2.9: from 2.9, torchaudio.load (XTTS reads its references
+# with it, demucs too) needs torchcodec and FFmpeg's shared libraries.
+#
+# Set these in the environment (install.sh --coqui does it):
+#   TTS_HOME=~/.local/share/tts-coqui   own model folder. coqui-tts 0.28 fetches
+#       XTTS-v2 from Hugging Face (tts-hub/XTTS-v2, about 2 GB, into
+#       ~/.cache/huggingface) and, if that download fails, deletes
+#       <TTS home>/tts/tts_models--multilingual--multi-dataset--xtts_v2.
+#       Without TTS_HOME that is ~/.local/share/tts/tts_models--..., the very
+#       folder where TTS 0.22 keeps ITS copy of the model.
+#   COQUI_TOS_AGREED=1                  otherwise XTTS waits for an answer on
+#       a terminal the GUI does not have.
+
+# ── Core TTS ─────────────────────────────────────────────────────────────────
+coqui-tts==0.28.0
+# coqui-tts 0.28 needs transformers >= 4.57. transformers 5 requires torch
+# >= 2.6 and is not tested here. With 4.57, XTTS beam search (num_beams > 1)
+# breaks; xtts_clone.generate works around it (CHANGELOG 3.10.8).
+transformers==4.57.6
+# No longer installed by coqui-tts, but XTTS needs it to split sentences
+# (enable_text_splitting, used by every tool here).
+spacy>=3.8,<3.9
+# coqui-tts 0.28.0 imports six (TTS/tts/utils/text/punctuation.py) without
+# declaring it, and python-dateutil 4 no longer brings it in.
+six>=1.16
+
+# ── Numeric core ─────────────────────────────────────────────────────────────
+# numpy 2 is fine here (the test suite runs on 2.4); TTS 0.22 needed < 2.
+numpy>=1.26,<3
+scipy>=1.13,<2
+scikit-learn>=1.3
+
+# ── Audio analysis and I/O ───────────────────────────────────────────────────
+librosa==0.11.0
+soundfile>=0.12
+praat-parselmouth>=0.4.3
+pydub>=0.25
+einops>=0.6
+encodec==0.1.1
+
+# ── Speaker identity, separation, denoising, ASR ─────────────────────────────
+speechbrain>=1.0
+demucs>=4.0
+# Pronunciation scores and auto-text. If "import av" fails on libavformat,
+# pip install --force-reinstall --no-deps "av<14"
+faster-whisper>=1.0
+
+# ── Interface and plots ──────────────────────────────────────────────────────
+matplotlib>=3.8.4,<4
+pygame>=2.5
+
+# Optional and system packages: as in requirements.txt.

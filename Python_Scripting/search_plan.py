@@ -296,13 +296,15 @@ def pipeline_voice_audio(voices, curate, recurate, keep_seconds, seconds_of):
     voices of one or several clips (a list of paths per voice).
 
     Returns one dict per voice: 'label' (its first file), 'files', 'seconds'
-    (per file: XTTS cuts each one to max_ref_len), 'joined' (the length of
-    what the analyser reads, which sets its gpt_cond_len) and 'what'.
+    (per file, at most: XTTS cuts each one to max_ref_len), 'total' (the
+    audio in all, gaps excluded), 'joined' (the length of what the analyser
+    reads, which sets its gpt_cond_len) and 'what'.
 
     One file: as pipeline_reference_seconds. Several, curated: the existing
     <clip>_curated.wav files when all are there and re-curation is off,
     otherwise an estimate -- each clip at most Keep s, Keep s in all, as the
-    shared selection keeps it.
+    shared selection keeps it: then 'seconds' are bounds for each clip and
+    add up to more than 'total'.
     """
     out = []
     for files in voices:
@@ -310,8 +312,8 @@ def pipeline_voice_audio(voices, curate, recurate, keep_seconds, seconds_of):
         if len(files) == 1:
             path, seconds, what = pipeline_reference_seconds(
                 files, curate, recurate, keep_seconds, seconds_of)[0]
-            out.append(dict(label=path, files=files, seconds=[seconds], joined=seconds,
-                            what=what))
+            out.append(dict(label=path, files=files, seconds=[seconds], total=seconds,
+                            joined=seconds, what=what))
             continue
         curated = [os.path.splitext(f)[0] + '_curated.wav' for f in files]
         if curate and not recurate and all(os.path.exists(c) for c in curated):
@@ -322,15 +324,23 @@ def pipeline_voice_audio(voices, curate, recurate, keep_seconds, seconds_of):
             seconds = [min(s, float(keep_seconds)) for s in raw]
             total = min(sum(raw), float(keep_seconds))
             joined = total + JOIN_GAP_S * (len(files) - 1)
-            out.append(dict(label=files[0], files=files, seconds=seconds, joined=joined,
-                            what=f'{len(files)} clips, curation to Keep s in all'))
+            out.append(dict(label=files[0], files=files, seconds=seconds, total=total,
+                            joined=joined, what=f'{len(files)} clips, curation to Keep s in all'))
             continue
         else:
             seconds = [float(seconds_of(f)) for f in files]
             what = f'{len(files)} clips as they are'
-        out.append(dict(label=files[0], files=files, seconds=seconds,
+        out.append(dict(label=files[0], files=files, seconds=seconds, total=sum(seconds),
                         joined=sum(seconds) + JOIN_GAP_S * (len(files) - 1), what=what))
     return out
+
+
+def gpt_readable_seconds(voice, max_ref):
+    """Seconds the GPT conditioning of one voice can read: its files end to
+    end, each cut to max_ref, and never more than the voice holds in all --
+    Keep s when its clips are curated together. A gpt_cond_len beyond this
+    reads the same audio again."""
+    return min(float(voice['total']), sum(min(float(s), float(max_ref)) for s in voice['seconds']))
 
 
 def whole_file_seconds(seconds):
